@@ -1,0 +1,5 @@
+# Development and test dependencies, on top of requirements.txt.
+#
+#   venv\Scripts\python.exe -m pip install -r requirements-dev.txt --no-cache-dir
+-r requirements.txt
+pytest

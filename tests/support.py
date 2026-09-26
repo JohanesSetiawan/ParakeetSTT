@@ -1,21 +1,32 @@
 """
-Shared fixtures for tests that must not depend on the 2.5 GB checkpoint.
+Shared test helpers.
 
-``write_tiny_checkpoint`` produces a complete, schema-valid checkpoint
-directory (config, processor, generation, tokenizer JSON) for a model small
-enough to build and run on CPU in milliseconds. Its structure mirrors the real
-Parakeet config.json key for key; only the sizes differ.
+Tiny checkpoint: ``write_tiny_checkpoint`` produces a complete, schema-valid
+checkpoint directory (config, processor, generation, tokenizer JSON) for a
+model small enough to build and run on CPU in milliseconds. Its structure
+mirrors the real Parakeet config.json key for key; only the sizes differ.
+
+Real speech: ``load_speech_clips`` reads the committed LibriSpeech clips and
+their manifest (reference text and expected transcripts) for the full tier.
+
+Scoring: ``word_error_rate`` is the standard Levenshtein WER over normalized
+words, implemented here so the tests need no scoring library.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
+import re
 import struct
+from dataclasses import dataclass
 from pathlib import Path
 
 import torch
+from torch import nn
 
 from src.configuration.settings import CheckpointSettings, InferenceSettings
+from src.models.parakeet import GenerationResult
 
 TINY_VOCAB_SIZE = 12
 TINY_BLANK_ID = TINY_VOCAB_SIZE - 1
@@ -153,3 +164,141 @@ def inference_settings(**overrides: object) -> InferenceSettings:
     }
     values.update(overrides)
     return InferenceSettings(**values)  # type: ignore[arg-type]
+
+
+# =============================================================================
+# Real speech clips (full tier)
+# =============================================================================
+
+SPEECH_DIR = Path(__file__).resolve().parent / "data" / "librispeech"
+
+
+@dataclass(frozen=True)
+class SpeechClip:
+    """One committed LibriSpeech utterance and its expected outputs."""
+
+    clip_id: str
+    path: Path
+    sha256: str
+    duration_seconds: float
+    chunks: int
+    reference_text: str
+    expected_transcript: str
+    expected_status: str
+    full_context_transcript: str
+
+
+def load_speech_clips() -> tuple[SpeechClip, ...]:
+    """
+    Read manifest.json and verify every audio file against its SHA-256.
+
+    Raises:
+        AssertionError: If a clip is missing or its bytes changed, because
+            every expected transcript is only valid for those exact bytes.
+    """
+
+    manifest = json.loads((SPEECH_DIR / "manifest.json").read_text(encoding="utf-8"))
+    clips = []
+    for entry in manifest["clips"]:
+        path = SPEECH_DIR / entry["file"]
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        assert digest == entry["sha256"], f"{path.name} does not match its manifest hash"
+        clips.append(
+            SpeechClip(
+                clip_id=entry["id"],
+                path=path,
+                sha256=entry["sha256"],
+                duration_seconds=entry["duration_seconds"],
+                chunks=entry["chunks"],
+                reference_text=entry["reference_text"],
+                expected_transcript=entry["expected_transcript"],
+                expected_status=entry["expected_status"],
+                full_context_transcript=entry["full_context_transcript"],
+            )
+        )
+    return tuple(clips)
+
+
+# =============================================================================
+# Word error rate
+# =============================================================================
+
+
+def normalize_words(text: str) -> list[str]:
+    """
+    Lowercase, drop punctuation except apostrophes, split on whitespace.
+
+    LibriSpeech references are uppercase without punctuation, while the model
+    writes cased, punctuated text; both must meet in the same form.
+    """
+
+    lowered = text.lower().replace("-", " ")
+    letters_only = re.sub(r"[^a-z0-9' ]+", " ", lowered)
+    return letters_only.split()
+
+
+def word_errors(reference: list[str], hypothesis: list[str]) -> int:
+    """Return substitutions + deletions + insertions (Levenshtein on words)."""
+
+    previous_row = list(range(len(hypothesis) + 1))
+    for reference_index, reference_word in enumerate(reference, start=1):
+        current_row = [reference_index] + [0] * len(hypothesis)
+        for hypothesis_index, hypothesis_word in enumerate(hypothesis, start=1):
+            substitution = previous_row[hypothesis_index - 1] + (reference_word != hypothesis_word)
+            deletion = previous_row[hypothesis_index] + 1
+            insertion = current_row[hypothesis_index - 1] + 1
+            current_row[hypothesis_index] = min(substitution, deletion, insertion)
+        previous_row = current_row
+    return previous_row[-1]
+
+
+def word_error_rate(references: list[str], hypotheses: list[str]) -> float:
+    """Corpus WER: total word errors divided by total reference words."""
+
+    total_errors = 0
+    total_words = 0
+    for reference, hypothesis in zip(references, hypotheses, strict=True):
+        reference_words = normalize_words(reference)
+        total_errors += word_errors(reference_words, normalize_words(hypothesis))
+        total_words += len(reference_words)
+    return total_errors / total_words
+
+
+# =============================================================================
+# Scripted model (orchestration tests without real inference)
+# =============================================================================
+
+
+class ScriptedModel(nn.Module):
+    """
+    Emit one fixed token per row; optionally fail the encoder.
+
+    ``at_last_frame`` emits on the row's final encoder frame with duration 4,
+    so the token midpoint lies past the end of the audio.
+    """
+
+    def __init__(self, token_id: int, encoder_finite: bool = True, at_last_frame: bool = False) -> None:
+        super().__init__()
+        self.anchor = nn.Parameter(torch.zeros(1))
+        self.token_id = token_id
+        self.encoder_finite = encoder_finite
+        self.at_last_frame = at_last_frame
+
+    def generate(self, features: torch.Tensor, mask: torch.Tensor) -> GenerationResult:
+        batch_size = features.shape[0]
+        encoder_lengths = (mask.sum(dim=1) + 7) // 8
+        if self.at_last_frame:
+            starts = (encoder_lengths - 1).clamp(min=0)[:, None]
+            durations = torch.full((batch_size, 1), 4, dtype=torch.long)
+        else:
+            starts = torch.zeros((batch_size, 1), dtype=torch.long)
+            durations = torch.ones((batch_size, 1), dtype=torch.long)
+        return GenerationResult(
+            sequences=torch.full((batch_size, 1), self.token_id, dtype=torch.long),
+            durations=durations,
+            frame_starts=starts,
+            frame_ends=starts + durations,
+            encoder_lengths=encoder_lengths,
+            forced_advances=torch.zeros(batch_size, dtype=torch.long),
+            encoder_finite=torch.full((batch_size,), self.encoder_finite),
+        )
