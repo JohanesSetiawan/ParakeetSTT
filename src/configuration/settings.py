@@ -26,6 +26,10 @@ class InferenceSettings:
     recursive: bool
     output_filename: str
     audio_extensions: tuple[str, ...]
+    max_chunk_feature_frames: int
+    overlap_feature_frames: int
+    max_batch_feature_frames: int
+    max_padding_fraction: float
 
 
 def load_inference_settings(
@@ -59,6 +63,10 @@ def load_inference_settings(
     recursive = raw_inference.get("recursive")
     output_filename = raw_inference.get("output_filename")
     audio_extensions = raw_inference.get("audio_extensions")
+    max_chunk_feature_frames = raw_inference.get("max_chunk_feature_frames")
+    overlap_feature_frames = raw_inference.get("overlap_feature_frames")
+    max_batch_feature_frames = raw_inference.get("max_batch_feature_frames")
+    max_padding_fraction = raw_inference.get("max_padding_fraction")
 
     if not isinstance(batch_size, int) or isinstance(batch_size, bool) or batch_size <= 0:
         raise ValueError("inference.batch_size must be a positive integer")
@@ -70,8 +78,26 @@ def load_inference_settings(
         or Path(output_filename).name != output_filename
     ):
         raise ValueError("inference.output_filename must be a plain filename")
-    if not isinstance(audio_extensions, list) or not audio_extensions:
-        raise ValueError("inference.audio_extensions must be a non-empty list")
+    if not isinstance(audio_extensions, list):
+        raise ValueError("inference.audio_extensions must be a list")
+    for field_name, value in (
+        ("max_chunk_feature_frames", max_chunk_feature_frames),
+        ("overlap_feature_frames", overlap_feature_frames),
+        ("max_batch_feature_frames", max_batch_feature_frames),
+    ):
+        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            raise ValueError(f"inference.{field_name} must be a positive integer")
+    if overlap_feature_frames >= max_chunk_feature_frames:
+        raise ValueError(
+            "inference.overlap_feature_frames must be smaller than "
+            "max_chunk_feature_frames"
+        )
+    if (
+        not isinstance(max_padding_fraction, (int, float))
+        or isinstance(max_padding_fraction, bool)
+        or not 0.0 <= float(max_padding_fraction) <= 1.0
+    ):
+        raise ValueError("inference.max_padding_fraction must be between 0 and 1")
 
     normalized_extensions: list[str] = []
     for extension in audio_extensions:
@@ -88,4 +114,8 @@ def load_inference_settings(
         recursive=recursive,
         output_filename=output_filename,
         audio_extensions=tuple(normalized_extensions),
+        max_chunk_feature_frames=max_chunk_feature_frames,
+        overlap_feature_frames=overlap_feature_frames,
+        max_batch_feature_frames=max_batch_feature_frames,
+        max_padding_fraction=float(max_padding_fraction),
     )

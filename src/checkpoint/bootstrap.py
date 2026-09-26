@@ -8,8 +8,9 @@ existence check and intentionally skip remote metadata, hashing, download, and
 conversion validation.
 
 If the user manually changes or deletes checkpoint files after bootstrap,
-``--repair`` is the explicit recovery path. This trade-off implements the user's
-requirement that repeated inference runs perform no weight checks.
+``clear_readiness_marker()`` is the internal recovery path. The public inference
+command intentionally exposes no checkpoint-management flags and repeated runs
+perform no weight checks.
 """
 
 from __future__ import annotations
@@ -22,9 +23,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
-from .checkpoint import CheckpointPreparationResult, prepare_checkpoint
-from .config import DEFAULT_WEIGHTS_DIR
-from .model.parakeet import load_model
+from .orchestration import CheckpointPreparationResult, prepare_checkpoint
+from ..configuration.config import DEFAULT_WEIGHTS_DIR
+from ..models.parakeet import load_model
 
 
 READINESS_MARKER_FILENAME = ".ready"

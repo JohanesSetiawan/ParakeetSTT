@@ -19,7 +19,7 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from ..config import ParakeetConfig
+from ..configuration.config import ParakeetConfig
 
 
 # =============================================================================

@@ -6,8 +6,8 @@ import unittest
 
 import torch
 
-from src.inference import TranscriptionBatch
-from src.model.parakeet import GenerationResult
+from src.inference.service import TranscriptionBatch
+from src.models.parakeet import GenerationResult
 
 
 class InferenceMetricTests(unittest.TestCase):

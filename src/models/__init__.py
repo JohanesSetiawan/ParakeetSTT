@@ -1,4 +1,4 @@
-"""Public model-layer API for the standalone Parakeet runtime."""
+"""Parakeet model architecture and neural network layers."""
 
 from .attention import Attention, RelativePositionalEncoding, repeat_key_value
 from .conformer import ConvolutionModule, EncoderBlock, FeedForward

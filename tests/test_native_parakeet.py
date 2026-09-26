@@ -10,12 +10,12 @@ from pathlib import Path
 
 import torch
 
-from src.audio import read_wav
-from src.config import DEFAULT_WEIGHTS_DIR, ParakeetConfig, load_config
-from src.model.attention import Attention
-from src.model.parakeet import select_device
-from src.processing import build_mel_filter_bank
-from src.tokenization import BpeTokenizer
+from src.audio.reader import read_wav
+from src.audio.features import build_mel_filter_bank
+from src.configuration.config import DEFAULT_WEIGHTS_DIR, ParakeetConfig, load_config
+from src.models.attention import Attention
+from src.models.parakeet import select_device
+from src.text.tokenization import BpeTokenizer
 
 
 class ParakeetRuntimeTests(unittest.TestCase):

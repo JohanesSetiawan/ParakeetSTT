@@ -29,7 +29,9 @@ from typing import Any
 # or another process without silently pointing at a different checkpoint.
 # =============================================================================
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+# This module lives under src/configuration, so two parents reach src and the
+# third reaches the repository root that owns weights/, docs/, and config.toml.
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 DEFAULT_WEIGHTS_DIR = PROJECT_ROOT / "weights" / "parakeet-tdt-0.6b-v3"
 DEFAULT_AUDIO_DIR = PROJECT_ROOT / "docs"
 

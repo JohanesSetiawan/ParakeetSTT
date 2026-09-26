@@ -5,8 +5,8 @@ This module coordinates two independent infrastructure operations:
 1. ensure the requested Hugging Face artifacts exist and match per-file evidence;
 2. ensure ``model.pth`` corresponds to the current model safetensors and config.
 
-Network transfer is delegated to ``src.utils.download``. Safetensors parsing and
-PyTorch serialization live in ``src.conversion``. A conversion
+Network transfer is delegated to ``checkpoint.download``. Safetensors parsing and
+PyTorch serialization live in ``checkpoint.conversion``. A conversion
 manifest records source and output hashes so unchanged checkpoints are not
 converted repeatedly.
 """
@@ -22,10 +22,10 @@ from typing import Any, Callable
 
 import torch
 
-from src.config import DEFAULT_WEIGHTS_DIR
-from src.conversion import convert_checkpoint
-from src.utils.artifacts import sha256_file
-from src.utils.download import DownloadResult, ensure_checkpoint_files, load_manifest
+from ..configuration.config import DEFAULT_WEIGHTS_DIR
+from .conversion import convert_checkpoint
+from .artifacts import sha256_file
+from .download import DownloadResult, ensure_checkpoint_files, load_manifest
 
 
 CONVERSION_MANIFEST_FILENAME = "conversion_manifest.json"

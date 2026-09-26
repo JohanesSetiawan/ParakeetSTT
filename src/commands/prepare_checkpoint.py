@@ -3,7 +3,7 @@ CLI for manifest-aware checkpoint download and automatic PyTorch conversion.
 
 Run from the repository root with:
 
-    venv\\Scripts\\python.exe -m src.cli.prepare_checkpoint
+    venv\\Scripts\\python.exe -m src.commands.prepare_checkpoint
 
 Matching source artifacts and model.pth are reused. Only missing or invalid
 source files are downloaded, and stale conversion output is regenerated after
@@ -13,28 +13,10 @@ all source artifacts pass identity validation.
 from __future__ import annotations
 
 import argparse
-import logging
 from pathlib import Path
 
-from ..checkpoint import prepare_checkpoint
-from ..config import DEFAULT_WEIGHTS_DIR
-
-
-def setup_logging() -> logging.Logger:
-    """Configure plain-text console logging for interactive progress."""
-
-    logger = logging.getLogger("checkpoint_preparation")
-    logger.setLevel(logging.INFO)
-    logger.handlers.clear()
-    handler = logging.StreamHandler()
-    handler.setFormatter(
-        logging.Formatter(
-            "%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-            datefmt="%Y-%m-%d %H:%M:%S",
-        )
-    )
-    logger.addHandler(handler)
-    return logger
+from ..checkpoint.orchestration import prepare_checkpoint
+from ..configuration.config import DEFAULT_WEIGHTS_DIR
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -54,10 +36,9 @@ def main() -> None:
     """Run acquisition, conversion freshness checks, and terminal reporting."""
 
     arguments = parse_arguments()
-    logger = setup_logging()
     result = prepare_checkpoint(
         checkpoint_dir=arguments.checkpoint_dir,
-        progress_callback=logger.info,
+        progress_callback=print,
     )
 
     print("Checkpoint preparation complete")

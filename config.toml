@@ -2,4 +2,8 @@
 batch_size = 8
 recursive = true
 output_filename = "transcriptions.csv"
-audio_extensions = [".wav"]
+audio_extensions = []
+max_chunk_feature_frames = 1500
+overlap_feature_frames = 50
+max_batch_feature_frames = 3000
+max_padding_fraction = 0.25

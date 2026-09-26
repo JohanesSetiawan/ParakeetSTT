@@ -16,7 +16,7 @@ from typing import Any
 import torch
 from torch import nn
 
-from ..config import DEFAULT_WEIGHTS_DIR, ParakeetConfig, load_config
+from ..configuration.config import DEFAULT_WEIGHTS_DIR, ParakeetConfig, load_config
 from .decoder import Decoder, DecoderCache
 from .encoder import Encoder
 from .joint import JointNetwork
@@ -28,6 +28,9 @@ class GenerationResult:
 
     sequences: torch.LongTensor
     durations: torch.LongTensor
+    frame_starts: torch.LongTensor | None = None
+    frame_ends: torch.LongTensor | None = None
+    encoder_lengths: torch.LongTensor | None = None
 
 
 # =============================================================================
@@ -122,13 +125,35 @@ class ParakeetTDT(nn.Module):
             device=encoder_states.device,
         )
         decoder_cache = DecoderCache(self.configuration)
-        sequence_parts = [decoder_input_ids]
-        duration_parts = [torch.zeros_like(decoder_input_ids)]
-
         # This upper bound mirrors the reference generation buffer policy. The
         # normal stopping condition is encoder exhaustion; reaching this bound
         # indicates every frame emitted max_symbols_per_step zero-duration tokens.
         maximum_steps = self.max_symbols_per_step * max(1, encoder_length)
+        output_capacity = maximum_steps + 1
+        sequence_buffer = torch.full(
+            (batch_size, output_capacity),
+            self.configuration.pad_token_id,
+            dtype=torch.long,
+            device=encoder_states.device,
+        )
+        duration_buffer = torch.zeros_like(sequence_buffer)
+        frame_start_buffer = torch.zeros_like(sequence_buffer)
+        frame_end_buffer = torch.zeros_like(sequence_buffer)
+        sequence_buffer[:, 0] = decoder_input_ids[:, 0]
+        output_length = 1
+        batch_indices = torch.arange(
+            batch_size,
+            device=encoder_states.device,
+        )
+        blank_input_ids = torch.full_like(
+            decoder_input_ids,
+            self.configuration.blank_token_id,
+        )
+        pad_token_ids = torch.full_like(
+            decoder_input_ids,
+            self.configuration.pad_token_id,
+        )
+        zero_durations = torch.zeros_like(decoder_input_ids)
 
         for _step in range(maximum_steps):
             decoder_hidden_states = self.decoder(
@@ -137,10 +162,6 @@ class ParakeetTDT(nn.Module):
             )
 
             safe_frame_indices = frame_indices.clamp(max=encoder_length - 1)
-            batch_indices = torch.arange(
-                batch_size,
-                device=encoder_states.device,
-            )
             current_encoder_states = encoder_states[
                 batch_indices,
                 safe_frame_indices,
@@ -165,15 +186,28 @@ class ParakeetTDT(nn.Module):
             emitted_token_ids = torch.where(
                 active,
                 token_ids,
-                torch.full_like(token_ids, self.configuration.pad_token_id),
+                pad_token_ids[:, 0],
             )
             emitted_durations = torch.where(
                 active,
                 duration_ids,
-                torch.zeros_like(duration_ids),
+                zero_durations[:, 0],
             )
-            sequence_parts.append(emitted_token_ids[:, None])
-            duration_parts.append(emitted_durations[:, None])
+            emitted_frame_starts = torch.where(
+                active,
+                frame_indices,
+                zero_durations[:, 0],
+            )
+            emitted_frame_ends = torch.where(
+                active,
+                frame_indices + emitted_durations,
+                zero_durations[:, 0],
+            )
+            sequence_buffer[:, output_length] = emitted_token_ids
+            duration_buffer[:, output_length] = emitted_durations
+            frame_start_buffer[:, output_length] = emitted_frame_starts
+            frame_end_buffer[:, output_length] = emitted_frame_ends
+            output_length += 1
 
             frame_indices = torch.where(
                 active,
@@ -182,14 +216,12 @@ class ParakeetTDT(nn.Module):
             )
             finished = finished | (frame_indices >= valid_lengths)
 
+
             # Completed rows receive blank decoder input to preserve cache state;
             # emitted output for those rows is already padded above.
             decoder_input_ids = torch.where(
                 finished,
-                torch.full_like(
-                    emitted_token_ids,
-                    self.configuration.blank_token_id,
-                ),
+                blank_input_ids[:, 0],
                 emitted_token_ids,
             )[:, None]
 
@@ -201,8 +233,11 @@ class ParakeetTDT(nn.Module):
             )
 
         return GenerationResult(
-            sequences=torch.cat(sequence_parts, dim=1),
-            durations=torch.cat(duration_parts, dim=1),
+            sequences=sequence_buffer[:, :output_length],
+            durations=duration_buffer[:, :output_length],
+            frame_starts=frame_start_buffer[:, :output_length],
+            frame_ends=frame_end_buffer[:, :output_length],
+            encoder_lengths=valid_lengths,
         )
 
 

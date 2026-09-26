@@ -14,7 +14,7 @@ from typing import Iterable
 
 import torch
 
-from .config import ParakeetConfig
+from ..configuration.config import ParakeetConfig
 
 
 # =============================================================================
@@ -117,13 +117,44 @@ class ParakeetFeatureExtractor:
         self.n_fft = feature["n_fft"]
         self.win_length = feature["win_length"]
         self.preemphasis = feature["preemphasis"]
-        self.mel_filters = build_mel_filter_bank(
+        self.mel_filters_cpu = build_mel_filter_bank(
             sample_rate=self.sample_rate,
             n_fft=self.n_fft,
             n_mels=self.feature_size,
             minimum_frequency=0.0,
             maximum_frequency=self.sample_rate / 2.0,
         )
+        self._window_cache: dict[tuple[str, torch.dtype], torch.Tensor] = {}
+        self._mel_cache: dict[tuple[str, torch.dtype], torch.Tensor] = {}
+
+    def _runtime_window(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        """Return one cached Hann window for a device/dtype pair."""
+
+        key = (str(device), dtype)
+        window = self._window_cache.get(key)
+        if window is None:
+            window = torch.hann_window(
+                self.win_length,
+                periodic=False,
+                dtype=dtype,
+                device=device,
+            )
+            self._window_cache[key] = window
+        return window
+
+    def _runtime_mel_filters(
+        self,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Return one cached mel filter bank for a device/dtype pair."""
+
+        key = (str(device), dtype)
+        mel_filters = self._mel_cache.get(key)
+        if mel_filters is None:
+            mel_filters = self.mel_filters_cpu.to(device=device, dtype=dtype)
+            self._mel_cache[key] = mel_filters
+        return mel_filters
 
     def __call__(
         self,
@@ -184,12 +215,7 @@ class ParakeetFeatureExtractor:
             )
             padded_audio = padded_audio.masked_fill(~time_mask, 0.0)
 
-        window = torch.hann_window(
-            self.win_length,
-            periodic=False,
-            dtype=padded_audio.dtype,
-            device=device,
-        )
+        window = self._runtime_window(device, padded_audio.dtype)
         stft = torch.stft(
             padded_audio,
             self.n_fft,
@@ -202,7 +228,7 @@ class ParakeetFeatureExtractor:
         magnitude = torch.view_as_real(stft)
         magnitude = torch.sqrt(magnitude.pow(2).sum(dim=-1)).pow(2)
 
-        mel_features = self.mel_filters.to(device=device) @ magnitude
+        mel_features = self._runtime_mel_filters(device, magnitude.dtype) @ magnitude
         mel_features = torch.log(mel_features + 2**-24)
         mel_features = mel_features.permute(0, 2, 1)
 

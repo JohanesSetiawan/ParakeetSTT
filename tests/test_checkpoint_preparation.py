@@ -12,9 +12,9 @@ from pathlib import Path
 
 import torch
 
-from src.checkpoint import ensure_converted_checkpoint
-from src.conversion import convert_checkpoint
-from src.utils.download import DownloadSpec, ensure_checkpoint_files
+from src.checkpoint.orchestration import ensure_converted_checkpoint
+from src.checkpoint.conversion import convert_checkpoint
+from src.checkpoint.download import DownloadSpec, ensure_checkpoint_files
 
 
 class _QuietRequestHandler(SimpleHTTPRequestHandler):

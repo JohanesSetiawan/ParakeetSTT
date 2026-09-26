@@ -4,7 +4,7 @@ Application service for standalone Parakeet WAV transcription.
 This module coordinates domain components but does not implement their math. It
 loads audio through ``audio.py``, extracts features through ``processing.py``,
 invokes ``ParakeetTDT.generate``, and decodes IDs through ``tokenization.py``.
-Reporting, logging, CLI parsing, and benchmark persistence remain in the runner.
+Reporting, CLI parsing, and benchmark persistence remain in the runner.
 """
 
 from __future__ import annotations
@@ -16,11 +16,11 @@ from typing import Iterable
 
 import torch
 
-from .audio import read_wav
-from .config import ParakeetConfig
-from .model.parakeet import GenerationResult, ParakeetTDT
-from .processing import ParakeetFeatureExtractor
-from .tokenization import BpeTokenizer
+from ..audio.reader import read_wav
+from ..audio.features import ParakeetFeatureExtractor
+from ..configuration.config import ParakeetConfig
+from ..models.parakeet import GenerationResult, ParakeetTDT
+from ..text.tokenization import BpeTokenizer
 
 
 @dataclass(frozen=True)

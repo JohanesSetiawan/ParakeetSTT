@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from src.bootstrap import ensure_first_run_ready, readiness_marker_path
+from src.checkpoint.bootstrap import ensure_first_run_ready, readiness_marker_path
 
 
 class BootstrapTests(unittest.TestCase):
@@ -23,7 +23,7 @@ class BootstrapTests(unittest.TestCase):
             marker_path.write_text(json.dumps({"schema_version": 1}), encoding="utf-8")
             (checkpoint_dir / "model.pth").write_bytes(b"prepared")
 
-            with patch("src.bootstrap.prepare_checkpoint") as prepare_mock:
+            with patch("src.checkpoint.bootstrap.prepare_checkpoint") as prepare_mock:
                 result = ensure_first_run_ready(checkpoint_dir)
 
             self.assertEqual(result.action, "ready")
@@ -40,8 +40,8 @@ class BootstrapTests(unittest.TestCase):
 
             preparation = object()
             with (
-                patch("src.bootstrap.prepare_checkpoint", return_value=preparation),
-                patch("src.bootstrap.load_model", return_value=(object(), object(), {})),
+                patch("src.checkpoint.bootstrap.prepare_checkpoint", return_value=preparation),
+                patch("src.checkpoint.bootstrap.load_model", return_value=(object(), object(), {})),
             ):
                 result = ensure_first_run_ready(checkpoint_dir, force_repair=True)
 
