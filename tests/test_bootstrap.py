@@ -6,7 +6,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from src.checkpoint.bootstrap import ensure_first_run_ready, readiness_marker_path
 from support import checkpoint_settings
@@ -22,21 +22,55 @@ def _write_marker(checkpoint_dir: Path, recorded_size: int) -> Path:
 
 
 class BootstrapTests(unittest.TestCase):
-    """Verify the fast path, stale-marker detection, and explicit repair."""
+    """Verify the fast path, stale-marker detection, single load, and repair."""
 
-    def test_current_marker_skips_checkpoint_preparation(self) -> None:
-        """A marker whose recorded size matches model.pth returns immediately."""
+    def test_current_marker_loads_once_without_preparation(self) -> None:
+        """A marker whose recorded size matches model.pth skips preparation."""
 
         with tempfile.TemporaryDirectory() as temporary_directory:
             checkpoint_dir = Path(temporary_directory)
             (checkpoint_dir / "model.pth").write_bytes(b"prepared")
             _write_marker(checkpoint_dir, recorded_size=len(b"prepared"))
+            loader = MagicMock(return_value="model")
 
             with patch("src.checkpoint.bootstrap.prepare_checkpoint") as prepare_mock:
-                result = ensure_first_run_ready(checkpoint_dir, checkpoint_settings())
+                result, loaded = ensure_first_run_ready(checkpoint_dir, checkpoint_settings(), loader)
 
             self.assertEqual(result.action, "ready")
+            self.assertEqual(loaded, "model")
             prepare_mock.assert_not_called()
+            loader.assert_called_once_with(checkpoint_dir.resolve())
+
+    def test_first_run_loads_checkpoint_exactly_once(self) -> None:
+        """
+        Regression: the first run used to strict-load model.pth for
+        validation, discard it, and load it again for inference.
+        """
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            checkpoint_dir = Path(temporary_directory)
+            (checkpoint_dir / "model.pth").write_bytes(b"prepared")
+            loader = MagicMock(return_value="model")
+
+            with patch("src.checkpoint.bootstrap.prepare_checkpoint", return_value=object()):
+                result, loaded = ensure_first_run_ready(checkpoint_dir, checkpoint_settings(), loader)
+
+            self.assertEqual(result.action, "prepared")
+            self.assertEqual(loaded, "model")
+            loader.assert_called_once()
+            self.assertTrue(readiness_marker_path(checkpoint_dir).is_file())
+
+    def test_failed_strict_load_does_not_mark_ready(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            checkpoint_dir = Path(temporary_directory)
+            (checkpoint_dir / "model.pth").write_bytes(b"prepared")
+            loader = MagicMock(side_effect=RuntimeError("missing keys"))
+
+            with patch("src.checkpoint.bootstrap.prepare_checkpoint", return_value=object()):
+                with self.assertRaises(RuntimeError):
+                    ensure_first_run_ready(checkpoint_dir, checkpoint_settings(), loader)
+
+            self.assertFalse(readiness_marker_path(checkpoint_dir).exists())
 
     def test_resized_checkpoint_invalidates_marker(self) -> None:
         """A truncated or replaced model.pth forces full preparation again."""
@@ -46,11 +80,12 @@ class BootstrapTests(unittest.TestCase):
             (checkpoint_dir / "model.pth").write_bytes(b"truncated")
             _write_marker(checkpoint_dir, recorded_size=123_456)
 
-            with (
-                patch("src.checkpoint.bootstrap.prepare_checkpoint", return_value=object()) as prepare_mock,
-                patch("src.checkpoint.bootstrap.load_model", return_value=(object(), object(), {})),
-            ):
-                result = ensure_first_run_ready(checkpoint_dir, checkpoint_settings())
+            with patch("src.checkpoint.bootstrap.prepare_checkpoint", return_value=object()) as prepare_mock:
+                result, _loaded = ensure_first_run_ready(
+                    checkpoint_dir,
+                    checkpoint_settings(),
+                    MagicMock(return_value="model"),
+                )
 
             self.assertEqual(result.action, "prepared")
             prepare_mock.assert_called_once()
@@ -68,31 +103,14 @@ class BootstrapTests(unittest.TestCase):
                 (checkpoint_dir / "model.pth").write_bytes(b"prepared")
                 return object()
 
-            with (
-                patch("src.checkpoint.bootstrap.prepare_checkpoint", side_effect=fake_prepare),
-                patch("src.checkpoint.bootstrap.load_model", return_value=(object(), object(), {})),
-            ):
-                result = ensure_first_run_ready(checkpoint_dir, checkpoint_settings())
+            with patch("src.checkpoint.bootstrap.prepare_checkpoint", side_effect=fake_prepare):
+                result, _loaded = ensure_first_run_ready(
+                    checkpoint_dir,
+                    checkpoint_settings(),
+                    MagicMock(return_value="model"),
+                )
 
             self.assertEqual(result.action, "prepared")
-
-    def test_validation_load_stays_on_cpu(self) -> None:
-        """The readiness strict-load must not claim accelerator memory."""
-
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            checkpoint_dir = Path(temporary_directory)
-            (checkpoint_dir / "model.pth").write_bytes(b"prepared")
-
-            with (
-                patch("src.checkpoint.bootstrap.prepare_checkpoint", return_value=object()),
-                patch(
-                    "src.checkpoint.bootstrap.load_model",
-                    return_value=(object(), object(), {}),
-                ) as load_mock,
-            ):
-                ensure_first_run_ready(checkpoint_dir, checkpoint_settings())
-
-            self.assertEqual(load_mock.call_args.kwargs["device"].type, "cpu")
 
     def test_repair_removes_marker_and_runs_preparation(self) -> None:
         """Repair explicitly invalidates the marker and rebuilds readiness."""
@@ -103,13 +121,11 @@ class BootstrapTests(unittest.TestCase):
             marker_path = _write_marker(checkpoint_dir, recorded_size=len(b"prepared"))
 
             preparation = object()
-            with (
-                patch("src.checkpoint.bootstrap.prepare_checkpoint", return_value=preparation),
-                patch("src.checkpoint.bootstrap.load_model", return_value=(object(), object(), {})),
-            ):
-                result = ensure_first_run_ready(
+            with patch("src.checkpoint.bootstrap.prepare_checkpoint", return_value=preparation):
+                result, _loaded = ensure_first_run_ready(
                     checkpoint_dir,
                     checkpoint_settings(),
+                    MagicMock(return_value="model"),
                     force_repair=True,
                 )
 

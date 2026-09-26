@@ -96,6 +96,40 @@ class LongFormPlanningTests(unittest.TestCase):
             self.assertEqual(item.source_start_frame, item.core_start_frame)
             self.assertEqual(item.source_end_frame, item.core_end_frame)
 
+    def test_batch_budget_counts_padded_frames(self) -> None:
+        """
+        Regression: 1333 + 1000 + 667 = 3000 passed a 3000-frame budget but
+        allocates 3 x 1333 = 3999 frames once padded to the longest item.
+        """
+
+        def item_frames(frames: int) -> int:
+            return (frames - 1) * HOP_LENGTH  # samples giving exactly `frames` STFT frames
+
+        plan = _plan(
+            [item_frames(1333), item_frames(1000), item_frames(667)],
+            max_chunk=1500,
+            overlap=0,
+            batch_size=8,
+            max_batch=3000,
+            padding=0.5,
+        )
+
+        self.assertEqual([item.feature_frames for item in plan.items], [1333, 1000, 667])
+        for batch in plan.batches:
+            padded = len(batch) * max(item.feature_frames for item in batch)
+            self.assertLessEqual(padded, 3000)
+        self.assertGreater(len(plan.batches), 1)
+
+    def test_random_workloads_respect_padded_budget(self) -> None:
+        generator = random.Random(99)
+        for _trial in range(100):
+            frames = [generator.randint(1_000, 600_000) for _ in range(generator.randint(1, 12))]
+            plan = _plan(frames, max_chunk=300, overlap=20, batch_size=6, max_batch=900, padding=0.4)
+            for batch in plan.batches:
+                longest = max(item.feature_frames for item in batch)
+                self.assertLessEqual(len(batch) * longest, 900)
+                self.assertLessEqual(len(batch), 6)
+
     def test_overlap_must_leave_room_for_a_core(self) -> None:
         with self.assertRaises(ValueError):
             _plan([100_000], max_chunk=100, overlap=50)

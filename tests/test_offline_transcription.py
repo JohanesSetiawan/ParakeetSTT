@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import tempfile
 import unittest
 from pathlib import Path
@@ -12,8 +13,14 @@ import soundfile
 import torch
 from torch import nn
 
-from src.audio.media import _codec_binary, inspect_media, open_media_session
+from src.audio.media import (
+    CodecUnavailableError,
+    _codec_binary,
+    inspect_media,
+    open_media_session,
+)
 from src.configuration.config import load_config
+from src.inference import offline as offline_module
 from src.inference.offline import ChunkResult, FileStatus, OfflineTranscriber, classify_file
 from src.inference.planning import WorkItem, build_execution_plan
 from src.models.parakeet import GenerationResult
@@ -153,11 +160,14 @@ class MediaDecodingTests(unittest.TestCase):
             "stream": {"sample_rate": "16000", "channels": 1, "duration": "13.820000", "nb_frames": "217"},
             "format": {"duration": "13.820000"},
         }
-        with (
-            patch("src.audio.media.soundfile.info", side_effect=RuntimeError("unsupported")),
-            patch("src.audio.media._run_ffprobe", return_value=probe),
-        ):
-            metadata = inspect_media(Path("clip.m4a"))
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "clip.m4a"
+            path.write_bytes(b"aac payload")
+            with (
+                patch("src.audio.media.soundfile.info", side_effect=RuntimeError("unsupported")),
+                patch("src.audio.media._run_ffprobe", return_value=probe),
+            ):
+                metadata = inspect_media(path)
 
         self.assertEqual(metadata.frame_count, 221_120)
         self.assertAlmostEqual(metadata.duration_seconds, 13.82)
@@ -167,21 +177,51 @@ class MediaDecodingTests(unittest.TestCase):
             "stream": {"sample_rate": "48000", "channels": 2, "duration": "N/A"},
             "format": {"duration": "2.5"},
         }
-        with (
-            patch("src.audio.media.soundfile.info", side_effect=RuntimeError("unsupported")),
-            patch("src.audio.media._run_ffprobe", return_value=probe),
-        ):
-            metadata = inspect_media(Path("clip.webm"))
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "clip.webm"
+            path.write_bytes(b"webm payload")
+            with (
+                patch("src.audio.media.soundfile.info", side_effect=RuntimeError("unsupported")),
+                patch("src.audio.media._run_ffprobe", return_value=probe),
+            ):
+                metadata = inspect_media(path)
 
         self.assertEqual(metadata.frame_count, 120_000)
 
     def test_unreadable_media_reports_both_backends(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "notes.txt"
+            path.write_text("not audio", encoding="utf-8")
+            with (
+                patch("src.audio.media.soundfile.info", side_effect=RuntimeError("libsndfile says no")),
+                patch(
+                    "src.audio.media._run_ffprobe",
+                    side_effect=CodecUnavailableError("ffprobe missing"),
+                ),
+            ):
+                with self.assertRaisesRegex(ValueError, "libsndfile says no.*ffprobe missing"):
+                    inspect_media(path)
+
+    def test_os_open_failure_is_not_mistaken_for_an_unsupported_format(self) -> None:
+        """
+        Regression: libsndfile reports "too many open files" like "unknown
+        format", which silently sent readable WAVs to the FFmpeg fallback.
+        """
+
+        too_many_files = OSError(errno.EMFILE, "Too many open files")
         with (
-            patch("src.audio.media.soundfile.info", side_effect=RuntimeError("libsndfile says no")),
-            patch("src.audio.media._run_ffprobe", side_effect=RuntimeError("ffprobe missing")),
+            patch("src.audio.media.soundfile.SoundFile", side_effect=RuntimeError("System error")),
+            patch("src.audio.media.Path.open", side_effect=too_many_files),
         ):
-            with self.assertRaisesRegex(ValueError, "libsndfile says no.*ffprobe missing"):
-                inspect_media(Path("notes.txt"))
+            with self.assertRaises(OSError):
+                open_media_session(Path("a.wav"))
+
+        with (
+            patch("src.audio.media.soundfile.info", side_effect=RuntimeError("System error")),
+            patch("src.audio.media.Path.open", side_effect=too_many_files),
+        ):
+            with self.assertRaises(OSError):
+                inspect_media(Path("a.wav"))
 
     def test_ffmpeg_binary_uses_external_environment_without_hardcoded_path(self) -> None:
         with patch.dict("os.environ", {"FFMPEG_BINARY": "C:/tools/ffmpeg.exe"}):
@@ -193,23 +233,37 @@ class MediaDecodingTests(unittest.TestCase):
 
 
 class _ScriptedModel(nn.Module):
-    """Emit one fixed token per row at frame 0; optionally fail the encoder."""
+    """
+    Emit one fixed token per row; optionally fail the encoder.
 
-    def __init__(self, token_id: int, encoder_finite: bool = True) -> None:
+    ``at_last_frame`` emits the token on the row's final encoder frame with
+    duration 4, so its midpoint lies past the end of the audio.
+    """
+
+    def __init__(self, token_id: int, encoder_finite: bool = True, at_last_frame: bool = False) -> None:
         super().__init__()
         self.anchor = nn.Parameter(torch.zeros(1))
         self.token_id = token_id
         self.encoder_finite = encoder_finite
+        self.at_last_frame = at_last_frame
 
     def generate(self, features: torch.Tensor, mask: torch.Tensor) -> GenerationResult:
         batch_size = features.shape[0]
         device = features.device
+        # Subsampling by 8: encoder frames = ceil(valid feature frames / 8).
+        encoder_lengths = (mask.sum(dim=1) + 7) // 8
+        if self.at_last_frame:
+            starts = (encoder_lengths - 1).clamp(min=0)[:, None]
+            durations = torch.full((batch_size, 1), 4, dtype=torch.long, device=device)
+        else:
+            starts = torch.zeros((batch_size, 1), dtype=torch.long, device=device)
+            durations = torch.ones((batch_size, 1), dtype=torch.long, device=device)
         return GenerationResult(
             sequences=torch.full((batch_size, 1), self.token_id, dtype=torch.long, device=device),
-            durations=torch.ones((batch_size, 1), dtype=torch.long, device=device),
-            frame_starts=torch.zeros((batch_size, 1), dtype=torch.long, device=device),
-            frame_ends=torch.ones((batch_size, 1), dtype=torch.long, device=device),
-            encoder_lengths=mask.sum(dim=1),
+            durations=durations,
+            frame_starts=starts,
+            frame_ends=starts + durations,
+            encoder_lengths=encoder_lengths,
             forced_advances=torch.zeros(batch_size, dtype=torch.long, device=device),
             encoder_finite=torch.full((batch_size,), self.encoder_finite, device=device),
         )
@@ -249,6 +303,72 @@ class OfflineServiceTests(unittest.TestCase):
         result = self._transcribe(_ScriptedModel(token_id=11), torch.zeros(16000))
 
         self.assertEqual(result.files[0].status, FileStatus.NO_SPEECH)
+
+    def test_token_at_end_of_audio_is_kept(self) -> None:
+        """
+        Regression: a token on the last encoder frame has its midpoint at or
+        past the end of the file and was dropped by the half-open core bound.
+        """
+
+        single_chunk = self._transcribe(
+            _ScriptedModel(token_id=3, at_last_frame=True),
+            torch.full((12_800,), 0.1),  # 80 feature frames: one chunk
+        )
+        multi_chunk = self._transcribe(
+            _ScriptedModel(token_id=3, at_last_frame=True),
+            torch.full((32_000,), 0.1),
+        )
+
+        self.assertEqual(len(single_chunk.plan.items), 1)
+        self.assertEqual(single_chunk.files[0].transcript, "a")
+        # Earlier chunks' end tokens fall in their right overlap and belong to
+        # the next core; only the final chunk's end token survives.
+        self.assertGreater(len(multi_chunk.plan.items), 1)
+        self.assertEqual(multi_chunk.files[0].transcript, "a")
+
+    def test_decoder_handles_are_opened_lazily_and_released(self) -> None:
+        """
+        Regression: every file's handle was opened before the first batch, so
+        a large folder could exhaust the process file limit.
+        """
+
+        open_sessions: list[object] = []
+        peak = [0]
+        original_open = offline_module.open_media_session
+
+        def tracking_open(path: Path):
+            session = original_open(path)
+            original_close = session.close
+            open_sessions.append(session)
+            peak[0] = max(peak[0], len(open_sessions))
+
+            def tracking_close() -> None:
+                if session in open_sessions:
+                    open_sessions.remove(session)
+                original_close()
+
+            session.close = tracking_close
+            return session
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            configuration = load_config(write_tiny_checkpoint(root / "checkpoint"))
+            paths = []
+            for index in range(6):
+                path = root / f"clip_{index}.wav"
+                write_float_wav(path, torch.full((8_000,), 0.1), TARGET_RATE)
+                paths.append(path)
+            transcriber = OfflineTranscriber(
+                _ScriptedModel(token_id=3).eval(),
+                configuration,
+                inference_settings(batch_size=1),
+            )
+            with patch.object(offline_module, "open_media_session", tracking_open):
+                result = transcriber.transcribe(paths)
+
+        self.assertEqual(len(result.files), 6)
+        self.assertEqual(peak[0], 1)
+        self.assertEqual(open_sessions, [])
 
 
 def _chunk(**overrides: object) -> ChunkResult:

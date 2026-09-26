@@ -149,13 +149,27 @@ def _schedule_round_robin(items: Iterable[WorkItem]) -> list[WorkItem]:
     return scheduled
 
 
+def padded_batch_frames(items: Iterable[WorkItem]) -> int:
+    """
+    Return the frames a batch really allocates: rows x longest row.
+
+    Features, encoder activations, and attention are padded to the longest
+    item, so this (not the sum of item lengths) is what memory scales with.
+    """
+
+    item_list = list(items)
+    if not item_list:
+        return 0
+    return len(item_list) * max(item.feature_frames for item in item_list)
+
+
 def _batch_items(
     items: Iterable[WorkItem],
     batch_size: int,
     max_batch_feature_frames: int,
     max_padding_fraction: float,
 ) -> tuple[tuple[WorkItem, ...], ...]:
-    """Pack scheduled work into deterministic bounded microbatches."""
+    """Pack scheduled work into deterministic micro-batches bounded by padded size."""
 
     if batch_size <= 0 or max_batch_feature_frames <= 0:
         raise ValueError("batch_size and max_batch_feature_frames must be positive")
@@ -164,7 +178,6 @@ def _batch_items(
 
     batches: list[tuple[WorkItem, ...]] = []
     current: list[WorkItem] = []
-    current_frames = 0
     for item in items:
         if item.feature_frames > max_batch_feature_frames:
             raise ValueError(
@@ -173,21 +186,15 @@ def _batch_items(
             )
 
         candidate = current + [item]
-        candidate_frames = current_frames + item.feature_frames
         exceeds_limits = (
             len(candidate) > batch_size
-            or candidate_frames > max_batch_feature_frames
+            or padded_batch_frames(candidate) > max_batch_feature_frames
             or _padding_fraction(candidate) > max_padding_fraction
         )
         if current and exceeds_limits:
             batches.append(tuple(current))
-            current = []
-            current_frames = 0
             candidate = [item]
-            candidate_frames = item.feature_frames
-
         current = candidate
-        current_frames = candidate_frames
 
     if current:
         batches.append(tuple(current))

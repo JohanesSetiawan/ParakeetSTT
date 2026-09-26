@@ -1,9 +1,11 @@
 """
 One-time checkpoint bootstrap for the easy-to-use inference command.
 
-The first run validates/downloads source artifacts, converts ``model.pth`` when
-needed, and strict-loads the native model. Only after all stages succeed is a
-readiness marker written atomically.
+The first run validates/downloads source artifacts and converts ``model.pth``
+when needed. The caller's loader then strict-loads the model exactly once, and
+only after that load succeeds is the readiness marker written atomically. The
+loaded model is returned, so the first run does not pay for a second 2.5 GB
+checkpoint load just to prove the first one worked.
 
 Later runs take a fast path: the marker must exist and ``model.pth`` must still
 have the byte size recorded in it. That check is two ``stat`` calls, so it
@@ -19,12 +21,9 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable
-
-import torch
+from typing import Callable, TypeVar
 
 from ..configuration.settings import CheckpointSettings
-from ..models.parakeet import load_model
 from ..runtime.filesystem import write_json_atomic
 from .orchestration import CheckpointPreparationResult, prepare_checkpoint
 
@@ -34,6 +33,8 @@ logger = logging.getLogger(__name__)
 READINESS_MARKER_FILENAME = ".ready"
 READINESS_SCHEMA_VERSION = 1
 CHECKPOINT_FILENAME = "model.pth"
+
+LoadedModel = TypeVar("LoadedModel")
 
 
 @dataclass(frozen=True)
@@ -96,20 +97,26 @@ def clear_readiness_marker(checkpoint_dir: Path) -> None:
 def ensure_first_run_ready(
     checkpoint_dir: Path,
     checkpoint_settings: CheckpointSettings,
+    loader: Callable[[Path], LoadedModel],
     force_repair: bool = False,
     progress_callback: Callable[[str], None] | None = None,
-) -> BootstrapResult:
+) -> tuple[BootstrapResult, LoadedModel]:
     """
-    Prepare the checkpoint once, then use the fast marker path thereafter.
+    Prepare the checkpoint when needed, then strict-load it exactly once.
 
     Args:
         checkpoint_dir: Checkpoint directory containing source and PTH artifacts.
         checkpoint_settings: Download/stream policy from config.toml.
+        loader: Strict loader called with the resolved directory; its return
+            value is passed through. It must raise when the checkpoint does
+            not match the model, because the marker is written only after it
+            returns.
         force_repair: Remove readiness and rerun preparation even when marked.
         progress_callback: Optional plain-text progress callback.
 
     Returns:
-        ``ready`` for the fast path or ``prepared`` after full first-run work.
+        ``(result, loaded)`` where ``result.action`` is ``ready`` for the fast
+        path or ``prepared`` after full first-run work.
     """
 
     resolved_dir = checkpoint_dir.resolve()
@@ -119,7 +126,8 @@ def ensure_first_run_ready(
         marker_path.unlink(missing_ok=True)
 
     if _marker_is_current(marker_path, resolved_dir / CHECKPOINT_FILENAME):
-        return BootstrapResult(action="ready", marker_path=str(marker_path), preparation=None)
+        loaded = loader(resolved_dir)
+        return BootstrapResult(action="ready", marker_path=str(marker_path), preparation=None), loaded
 
     if marker_path.is_file():
         logger.warning("readiness marker is stale (model.pth missing or resized); re-preparing")
@@ -135,14 +143,11 @@ def ensure_first_run_ready(
 
     if progress_callback is not None:
         progress_callback("First run: strict-loading model.pth before marking ready")
-
-    # Strict-load on CPU to prove the generated bundle matches the native model
-    # without claiming accelerator memory the inference load needs next.
-    model, _configuration, _metadata = load_model(resolved_dir, device=torch.device("cpu"))
-    del model
+    loaded = loader(resolved_dir)
 
     marker_path = _write_readiness_marker(resolved_dir)
     if progress_callback is not None:
         progress_callback(f"Checkpoint ready marker created: {marker_path}")
 
-    return BootstrapResult(action="prepared", marker_path=str(marker_path), preparation=preparation)
+    result = BootstrapResult(action="prepared", marker_path=str(marker_path), preparation=preparation)
+    return result, loaded

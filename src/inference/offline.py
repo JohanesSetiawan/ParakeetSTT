@@ -14,6 +14,7 @@ looking like a normal transcript.
 from __future__ import annotations
 
 import logging
+import math
 import time
 from dataclasses import dataclass
 from enum import StrEnum
@@ -47,6 +48,8 @@ class FileStatus(StrEnum):
         transcript comes from a degenerate decoding loop.
     NO_SPEECH: every chunk was digital silence and nothing was transcribed.
     EMPTY_TRANSCRIPT: audio was not silent but no token was produced.
+    UNREADABLE: the file could not be decoded as audio and was not
+        transcribed; assigned by the command layer during discovery.
     """
 
     NUMERICAL_FAILURE = "numerical_failure"
@@ -54,6 +57,7 @@ class FileStatus(StrEnum):
     DECODER_FORCED_ADVANCE = "decoder_forced_advance"
     NO_SPEECH = "no_speech"
     EMPTY_TRANSCRIPT = "empty_transcript"
+    UNREADABLE = "unreadable"
     OK = "ok"
 
 
@@ -124,6 +128,37 @@ class OfflineRunResult:
         if self.elapsed_seconds <= 0:
             return 0.0
         return self.total_audio_seconds / self.elapsed_seconds
+
+
+@dataclass(frozen=True)
+class _GenerationOnHost:
+    """A batch's generation output copied to Python lists, one transfer each."""
+
+    sequences: list[list[int]]
+    durations: list[list[int]]
+    frame_starts: list[list[int]]
+    frame_ends: list[list[int]]
+    encoder_lengths: list[int]
+    forced_advances: list[int]
+    encoder_finite: list[bool]
+    features_finite: list[bool]
+
+    @classmethod
+    def from_device(
+        cls,
+        generation: GenerationResult,
+        features_finite: torch.Tensor,
+    ) -> _GenerationOnHost:
+        return cls(
+            sequences=generation.sequences.cpu().tolist(),
+            durations=generation.durations.cpu().tolist(),
+            frame_starts=generation.frame_starts.cpu().tolist(),
+            frame_ends=generation.frame_ends.cpu().tolist(),
+            encoder_lengths=generation.encoder_lengths.cpu().tolist(),
+            forced_advances=generation.forced_advances.cpu().tolist(),
+            encoder_finite=generation.encoder_finite.cpu().tolist(),
+            features_finite=features_finite.cpu().tolist(),
+        )
 
 
 def classify_file(transcript: str, chunks: tuple[ChunkResult, ...]) -> FileStatus:
@@ -216,12 +251,24 @@ class OfflineTranscriber:
         sequential_state: dict[Path, tuple[int, torch.Tensor]],
         remaining_chunks: dict[Path, int],
     ) -> tuple[DecodedSegment, ...]:
-        """Decode each item in plan order, reusing per-file overlap tails."""
+        """
+        Decode each item in plan order, reusing per-file overlap tails.
+
+        A file's decoder session is opened at its first chunk and closed after
+        its last one, so single-chunk files never hold a handle beyond their
+        own batch and the number of open handles tracks the files that are
+        actually in progress, not the size of the folder.
+        """
 
         segments: list[DecodedSegment] = []
         for item in items:
+            session = sessions.get(item.path)
+            if session is None:
+                session = open_media_session(item.path)
+                sessions[item.path] = session
+
             previous = sequential_state.get(item.path)
-            segment, waveform = sessions[item.path].read_sequential_segment(
+            segment, waveform = session.read_sequential_segment(
                 item.source_start_frame,
                 item.source_end_frame,
                 self.target_sample_rate,
@@ -237,7 +284,7 @@ class OfflineTranscriber:
                 sequential_state[item.path] = (item.source_end_frame, waveform)
             else:
                 sequential_state.pop(item.path, None)
-                sessions[item.path].close()
+                sessions.pop(item.path).close()
         return tuple(segments)
 
     def _out_of_memory(self, stage: str, items: tuple[WorkItem, ...]) -> RuntimeError:
@@ -297,9 +344,12 @@ class OfflineTranscriber:
             torch.cuda.synchronize(self.device)
         generation_seconds = time.perf_counter() - generation_started
 
-        features_finite_rows = features_finite.cpu().tolist()
+        # One device-to-host copy per tensor for the whole batch; indexing
+        # rows on the device first would cost one synchronizing copy per row
+        # and per field.
+        host = _GenerationOnHost.from_device(generation, features_finite)
         results = tuple(
-            self._chunk_result(item, segment, generation, row_index, features_finite_rows[row_index])
+            self._chunk_result(item, segment, host, row_index)
             for row_index, (item, segment) in enumerate(zip(items, segments))
         )
         timings = {
@@ -321,24 +371,23 @@ class OfflineTranscriber:
         self,
         item: WorkItem,
         segment: DecodedSegment,
-        generation: GenerationResult,
+        host: _GenerationOnHost,
         row_index: int,
-        features_finite: bool,
     ) -> ChunkResult:
-        """Move one generated row to CPU together with its health facts."""
+        """Assemble one row's tokens and health facts from host-side lists."""
 
         return ChunkResult(
             item=item,
-            token_ids=tuple(generation.sequences[row_index].cpu().tolist()),
-            durations=tuple(generation.durations[row_index].cpu().tolist()),
-            frame_starts=tuple(generation.frame_starts[row_index].cpu().tolist()),
-            frame_ends=tuple(generation.frame_ends[row_index].cpu().tolist()),
-            encoder_length=int(generation.encoder_lengths[row_index].cpu()),
+            token_ids=tuple(host.sequences[row_index]),
+            durations=tuple(host.durations[row_index]),
+            frame_starts=tuple(host.frame_starts[row_index]),
+            frame_ends=tuple(host.frame_ends[row_index]),
+            encoder_length=host.encoder_lengths[row_index],
             input_finite=segment.finite,
             silent=segment.rms == 0.0,
-            features_finite=features_finite,
-            encoder_finite=bool(generation.encoder_finite[row_index].cpu()),
-            forced_advances=int(generation.forced_advances[row_index].cpu()),
+            features_finite=host.features_finite[row_index],
+            encoder_finite=host.encoder_finite[row_index],
+            forced_advances=host.forced_advances[row_index],
         )
 
     # -------------------------------------------------------------------------
@@ -359,17 +408,28 @@ class OfflineTranscriber:
         """
 
         ordered_chunks = tuple(sorted(chunks, key=lambda chunk: chunk.item.chunk_index))
+        last_chunk_index = ordered_chunks[-1].item.chunk_index if ordered_chunks else -1
         merged_tokens: list[int] = []
         for chunk in ordered_chunks:
             if not chunk.numerically_valid:
                 continue
+
+            # The last core has no successor to hand tokens to. Its midpoint
+            # can land at or past the end of the audio (last encoder frame,
+            # or a long duration), and such a token must still be kept.
+            core_start = chunk.item.core_start_frame
+            if chunk.item.chunk_index == last_chunk_index:
+                core_end: float = math.inf
+            else:
+                core_end = chunk.item.core_end_frame
+
             for token, start, end in zip(chunk.token_ids, chunk.frame_starts, chunk.frame_ends):
                 if token in self.special_token_ids:
                     continue
                 token_start = chunk.item.source_start_frame + start * self.samples_per_encoder_frame
                 token_end = chunk.item.source_start_frame + end * self.samples_per_encoder_frame
                 midpoint = (token_start + token_end) // 2
-                if chunk.item.core_start_frame <= midpoint < chunk.item.core_end_frame:
+                if core_start <= midpoint < core_end:
                     merged_tokens.append(token)
 
         transcript = self.tokenizer.decode(merged_tokens)
@@ -434,7 +494,7 @@ class OfflineTranscriber:
         if self.device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(self.device)
 
-        sessions = {path: open_media_session(path) for path in path_tuple}
+        sessions: dict[Path, MediaSession] = {}
         sequential_state: dict[Path, tuple[int, torch.Tensor]] = {}
         chunk_results: dict[int, list[ChunkResult]] = {index: [] for index in range(len(path_tuple))}
         stage_totals = {"decode": 0.0, "feature": 0.0, "generation": 0.0}

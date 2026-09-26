@@ -22,7 +22,9 @@ from ..configuration.settings import load_settings
 from ..runtime.logging_setup import configure_run_logging
 
 
-logger = logging.getLogger(__name__)
+# A literal name: under `python -m` __name__ is "__main__", outside the "src"
+# logger that owns the run log file, so lines and tracebacks would be lost.
+logger = logging.getLogger("src.commands.prepare_checkpoint")
 
 
 def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:

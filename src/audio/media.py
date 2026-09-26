@@ -32,6 +32,16 @@ from ..inference.planning import AudioMetadata
 SOUNDFILE_OPEN_ERRORS = (RuntimeError, OSError)
 
 
+class CodecUnavailableError(RuntimeError):
+    """
+    FFprobe/FFmpeg is not installed, so a non-libsndfile format cannot be read.
+
+    This is a per-file limitation (the file is skipped as unreadable). A codec
+    path that is configured but wrong raises a plain RuntimeError instead,
+    because that is a setup mistake that must stop the run.
+    """
+
+
 @dataclass(frozen=True)
 class DecodedSegment:
     """
@@ -82,7 +92,7 @@ def _run_ffprobe(path: Path) -> dict[str, object]:
 
     executable = _codec_binary("FFPROBE_BINARY", "ffprobe")
     if executable is None:
-        raise RuntimeError(
+        raise CodecUnavailableError(
             "The media format is not supported by soundfile/libsndfile and "
             "ffprobe was not found in PATH. Set FFPROBE_BINARY externally."
         )
@@ -136,6 +146,19 @@ def _probe_number(value: object, name: str) -> float:
 # =============================================================================
 
 
+def _require_openable(path: Path) -> None:
+    """
+    Re-raise OS-level open failures that libsndfile reports as format errors.
+
+    libsndfile turns "file missing", "access denied", and "too many open
+    files" into the same error as "unknown format". Only the last one may send
+    a file to the FFmpeg fallback; the others must surface as they are.
+    """
+
+    with path.open("rb"):
+        pass
+
+
 def _metadata_from_probe(path: Path, probe: dict[str, object]) -> AudioMetadata:
     """
     Convert FFprobe output into planner metadata.
@@ -173,16 +196,21 @@ def inspect_media(path: Path) -> AudioMetadata:
     Read container metadata without decoding samples.
 
     Raises:
-        ValueError: If neither libsndfile nor FFprobe can read an audio stream.
-            The message carries both backend errors.
+        ValueError: If neither libsndfile nor FFprobe can read an audio stream,
+            including when FFprobe is not installed. The message carries both
+            backend errors.
+        OSError: If the file itself cannot be opened (missing, permission,
+            too many open files); that is not a format problem.
+        RuntimeError: If FFPROBE_BINARY is set but points nowhere.
     """
 
     try:
         information = soundfile.info(str(path))
     except SOUNDFILE_OPEN_ERRORS as soundfile_error:
+        _require_openable(path)
         try:
             return _metadata_from_probe(path, _run_ffprobe(path))
-        except (RuntimeError, ValueError) as probe_error:
+        except (CodecUnavailableError, ValueError) as probe_error:
             raise ValueError(
                 f"Unsupported or unreadable media {path}: "
                 f"soundfile: {soundfile_error}; ffprobe: {probe_error}"
@@ -273,7 +301,7 @@ def _read_ffmpeg_segment(
 
     executable = _codec_binary("FFMPEG_BINARY", "ffmpeg")
     if executable is None:
-        raise RuntimeError(
+        raise CodecUnavailableError(
             "The media format is not supported by soundfile/libsndfile and "
             "ffmpeg was not found in PATH. Set FFMPEG_BINARY externally."
         )
@@ -348,7 +376,9 @@ class MediaSession:
         try:
             self._source = soundfile.SoundFile(str(path), mode="r")
         except SOUNDFILE_OPEN_ERRORS:
-            # FFmpeg fallback; per-segment subprocesses are spawned on demand.
+            _require_openable(path)
+            # A format libsndfile cannot decode: FFmpeg fallback, with
+            # per-segment subprocesses spawned on demand.
             self._source = None
 
     def __enter__(self) -> "MediaSession":

@@ -50,8 +50,14 @@ class RealWeightsSmokeTest(unittest.TestCase):
         self.assertEqual(exit_code, 0, output)
         self.assertIn("Device:", output)
         self.assertIn("Batch: ", output)
-        self.assertEqual([row["filename_audio"] for row in rows], [sample.name for sample in SAMPLES])
-        for row in rows:
+        self.assertIn("Skipped unreadable file: readme.txt", output)
+
+        # The non-audio file is reported with its own row, never dropped.
+        by_name = {row["filename_audio"]: row for row in rows}
+        self.assertEqual(set(by_name), {sample.name for sample in SAMPLES} | {"readme.txt"})
+        self.assertEqual(by_name["readme.txt"]["status"], "unreadable")
+        for sample in SAMPLES:
+            row = by_name[sample.name]
             self.assertEqual(row["status"], "ok")
             self.assertGreater(len(row["transcription"].split()), 3)
         print(output, file=sys.stderr)
