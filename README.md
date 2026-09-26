@@ -317,6 +317,6 @@ tests/                        Unit, integration, and smoke tests
 
 ## License and attribution
 
-The model weights are published by NVIDIA as `nvidia/parakeet-tdt-0.6b-v3` under [CC-BY-4.0](https://creativecommons.org/licenses/by/4.0/). Using or redistributing them requires attribution to NVIDIA. This repository does not include the weights; they are downloaded from Hugging Face on first use.
+The source code in this repository is licensed under the [Creative Commons Attribution 4.0 International License (CC-BY-4.0)](https://creativecommons.org/licenses/by/4.0/), the same license NVIDIA uses for the model. The full legal text is in [LICENSE](LICENSE). Copyright (c) 2026 Johanes Setiawan.
 
-This repository does not yet include a license file for its source code.
+The model weights are a separate work: NVIDIA publishes them as [`nvidia/parakeet-tdt-0.6b-v3`](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) under CC-BY-4.0. Using or redistributing the weights requires attribution to NVIDIA. This repository does not include the weights; they are downloaded from Hugging Face on first use.
