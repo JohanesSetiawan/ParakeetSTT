@@ -61,10 +61,11 @@ Decoding is greedy. Beam search and language-model rescoring are not implemented
 
 2. Install PyTorch for your platform using the selector at [pytorch.org](https://pytorch.org/get-started/locally/). Keep the index URL it gives you and add `--no-cache-dir`.
 
-3. Install the audio dependency:
+3. Install the runtime dependencies (and, to run the tests, the development ones):
 
    ```powershell
-   venv\Scripts\python.exe -m pip install soundfile numpy --no-cache-dir
+   venv\Scripts\python.exe -m pip install -r requirements.txt --no-cache-dir
+   venv\Scripts\python.exe -m pip install -r requirements-dev.txt --no-cache-dir
    ```
 
 4. Optionally install FFmpeg and make sure `ffmpeg` and `ffprobe` are on `PATH`.
@@ -279,13 +280,23 @@ Transcripts themselves are not written to the log.
 
 ## Running the tests
 
-The tests use the standard library `unittest`:
+The suite uses pytest (`requirements-dev.txt`) and has three tiers, selected by directory:
+
+| Tier | Directory | What it needs | What it checks |
+|---|---|---|---|
+| `unit` | `tests/unit/` | nothing (tiny fixture checkpoint, CPU) | planner, features, TDT loop, media decoding, merge, statuses, settings, checkpoint download and conversion against a local HTTP server, CLI |
+| `regression` | `tests/regression/` | nothing | one test per defect that was found and fixed, each naming the fixing commit |
+| `full` | `tests/full/` | the prepared checkpoint | real speech end to end: exact transcripts, word error rate, batching and determinism, long-form memory bound, anomalies, the real `inference.py` command, and parity with Hugging Face `ParakeetForTDT` (when `transformers` is installed) |
 
 ```powershell
-venv\Scripts\python.exe -m unittest discover -s tests -p "test_*.py"
+venv\Scripts\python.exe -m pytest                     # everything
+venv\Scripts\python.exe -m pytest -m "not full"       # fast suite, no checkpoint needed
+venv\Scripts\python.exe -m pytest -m full             # real checkpoint and speech only
 ```
 
-Most tests build a tiny schema-valid checkpoint (`tests/support.py`) and need neither the real weights nor a GPU. `tests/test_smoke_real_weights.py` runs the real command on two sample WAVs. It is skipped automatically when the prepared checkpoint or the local sample audio (`docs/*.wav`, not committed) is missing.
+The `full` tier uses five LibriSpeech clips committed under `tests/data/librispeech/` (CC BY 4.0; see `SOURCE.md` there). If the checkpoint has not been prepared, the whole tier is skipped with a message rather than downloading it. To also run your own long recordings through the long-form checks, list them in `PARAKEET_TEST_LONG_AUDIO`, separated by `;` on Windows or `:` elsewhere.
+
+On the development machine the full suite (175 tests) takes about 70 seconds. Two `full` tests are marked as expected failures for the known chunk-boundary defect (see [Known limitations](#known-limitations)). pytest runs with strict expected failures, so fixing the defect makes those tests fail until their markers are removed.
 
 ## Project layout
 
@@ -301,13 +312,18 @@ src/
   models/                     Subsampling, attention, Conformer blocks, encoder, LSTM decoder, joint, TDT loop
   runtime/                    Device selection and report, dated logging, atomic file writes
   text/                       Tokenizer decoding from tokenizer.json
-tests/                        Unit, integration, and smoke tests
+tests/
+  unit/                       Fast isolated tests (tiny fixture checkpoint)
+  regression/                 One test per fixed defect
+  full/                       Real checkpoint and real speech, end to end
+  data/librispeech/           Five CC BY 4.0 speech clips with expected transcripts
 ```
 
 [AGENTS.md](AGENTS.md) documents the architecture, invariants, and development rules in depth.
 
 ## Known limitations
 
+- **Chunk boundaries cost accuracy.** Audio longer than about 15 s is split into chunks, and merging them can insert a stray subword fragment at a boundary: for example "smile atile at one" where the unchunked reference says "smile at one". On the test clips, word error rate rises from 6.4% (each clip transcribed alone) to 13.3% when the same speech is transcribed as one 196-second recording cut into 15 chunks. The `full` test tier tracks this as a known defect.
 - **Resampling** is linear interpolation without a low-pass filter. Audio above 16 kHz sample rate with strong content above 8 kHz is aliased slightly, and the FFmpeg path resamples differently from the libsndfile path.
 - **The FFmpeg fallback** starts one `ffmpeg` process per chunk and decodes overlap regions twice. libsndfile formats are not affected.
 - **The greedy decoding loop** synchronizes with the GPU once per step. It is the dominant cost of a run.

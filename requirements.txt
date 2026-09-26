@@ -1,0 +1,7 @@
+# Runtime dependencies. Install PyTorch for your platform first
+# (https://pytorch.org/get-started/locally/); it is not listed here because
+# the right wheel depends on the operating system and accelerator.
+#
+#   venv\Scripts\python.exe -m pip install -r requirements.txt --no-cache-dir
+soundfile
+numpy

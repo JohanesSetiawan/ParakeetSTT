@@ -1,0 +1,60 @@
+{
+  "description": "LibriSpeech dev-clean clips used by the full test tier. reference_text is the LibriSpeech human transcript. expected_transcript is this runtime's output with default config.toml settings, recorded on 2026-09-26. full_context_transcript is Hugging Face ParakeetForTDT on the whole clip without chunking; it equals expected_transcript for every single-chunk clip.",
+  "clips": [
+    {
+      "id": "1272-128104-0000",
+      "file": "1272-128104-0000.flac",
+      "sha256": "4e25e22555cd16e90edb0a3b49fdcf1fe652b2a1250ab643634db33895c75b41",
+      "duration_seconds": 5.855,
+      "chunks": 1,
+      "reference_text": "MISTER QUILTER IS THE APOSTLE OF THE MIDDLE CLASSES AND WE ARE GLAD TO WELCOME HIS GOSPEL",
+      "expected_transcript": "mister Quilter is the apostle of the middle classes, and we are glad to welcome his gospel.",
+      "expected_status": "ok",
+      "full_context_transcript": "mister Quilter is the apostle of the middle classes, and we are glad to welcome his gospel."
+    },
+    {
+      "id": "1272-128104-0001",
+      "file": "1272-128104-0001.flac",
+      "sha256": "46a9d58622b4675b29564da2d9ba73e702241c5fa969f12c387cad4aa984276a",
+      "duration_seconds": 4.815,
+      "chunks": 1,
+      "reference_text": "NOR IS MISTER QUILTER'S MANNER LESS INTERESTING THAN HIS MATTER",
+      "expected_transcript": "Nor is mister Quilter's manner less interesting than his matter.",
+      "expected_status": "ok",
+      "full_context_transcript": "Nor is mister Quilter's manner less interesting than his matter."
+    },
+    {
+      "id": "1272-128104-0004",
+      "file": "1272-128104-0004.flac",
+      "sha256": "07244790e9a8300bfcbf12c28ac5230792e75238d03b2ac167a72bf3943c5404",
+      "duration_seconds": 29.4,
+      "chunks": 3,
+      "reference_text": "LINNELL'S PICTURES ARE A SORT OF UP GUARDS AND AT EM PAINTINGS AND MASON'S EXQUISITE IDYLLS ARE AS NATIONAL AS A JINGO POEM MISTER BIRKET FOSTER'S LANDSCAPES SMILE AT ONE MUCH IN THE SAME WAY THAT MISTER CARKER USED TO FLASH HIS TEETH AND MISTER JOHN COLLIER GIVES HIS SITTER A CHEERFUL SLAP ON THE BACK BEFORE HE SAYS LIKE A SHAMPOOER IN A TURKISH BATH NEXT MAN",
+      "expected_transcript": "Linnell's pictures are a sort of up guards and atom paintings, and Mason's exquisite idols are as national as a jingo poem. mister Burkett Foster's landscapes smile atile at one much in the same way that mister Carker used to flash his teeth. And Mr John Collier gives his sitter a cheerful slap on the back, before he says, like a shampooer in a Turkish bath, ne Next man.",
+      "expected_status": "ok",
+      "full_context_transcript": "Linnell's pictures are a sort of up guards an atom paintings, and Mason's exquisite idols are as national as a jingo poem. mister Burkett Foster's landscapes smile at one much in the same way that mister Carker used to flash his teeth. And mister John Collier gives his sitter a cheerful slap on the back, before he says, like a shampooer in a Turkish bath Next man"
+    },
+    {
+      "id": "1272-135031-0009",
+      "file": "1272-135031-0009.flac",
+      "sha256": "d23fc0e9c9ccb35f6ec9223954c921e1c9daa0cc9d8e8ad10b3b9cb4b14b6617",
+      "duration_seconds": 1.91,
+      "chunks": 1,
+      "reference_text": "HE DOESN'T WORK AT ALL",
+      "expected_transcript": "He doesn't work at all.",
+      "expected_status": "ok",
+      "full_context_transcript": "He doesn't work at all."
+    },
+    {
+      "id": "1272-141231-0000",
+      "file": "1272-141231-0000.flac",
+      "sha256": "adb240047a1e0732c96b029b7dbd7c81a17c853cbd30aec0ee0d9c4e59fe720a",
+      "duration_seconds": 4.65,
+      "chunks": 1,
+      "reference_text": "A MAN SAID TO THE UNIVERSE SIR I EXIST",
+      "expected_transcript": "A man said to the universe, Sir, I exist.",
+      "expected_status": "ok",
+      "full_context_transcript": "A man said to the universe, Sir, I exist."
+    }
+  ]
+}

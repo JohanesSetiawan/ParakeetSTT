@@ -208,37 +208,67 @@ Never swallow an exception without logging it. Never report success for work tha
 
 ## 8. Testing strategy
 
-Run everything:
+The suite uses pytest (`requirements-dev.txt`, configured by `pytest.ini`). Tiers are assigned by directory in `tests/conftest.py`, so a test cannot sit in the wrong tier:
 
 ```powershell
-venv\Scripts\python.exe -m unittest discover -s tests -p "test_*.py"
+venv\Scripts\python.exe -m pytest                     # all tiers
+venv\Scripts\python.exe -m pytest -m "not full"       # fast suite: no checkpoint, no GPU
+venv\Scripts\python.exe -m pytest -m full             # real checkpoint and real speech
+venv\Scripts\python.exe -m pytest -m regression       # only the fixed-defect guards
 ```
 
-pytest is not a dependency; tests use `unittest`.
+| Tier | Location | Needs | Contents |
+|---|---|---|---|
+| unit | `tests/unit/` | nothing | `test_planning.py` (frame estimate, tiling and batch properties), `test_model.py` (config validation, features, TDT loop, duration table, non-finite rows, strict loading, tokenizer, attention), `test_offline.py` (sequential decoding bit-identity, downmix, ffprobe metadata, merge, statuses), `test_checkpoint.py` (download reuse, retry, pin rejection, conversion, against a real local HTTP server), `test_bootstrap.py`, `test_cli.py`, `test_runtime_services.py` |
+| regression | `tests/regression/test_fixed_defects.py` | nothing | one test per fixed defect; each docstring states the original failure and each section names the fixing commit |
+| full | `tests/full/` | prepared checkpoint | `test_accuracy.py` (exact transcripts, corpus WER budget, batching parity, determinism), `test_long_form.py` (chunking at scale, WER budget, CUDA memory bound, optional user recordings), `test_anomalies.py` (silence, noise, NaN samples, 48 kHz stereo), `test_command.py` (the real `inference.py` in a subprocess, folder CSV, FFmpeg fallback, error exit), `test_reference_parity.py` (HF `ParakeetForTDT` on CPU, skipped without `transformers`) |
 
-| File | Covers |
-|---|---|
-| `tests/support.py` | Fixtures: a tiny schema-valid checkpoint (`write_tiny_checkpoint`), a WAV writer, settings factories |
-| `test_native_parakeet.py` | config validation, feature finiteness and normalization, TDT guard, duration table, non-finite rows, strict/safe/meta loading, tokenizer, device report, attention masking |
-| `test_offline_transcription.py` | sequential decoding bit-identity (zero overlap, overlap longer than core, 48 kHz with an EOF short read), ffprobe metadata, OS-error handling, lazy sessions, merge ownership incl. end of audio, statuses |
-| `test_long_form.py` | STFT frame estimate, randomized tiling and budget properties, padded batch budget |
-| `test_inference_cli.py` | argument contract, CSV format and ordering, unreadable rows, codec errors, CSV fallback, early input validation, `python -m` logging, progress reporter |
-| `test_bootstrap.py` | readiness fast path, stale marker, single load, failed load leaves no marker, repair |
-| `test_checkpoint_preparation.py` | per-file download reuse and repair, legacy bundle bootstrap, conversion round trip, shard path traversal, payload size, progress rate |
-| `test_runtime_services.py` | settings validation, atomic writes under failure, dated logging |
-| `test_smoke_real_weights.py` | the real command end to end; skipped without the prepared checkpoint and `docs/*.wav` |
+Shared helpers live in `tests/support.py`:
+- the tiny checkpoint writer;
+- the WAV writer;
+- settings factories;
+- `ScriptedModel`, a stand-in for the model's `generate`;
+- the speech-clip loader, which checks each file's SHA-256 against `manifest.json`;
+- a dependency-free WER.
 
-Rules:
+Fixtures live in `tests/conftest.py`: `tiny_checkpoint_dir`, `tiny_configuration`, and the session-scoped `real_settings`, `real_model`, `speech_clips`.
 
-- Every bug fix gets a regression test that fails on the old code. Name the defect in the test docstring.
-- Prefer the tiny fixture checkpoint so tests run without the 2.5 GB weights or a GPU.
-- Prefer randomized or property-style checks for planner math, with a fixed seed.
-- Update existing tests when behavior changes on purpose. Do not delete them to make a change pass.
+### Real speech data
+
+`tests/data/librispeech/` holds five LibriSpeech dev-clean clips (CC BY 4.0, attribution in `SOURCE.md`) and `manifest.json`. For each clip the manifest records:
+
+- the SHA-256;
+- the LibriSpeech reference text;
+- `expected_transcript`, this runtime's output, recorded and cross-checked against Hugging Face;
+- `full_context_transcript`, Hugging Face on the unchunked clip.
+
+If a deliberate change alters a transcript, update `expected_transcript` in the same commit and state why in the commit body. Never regenerate expectations to make an unexplained diff disappear.
+
+### Known-defect tests
+
+Two `full` tests are `xfail(strict=True)` for the chunk-boundary defect (Section 16). Strict means that once the defect is fixed they pass unexpectedly and fail the run. Remove the marker and update `expected_transcript` for the chunked clip in the same change.
+
+### Thresholds
+
+The WER budgets are measured values plus a small margin, with the measurement written next to each constant:
+
+- corpus 6.42% measured, budget 7.5%;
+- long form 13.30% measured, budget 14%.
+
+Tighten a budget when accuracy improves. Never loosen one without a written reason.
+
+### Rules
+
+- Every bug fix gets a regression test in `tests/regression/` that fails on the old code. Name the defect and the fixing commit.
+- Prefer the tiny fixture checkpoint so tests run without the 2.5 GB weights or a GPU. Use `full` only for what needs real weights or real speech.
+- Prefer randomized or property-style checks for planner math, with fixed seeds.
+- The `full` tier never downloads the checkpoint. It skips with an explanation when `.ready` is missing.
+- Update existing tests when behavior changes on purpose. Do not delete or weaken them to make a change pass.
 - Do not claim tests pass unless they were run in this environment.
 
 ## 9. Verification protocol for inference changes
 
-Unit tests cannot prove numerical parity with the full model. Any change under `audio/`, `models/`, `inference/`, or `text/` also needs the checks below before merge. Run them with the real checkpoint on the development GPU.
+Unit tests cannot prove numerical parity with the full model. Any change under `audio/`, `models/`, `inference/`, or `text/` must pass `pytest -m full`, which automates checks 1 and 2 (and part of 3 and 6) on the committed clips. The remaining checks need longer recordings and instrumentation. Run them with the real checkpoint on the development GPU before merge.
 
 1. **Token parity, single vs mixed.** Transcribe each sample WAV alone, then all together as one folder. Compare token IDs and durations after stripping trailing padding (`pad_token_id` with duration 0), because rows in a batch are right-padded to the longest row. They must be identical.
 2. **Parity with the reference.** For each sample WAV, run Hugging Face `transformers` `ParakeetForTDT.from_pretrained(weights_dir)` with its `AutoProcessor` and `model.generate(..., return_dict_in_generate=True)`. Compare content tokens (blank and pad removed) and decoded text with this runtime. `transformers` is only a verification tool here; it must never become a runtime import.
@@ -280,6 +310,7 @@ Keep verification scripts outside the repository (a scratch directory). Report t
 - Do not add torchaudio, torchcodec, librosa, NeMo, or Transformers as runtime dependencies. Do not hardcode an FFmpeg path; resolve it through `FFMPEG_BINARY`/`FFPROBE_BINARY` or `PATH`.
 - Install with `pip ... --no-cache-dir`. Do not pin versions (`==`, `>=`, `<=`, `~=`) in install commands or dependency files.
 - Never upgrade, downgrade, or reinstall PyTorch as a side effect of another install. If a package would change torch, stop and ask.
+- Runtime dependencies are listed in `requirements.txt`, and test dependencies (pytest) in `requirements-dev.txt`. Both are unpinned. PyTorch is installed separately per platform.
 - Use the repository's `venv` interpreter.
 
 ## 12. Git and change management
@@ -360,6 +391,6 @@ These are known and deliberately not done yet. Each one needs the verification o
 - **FFmpeg fallback:** keep one persistent process per file instead of one per chunk, and stop re-decoding overlap on that path.
 - **Resampling:** anti-aliased windowed-sinc or polyphase resampling, benchmarked for accuracy against the current linear path.
 - **Budget tuning:** benchmark chunk sizes (1000 to 1750 frames), overlaps (0 to 100 frames), and batch budgets (2500 to 3500 frames) for speed and boundary accuracy.
-- **Boundary merging:** evaluate token-time ownership against alternatives on recordings with speech crossing chunk boundaries.
+- **Boundary merging (known defect, highest accuracy impact):** midpoint ownership can keep a subword from one chunk and the rest of the word from the next. For example, the 29.4 s test clip yields "smile atile at one" where the unchunked reference says "smile at one". On the test clips, WER goes from 6.42% per clip to 9.17% over 4 chunks and 13.30% over 15 chunks. Two strict-xfail tests in the `full` tier track it. Candidate fixes: word-aligned ownership (move a boundary to the nearest word-initial token), or dropping tokens whose frames fall in the overlap unless both chunks agree.
 - **Precision:** evaluate BF16/FP16 inference for memory headroom on 4 GB GPUs. Adopt only with measured parity or a documented, measured accuracy trade-off.
 - **Metrics:** per-file runtime metrics in folder mode, CPU RAM measurement, a machine-readable benchmark output for development.
