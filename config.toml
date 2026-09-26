@@ -1,5 +1,30 @@
+# Runtime configuration for the standalone Parakeet TDT runtime.
+# Relative paths resolve against the repository root, not the working directory.
+
+[paths]
+weights_dir = "weights/parakeet-tdt-0.6b-v3"
+log_dir = "logs"
+
+[logging]
+# Python logging level for the dated run log (DEBUG adds per-batch detail).
+level = "INFO"
+
+[checkpoint]
+request_timeout_seconds = 120.0
+download_attempts = 3
+# Wait before retry N is retry_backoff_seconds * N.
+retry_backoff_seconds = 2.0
+stream_block_bytes = 1048576
+
 [inference]
 batch_size = 8
 recursive = true
 output_filename = "transcriptions.csv"
-audio_extensions = [".wav"]
+# Empty list means every file is content-probed instead of filtered by extension.
+audio_extensions = []
+max_chunk_feature_frames = 1500
+overlap_feature_frames = 50
+max_batch_feature_frames = 3000
+max_padding_fraction = 0.25
+# Minimum wall-clock gap between two terminal progress lines.
+progress_interval_seconds = 2.0

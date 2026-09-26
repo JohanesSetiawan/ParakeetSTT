@@ -12,9 +12,14 @@ from pathlib import Path
 
 import torch
 
-from src.checkpoint import ensure_converted_checkpoint
-from src.conversion import convert_checkpoint
-from src.utils.download import DownloadSpec, ensure_checkpoint_files
+from src.checkpoint.orchestration import ensure_converted_checkpoint
+from src.checkpoint.conversion import (
+    convert_checkpoint,
+    read_safetensors_file,
+    resolve_safetensors_files,
+)
+from src.checkpoint.download import DownloadSpec, ensure_checkpoint_files
+from support import checkpoint_settings
 
 
 class _QuietRequestHandler(SimpleHTTPRequestHandler):
@@ -67,6 +72,7 @@ class CheckpointPreparationTests(unittest.TestCase):
 
                     first_run = ensure_checkpoint_files(
                         checkpoint_root,
+                        checkpoint_settings(),
                         specifications=specifications,
                     )
                     self.assertEqual(
@@ -76,6 +82,7 @@ class CheckpointPreparationTests(unittest.TestCase):
 
                     second_run = ensure_checkpoint_files(
                         checkpoint_root,
+                        checkpoint_settings(),
                         specifications=specifications,
                     )
                     self.assertEqual(
@@ -86,6 +93,7 @@ class CheckpointPreparationTests(unittest.TestCase):
                     (checkpoint_root / "second.json").write_bytes(b"corrupted")
                     third_run = ensure_checkpoint_files(
                         checkpoint_root,
+                        checkpoint_settings(),
                         specifications=specifications,
                     )
                     self.assertEqual(
@@ -212,13 +220,80 @@ class CheckpointPreparationTests(unittest.TestCase):
             )
             bundle = torch.load(
                 checkpoint_dir / "model.pth",
-                weights_only=False,
+                weights_only=True,
             )
 
             self.assertEqual(result.tensor_count, len(tensors))
             self.assertEqual(set(bundle["state_dict"]), set(tensors))
             for name, expected in tensors.items():
                 self.assertTrue(torch.equal(bundle["state_dict"][name], expected))
+
+    def test_index_shard_names_cannot_escape_checkpoint_dir(self) -> None:
+        """A malicious index naming ../ or absolute shard paths is rejected."""
+
+        for shard_name in ("../outside.safetensors", "sub/inner.safetensors", "C:/abs.safetensors", ""):
+            with self.subTest(shard_name=shard_name):
+                with tempfile.TemporaryDirectory() as temporary_directory:
+                    checkpoint_dir = Path(temporary_directory)
+                    (checkpoint_dir / "model.safetensors.index.json").write_text(
+                        json.dumps({"weight_map": {"layer.weight": shard_name}}),
+                        encoding="utf-8",
+                    )
+                    with self.assertRaisesRegex(ValueError, "invalid shard"):
+                        resolve_safetensors_files(checkpoint_dir)
+
+    def test_payload_size_must_match_shape_and_dtype(self) -> None:
+        """A descriptor whose byte range disagrees with its shape is rejected."""
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "model.safetensors"
+            payload = torch.ones(4).numpy().tobytes()
+            header = {"w": {"dtype": "F32", "shape": [3], "data_offsets": [0, len(payload)]}}
+            header_bytes = json.dumps(header).encode("utf-8")
+            path.write_bytes(len(header_bytes).to_bytes(8, "little") + header_bytes + payload)
+
+            with self.assertRaisesRegex(ValueError, "does not match shape"):
+                read_safetensors_file(path)
+
+    def test_download_progress_is_bounded_by_percent(self) -> None:
+        """Progress prints at most once per percent, not once per block."""
+
+        with tempfile.TemporaryDirectory() as server_directory:
+            with tempfile.TemporaryDirectory() as checkpoint_directory:
+                server_root = Path(server_directory)
+                payload = bytes(range(256)) * 40  # 10240 bytes, 2560 blocks of 4 bytes
+                (server_root / "blob.bin").write_bytes(payload)
+                handler = lambda *args, **kwargs: _QuietRequestHandler(
+                    *args,
+                    directory=server_root,
+                    **kwargs,
+                )
+                server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+                server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+                server_thread.start()
+                messages: list[str] = []
+                try:
+                    ensure_checkpoint_files(
+                        Path(checkpoint_directory),
+                        checkpoint_settings(),
+                        specifications=(
+                            DownloadSpec(
+                                "blob.bin",
+                                f"http://127.0.0.1:{server.server_port}/blob.bin",
+                                len(payload),
+                                expected_sha256=hashlib.sha256(payload).hexdigest(),
+                            ),
+                        ),
+                        progress_callback=messages.append,
+                    )
+                finally:
+                    server.shutdown()
+                    server.server_close()
+                    server_thread.join()
+
+        progress_lines = [message for message in messages if "Progress:" in message]
+        self.assertLessEqual(len(progress_lines), 101)
+        self.assertIn("Progress: 100 percent", progress_lines[-1])
 
 
 if __name__ == "__main__":

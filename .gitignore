@@ -219,6 +219,10 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
+# Claude Code local files
+.claude/
+CLAUDE.md
+
 # Folders
 datasets/
 deprecated/
@@ -226,7 +230,5 @@ weights/
 logs/
 metrics/
 checkpoints/
-results/
-debuggings/
 reports/
 docs/

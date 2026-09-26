@@ -1,254 +1,365 @@
-# Agent Guide for Parakeet TDT Runtime
+# AGENTS.md
 
-This document is the repository operating guide for AI agents. It describes only
-the Parakeet model, native PyTorch implementation, checkpoint artifacts,
-processing, inference, conversion, and tests. It does not describe unrelated
-future systems.
+Guidance for coding agents and contributors working on this repository. [README.md](README.md) explains how to use the runtime. This file explains how it is built, which properties must never break, and how to prove a change did not break them.
 
-A newer explicit user instruction takes precedence over this document. Do not
-invent undocumented repository behavior.
+## Contents
 
-## 1. Repository Purpose
+1. [Purpose and scope](#1-purpose-and-scope)
+2. [Architecture](#2-architecture)
+3. [Module map and dependency rules](#3-module-map-and-dependency-rules)
+4. [Invariants that must hold](#4-invariants-that-must-hold)
+5. [Configuration discipline](#5-configuration-discipline)
+6. [Error handling, statuses, and logging](#6-error-handling-statuses-and-logging)
+7. [Coding standards](#7-coding-standards)
+8. [Testing strategy](#8-testing-strategy)
+9. [Verification protocol for inference changes](#9-verification-protocol-for-inference-changes)
+10. [Performance work](#10-performance-work)
+11. [Dependencies and environment](#11-dependencies-and-environment)
+12. [Git and change management](#12-git-and-change-management)
+13. [What agents may and must not modify](#13-what-agents-may-and-must-not-modify)
+14. [Troubleshooting](#14-troubleshooting)
+15. [Decision records](#15-decision-records)
+16. [Open optimization items](#16-open-optimization-items)
 
-This repository reconstructs the local `nvidia/parakeet-tdt-0.6b-v3` checkpoint
-as a standalone native PyTorch runtime. The current objective is reliable local
-Parakeet checkpoint handling, native model behavior, checkpoint conversion, and
-simple offline inference.
+## 1. Purpose and scope
 
-The runtime preserves checkpoint behavior, reads JSON artifacts as the model
-configuration source of truth, and does not import the Hugging Face model runtime
-during native inference.
+This repository is a standalone PyTorch inference runtime for `nvidia/parakeet-tdt-0.6b-v3`. At runtime it uses only PyTorch, the Python standard library, and soundfile (plus FFmpeg as an optional external fallback). It must:
 
-## 2. Current Scope
+- produce the same tokens as the reference implementation (Hugging Face `ParakeetForTDT`);
+- transcribe audio of any length with memory that does not grow with duration;
+- process folders of mixed short and long files with bounded, deterministic batching;
+- report every anomaly explicitly instead of producing a normal-looking transcript;
+- run on a 4 GB GPU with the full float32 weights.
 
-Included:
+This repository only runs inference with the published checkpoint. Changing or replacing the model weights is out of scope.
 
-- Parakeet TDT JSON configuration loading and validation.
-- Native Fast Conformer encoder.
-- Native relative-position SDPA attention.
-- Native convolutional subsampling.
-- Native feed-forward and convolutional blocks.
-- Native LSTM prediction network and decoder cache.
-- Native TDT joint network.
-- Native greedy token-duration decoding.
-- Native JSON BPE and Metaspace decoding.
-- Strict `model.pth` loading.
-- Per-file checkpoint acquisition and identity validation.
-- Atomic safetensors-to-PyTorch conversion.
-- First-run readiness marker.
-- Single-file and folder inference.
-- Inference duration, latency, RTF, and throughput metrics.
+## 2. Architecture
 
-Explicitly excluded:
-
-- Changing full model weights.
-- Quantization, pruning, or distillation.
-- Training or fine-tuning.
-- Additional language adaptation.
-- Realtime streaming.
-- Long-form chunking and timestamp reconciliation.
-- External data collection or scraping.
-- Accuracy claims without trusted references.
-
-## 3. Verified Model Facts
-
-- Checkpoint: `nvidia/parakeet-tdt-0.6b-v3`.
-- Architecture: `ParakeetForTDT`.
-- Encoder: 24 layers, hidden size 1024, intermediate size 4096, 8 heads.
-- Decoder: hidden size 640, 2 LSTM layers.
-- Vocabulary: 8193 entries.
-- Blank ID: 8192.
-- Padding ID: 2.
-- Durations: `[0, 1, 2, 3, 4]`.
-- Mel features: 128.
-- Subsampling factor: 8.
-- Native model parameters: 627,008,134.
-- State-dictionary keys: 723.
-
-## 4. Repository Structure
+### Data flow of one command
 
 ```text
-src/
-  config.py                     JSON configuration and validation
-  audio.py                      Input container parsing
-  bootstrap.py                  Readiness marker and repair flow
-  checkpoint.py                 Acquisition and conversion orchestration
-  conversion.py                 Safetensors parsing and PTH serialization
-  inference.py                  Transcriber application service
-  processing.py                 Tensor preprocessing
-  settings.py                   TOML settings
-  tokenization.py               BPE and Metaspace decoder
-
-  model/
-    attention.py                Relative-position SDPA attention
-    conformer.py                Feed-forward and convolution blocks
-    decoder.py                  LSTM prediction network and cache
-    encoder.py                  Encoder stack orchestration
-    joint.py                    TDT joint projection
-    parakeet.py                 Model composition and strict loading
-    subsampling.py              Conv2d subsampling
-
-  utils/
-    artifacts.py                Bounded-memory hashing
-    download.py                 Artifact download and manifest handling
-    runtime.py                  Runtime diagnostics
-
-  cli/
-    inference.py                Inference command
-    prepare_checkpoint.py       Checkpoint preparation command
-
-inference.py                    Root inference launcher
-config.toml                     User-facing settings
-tests/                          Regression tests
-weights/                        Ignored checkpoint artifacts
+inference.py --transcribe <file|folder>
+  commands/inference.py
+    configuration/settings.py   load and validate config.toml
+    runtime/logging_setup.py    open logs/log_<date>.txt, assign run id
+    discover_audio_files        content-probe inputs (audio/media.inspect_media)
+    checkpoint/bootstrap.py     readiness gate, then a single strict model load
+      checkpoint/orchestration.py  download + verify + convert when not ready
+    runtime/device.py           resolved device and version report
+    inference/offline.py        OfflineTranscriber.transcribe
+      inference/planning.py       chunks, round-robin scheduling, micro-batches
+      per batch:
+        audio/media.py            MediaSession.read_sequential_segment (decode, mono, 16 kHz)
+        audio/features.py         log-mel features + per-recording normalization
+        models/parakeet.py        ParakeetTDT.generate (encoder + greedy TDT loop)
+      merge                       token ownership by midpoint, tokenizer decode, status
+    CSV (folder) or terminal (single file)
 ```
 
-## 5. Configuration Source of Truth
+### Model
 
-Checkpoint JSON artifacts define model and processing behavior:
+| Stage | Module | Shape (B = batch, T = feature frames, T' = T/8) |
+|---|---|---|
+| Log-mel front end | `audio/features.py` | waveform `(B, samples)` to `(B, T, 128)` plus mask `(B, T)` |
+| Subsampling | `models/subsampling.py` | Conv2d stack, 3 stride-2 stages: `(B, T, 128)` to `(B, T', 1024)` |
+| Positional encoding | `models/attention.py` `RelativePositionalEncoding` | `(B, 2T'-1, 1024)` sinusoidal relative positions |
+| Conformer blocks x24 | `models/conformer.py` `EncoderBlock` | half FFN, relative multi-head attention with bias_u/bias_v, depthwise conv module (GLU, BatchNorm, SiLU), half FFN, LayerNorm |
+| Encoder projection | `ParakeetTDT.encoder_projector` | `(B, T', 1024)` to `(B, T', 640)` |
+| Prediction network | `models/decoder.py` | embedding + 2-layer LSTM + projection, blank-aware cache |
+| Joint | `models/joint.py` | ReLU(enc + dec), then linear to 8193 token logits + 5 duration logits |
+| Greedy TDT loop | `ParakeetTDT.generate` | per step: argmax token, argmax duration, advance frame pointer |
 
-- `config.json`: architecture, dimensions, vocabulary, token IDs, durations.
-- `processor_config.json`: processing parameters and feature dimensions.
-- `generation_config.json`: decoder and generation IDs.
-- `tokenizer.json`: vocabulary, merges, added tokens, Metaspace rules.
-- `tokenizer_config.json`: tokenizer metadata.
+Greedy TDT rules (`generate`):
 
-Do not duplicate these values in implementation code. Derived values may be
-calculated from loaded JSON. Validate configuration before model allocation.
+- A blank token with duration 0 advances one frame. This is the reference rule.
+- A non-blank token updates the decoder state. Its duration may be 0, in which case the decoder stays on the same frame.
+- After `max_symbols_per_step` consecutive non-blank zero-duration tokens on one frame, the last one is forced to advance one frame. It is counted in `GenerationResult.forced_advances`. This is the NeMo-style guard; see D3 in [Decision records](#15-decision-records).
+- Rows whose encoder output is non-finite are marked finished before decoding and emit no tokens.
+- `maximum_steps = max_symbols_per_step * encoder_length` is a safety net that the guard makes unreachable.
 
-User-facing behavior comes from `config.toml`:
+## 3. Module map and dependency rules
 
-```toml
-[inference]
-batch_size = 8
-recursive = true
-output_filename = "transcriptions.csv"
-audio_extensions = [".wav"]
-```
-
-## 6. Native Dependency Boundary
-
-Native runtime code uses PyTorch and Python standard-library code. It must not
-directly import Transformers, Hugging Face Hub, Safetensors, Tokenizers, Librosa,
-NumPy, or SoundFile.
-
-## 7. Architecture and Tensor Flow
-
-```text
-Input tensor
--> configured preprocessing
--> Conv2d subsampling
--> relative positional encoding
--> Fast Conformer encoder
--> encoder projection
--> LSTM prediction network/cache
--> TDT token and duration logits
--> duration-aware greedy decoding
--> JSON BPE Metaspace decoding
--> transcript
-```
-
-Important shapes:
-
-- Features: `(B, T_features, 128)`.
-- Encoder states: `(B, T_encoder, 1024)`.
-- Projected states: `(B, T_encoder, 640)`.
-- Generated IDs: `(B, U)`.
-- Generated durations: `(B, U)`.
-
-State-dict attribute names mirror the checkpoint and are compatibility boundaries.
-
-## 8. Easy Inference Contract
-
-Single file:
-
-```powershell
-venv\Scripts\python.exe inference.py --transcribe input_file
-```
-
-Folder:
-
-```powershell
-venv\Scripts\python.exe inference.py --transcribe input_folder
-```
-
-Folder inference writes `input_folder/transcriptions.csv` with:
-
-```text
-filename,duration_audio,transcribe
-```
-
-The first run prepares and strict-loads the checkpoint, then writes the
-checkpoint-local `.ready` marker atomically. Later runs check only marker
-existence and skip repeated download, hash, remote metadata, and conversion
-validation. `--repair` explicitly removes readiness and repeats preparation.
-
-## 9. Checkpoint Acquisition
-
-Run:
-
-```powershell
-venv\Scripts\python.exe -m src.cli.prepare_checkpoint
-```
+| Package | Responsibility | May import |
+|---|---|---|
+| `configuration/config.py` | Load and validate checkpoint JSON (`config.json`, processor, generation) | standard library only |
+| `configuration/settings.py` | Load and validate `config.toml` | standard library, `config.py` |
+| `runtime/` | Device selection and report, dated run logging, atomic writes | standard library, torch |
+| `text/` | Tokenizer decoding from `tokenizer.json` | standard library, torch |
+| `models/` | Network modules and the TDT loop, strict checkpoint loading | torch, `configuration`, `runtime.device` |
+| `audio/features.py` | Feature extraction | torch, `configuration` |
+| `audio/media.py` | Probe and decode media, sequential chunk reading | torch, soundfile, subprocess, `inference.planning` (for `AudioMetadata`) |
+| `inference/planning.py` | Pure planning math: chunks, schedule, batches | standard library only |
+| `inference/offline.py` | Orchestration, merge, statuses | everything above except `commands` and `checkpoint` |
+| `checkpoint/` | Download, verify, convert, readiness marker | standard library, torch, `configuration.settings`, `runtime` |
+| `commands/` | CLI parsing, terminal output, wiring | anything |
 
 Rules:
 
-- Use the existing `venv`.
-- Do not modify installed PyTorch.
-- Every authorized pip command uses `--no-cache-dir`.
-- Do not add dependency version pins without authorization.
-- Validate each artifact by official size and Git blob/LFS SHA-256 identity.
-- Reuse matching files and redownload only mismatching files.
-- Use same-directory `.part` files and atomic replacement.
-- Convert only after all six source artifacts are valid.
-- Bind `model.pth` to source/output hashes with conversion manifest.
+- `models/` never imports `audio/`, `inference/`, `checkpoint/`, or `commands/`.
+- `checkpoint/bootstrap.py` does not import the model. The caller passes a `loader`, so the checkpoint layer stays independent of the architecture.
+- Terminal printing happens only in `commands/`. Library code logs through `logging.getLogger(__name__)` and never prints.
+- Command modules use literal logger names (`"src.commands.inference"`), not `__name__`. Under `python -m`, `__name__` is `"__main__"`, which falls outside the `"src"` logger that owns the log file.
+- New public names go into the package `__init__.py` and its `__all__`.
 
-## 10. Mandatory Commented Code
+## 4. Invariants that must hold
 
-Commented code is mandatory. Every meaningful module requires a module
-Docstring. Public functions, public classes, complex components, and ML modules
-require detailed docstrings.
+A change that breaks any of these is a regression, whatever else it improves.
 
-Every non-trivial section must include technical comments covering algorithm,
-invariant, tensor shape/layout, format, compatibility, performance, numerical
-stability, or failure behavior not obvious from syntax.
+### Model and checkpoint
 
-ML comments are required around preprocessing, STFT, mel filters, normalization,
-masking, attention, relative positions, convolution, LSTM cache, TDT durations,
-device placement, checkpoint state, and numerical safety.
+1. **State-dict names are fixed.** The top-level attributes `encoder`, `encoder_projector`, `decoder`, `joint` and every nested attribute name mirror checkpoint keys. Renaming one breaks strict loading. File and class names may change; attribute names may not.
+2. **Loading is strict.** `load_state_dict(strict=True, assign=True)`. Missing or unexpected keys raise.
+3. **Loading is safe.** `torch.load(..., weights_only=True)` everywhere. Never switch to `weights_only=False`.
+4. **Meta-device construction.** `load_model` builds the model under `torch.device("meta")` to skip random initialization. Any new non-persistent buffer must be created with an explicit `device="cpu"` in its constructor, as `inv_freq` and `duration_values` are. `_require_materialized` fails loudly otherwise.
+5. **Pinned artifacts.** URLs, sizes, SHA-256, and Git blob SHA-1 values in `checkpoint/download.py` identify the verified upstream revision. They are an integrity invariant, not configuration. Update them only together with a full parity re-verification.
+6. **Unimplemented config values are rejected.** `validate_config` requires `hidden_act == "relu"` (joint), `encoder_config.hidden_act == "silu"`, and `scale_input == false`, because the modules hard-wire that math. Add support in the modules before relaxing a check.
 
-Comments must be accurate, synchronized with code, non-decorative, and must not
-replace clear naming, types, validation, tests, or decomposition.
+### Numerics and parity
 
-## 11. Testing and Quality Gate
+7. **Feature extraction matches the reference.** Constants: preemphasis 0.97, periodic-false Hann window of 400 samples, `n_fft` 512, hop 160, constant STFT padding, Slaney mel filters, `LOG_GUARD = 2**-24`, `NORMALIZATION_EPSILON = 1e-5`. Normalization is per recording with divisor n for the mean and n - 1 for the variance. Both divisors are clamped to at least 1; that changes nothing for n >= 2 and keeps inputs with 0 or 1 valid frames finite.
+8. **Parity targets.** Same tokens and durations single-file vs mixed-batch. Same content tokens and text as HF `ParakeetForTDT`. Long-form transcripts byte-identical to the previous commit, unless a change intends to alter them, in which case say so and measure it.
 
-Run:
+### Planning, decoding, merging
+
+9. **Chunk budget.** Every work item satisfies `feature_frames = source_samples // 160 + 1 <= max_chunk_feature_frames`. The core is at most `(max_chunk - 2 * overlap) * 160 - 1` samples, and the one-sample reserve prevents the 1500 vs 1501 off-by-one.
+10. **Batch budget is padded.** `len(batch) * max(item.feature_frames) <= max_batch_feature_frames`. Do not revert to summing unpadded frames.
+11. **Cores tile the file.** Cores are contiguous, non-overlapping, and cover `[0, total_samples)`. Sources are the core plus at most `overlap` on each side, clamped at 0 and at the end of the file.
+12. **Sequential decoding.** Chunks of one file are read in order through `read_sequential_segment`. Only `previous_end - current_start` samples are reused, and never through `tensor[-k:]` with `k == 0`, which selects the whole tensor. A non-positive overlap decodes fresh. The result must be bit-identical to a fresh decode of the same interval.
+13. **Session lifetime.** A decoder session opens at a file's first chunk and closes after its last. Never open all files up front.
+14. **Ownership.** A token belongs to the chunk whose core contains its midpoint. The last chunk of a file owns everything from its core start onward, because end-of-audio tokens can have a midpoint past the end.
+15. **No text rewriting.** No deduplication of repeated words, no dictionary, word list, phrase, or name correction.
+
+### Resource policy
+
+16. **Memory does not scale with duration.** Never hold a full-file waveform, feature tensor, encoder output, or logits for long audio.
+17. **OOM policy.** On accelerator OOM, stop with a diagnostic. No retry, no silent batch reduction, no CPU fallback, no partial CSV.
+18. **Device agnostic.** Device resolution happens once in `runtime/device.select_device()`. Components use the model's device. Do not assume CUDA.
+
+## 5. Configuration discipline
+
+- Every user-facing value lives in `config.toml` and is parsed in `configuration/settings.py`. That covers paths, log level, network policy, budgets, and reporting interval.
+- Every key is required. Validation reports `section.key` and the rule it broke. There are no silent defaults.
+- Cross-field rules enforced today:
+  - `max_chunk_feature_frames > 2 * overlap_feature_frames`
+  - `max_batch_feature_frames >= max_chunk_feature_frames`
+  - `0 <= max_padding_fraction <= 1`
+  - `request_timeout_seconds > 0`
+  - `download_attempts >= 1`
+- Constants that belong to the checkpoint's input contract (feature constants, pinned hashes) stay in code with a comment explaining why they are not settings.
+- Adding a setting means:
+  1. add a field to the dataclass;
+  2. add the parser and its validation;
+  3. add the key to `config.toml` with a comment;
+  4. add a test in `tests/test_runtime_services.py`;
+  5. add a row to the README configuration table.
+
+## 6. Error handling, statuses, and logging
+
+### File statuses
+
+`inference/offline.py` `FileStatus`, most severe first:
+
+| Status | Assigned when |
+|---|---|
+| `numerical_failure` | features or encoder states non-finite for any chunk; that chunk's tokens are dropped |
+| `input_nonfinite` | decoded samples contained NaN/Inf (zeroed before inference) |
+| `decoder_forced_advance` | the per-frame guard fired |
+| `no_speech` | transcript empty and every chunk is digital silence |
+| `empty_transcript` | transcript empty and audio not silent |
+| `unreadable` | assigned by `commands/inference.py` for files discovery could not read |
+| `ok` | none of the above |
+
+Statuses are derived from objective facts only. Do not add heuristics that judge transcript quality. A repeated-token "gibberish" rule was removed because it flagged natural speech (D5).
+
+### Error classes
+
+| Situation | Behavior |
+|---|---|
+| One file is not decodable audio | `ValueError`; the file becomes an `unreadable` row and the run continues. |
+| `ffprobe`/`ffmpeg` not installed | `CodecUnavailableError`; per-file `unreadable`. |
+| `FFMPEG_BINARY`/`FFPROBE_BINARY` set to a missing path | `RuntimeError`; the run stops (setup error). |
+| OS cannot open the file (missing, permission, too many open files) | `OSError` surfaces. It is never treated as an unsupported format. |
+| Invalid settings or checkpoint JSON | `ValueError` before model allocation. |
+| Accelerator OOM | `RuntimeError` naming the batch items, frames, memory, and the two keys to lower. |
+| CSV write fails | Fallback to `logs/transcriptions_<run id>.csv`; exit code 1. |
+
+Never swallow an exception without logging it. Never report success for work that did not happen.
+
+### Logging
+
+- `logs/log_<YYYY-MM-DD>.txt` in `paths.log_dir`, appended. Each line carries `run=<id>`.
+- INFO: run start, input, checkpoint action, device report, load time, plan summary, one line per file.
+- WARNING: non-`ok` files, unreadable files, stale readiness marker, rejected legacy checkpoint.
+- DEBUG: one line per batch with its items, frames, and stage timings.
+- Never log secrets or full transcripts.
+
+## 7. Coding standards
+
+- **Readability over brevity.**
+  - One transformation per statement, with descriptive intermediate names.
+  - Multi-line signatures and calls when they are dense.
+  - Shape comments such as `# (B, T, H)` on tensor transitions that are not obvious. Shape comments must be true.
+- **Comments explain why:** a constraint, a trade-off, or an external quirk. Never restate the code. No emojis or decorative characters in code, comments, or terminal output.
+- **Docstrings:** on public functions and classes, and on non-trivial internals. Cover purpose, arguments, returns, shapes, raised errors, and side effects.
+- **Hot loop cost:** in `ParakeetTDT.generate`, every elementwise op runs once per emitted symbol. Count kernel launches before adding ops there, and measure (see [Performance work](#10-performance-work)).
+- **No dead code:** no unused imports, no placeholder logic. Remove what your change makes unused.
+- **Terminal output:** plain text only, for example `Batch: 12 / 241, Progress: 4.98 percent`.
+- **Surgical changes:** keep diffs focused. Do not reformat or refactor unrelated code in the same change.
+
+## 8. Testing strategy
+
+Run everything:
 
 ```powershell
-venv\Scripts\python.exe -m unittest discover -s tests -v
+venv\Scripts\python.exe -m unittest discover -s tests -p "test_*.py"
 ```
 
-Tests cover configuration, parsing, tokenization, processing, device selection,
-padded attention safety, per-file acquisition, isolated redownload, conversion
-bootstrap, synthetic conversion, readiness marker behavior, repair, and
-inference metric formulas.
+pytest is not a dependency; tests use `unittest`.
 
-Before completion verify syntax, diagnostics, strict loading when model code
-changes, finite individual/batch output, parity where expected, manifests, and
-absence of secrets or stale documentation. Never claim tests or benchmarks that
-did not run.
+| File | Covers |
+|---|---|
+| `tests/support.py` | Fixtures: a tiny schema-valid checkpoint (`write_tiny_checkpoint`), a WAV writer, settings factories |
+| `test_native_parakeet.py` | config validation, feature finiteness and normalization, TDT guard, duration table, non-finite rows, strict/safe/meta loading, tokenizer, device report, attention masking |
+| `test_offline_transcription.py` | sequential decoding bit-identity (zero overlap, overlap longer than core, 48 kHz with an EOF short read), ffprobe metadata, OS-error handling, lazy sessions, merge ownership incl. end of audio, statuses |
+| `test_long_form.py` | STFT frame estimate, randomized tiling and budget properties, padded batch budget |
+| `test_inference_cli.py` | argument contract, CSV format and ordering, unreadable rows, codec errors, CSV fallback, early input validation, `python -m` logging, progress reporter |
+| `test_bootstrap.py` | readiness fast path, stale marker, single load, failed load leaves no marker, repair |
+| `test_checkpoint_preparation.py` | per-file download reuse and repair, legacy bundle bootstrap, conversion round trip, shard path traversal, payload size, progress rate |
+| `test_runtime_services.py` | settings validation, atomic writes under failure, dated logging |
+| `test_smoke_real_weights.py` | the real command end to end; skipped without the prepared checkpoint and `docs/*.wav` |
 
-## 12. Verified Baseline and Limitations
+Rules:
 
-Observed local baseline:
+- Every bug fix gets a regression test that fails on the old code. Name the defect in the test docstring.
+- Prefer the tiny fixture checkpoint so tests run without the 2.5 GB weights or a GPU.
+- Prefer randomized or property-style checks for planner math, with a fixed seed.
+- Update existing tests when behavior changes on purpose. Do not delete them to make a change pass.
+- Do not claim tests pass unless they were run in this environment.
 
-- 627,008,134 native model parameters.
-- Strict `model.pth` loading success.
-- 15/15 individual inference success.
-- 15-file mixed-duration batch success.
-- Exact transcript, token, and duration parity between individual and batch native inference.
-- Observed batch RTF around `0.013`.
-- Observed peak allocated CUDA memory around `3.89 GB`.
+## 9. Verification protocol for inference changes
 
-These are local observations, not universal guarantees. Long-form processing,
-realtime streaming, and large-scale capacity are not verified in this milestone.
+Unit tests cannot prove numerical parity with the full model. Any change under `audio/`, `models/`, `inference/`, or `text/` also needs the checks below before merge. Run them with the real checkpoint on the development GPU.
+
+1. **Token parity, single vs mixed.** Transcribe each sample WAV alone, then all together as one folder. Compare token IDs and durations after stripping trailing padding (`pad_token_id` with duration 0), because rows in a batch are right-padded to the longest row. They must be identical.
+2. **Parity with the reference.** For each sample WAV, run Hugging Face `transformers` `ParakeetForTDT.from_pretrained(weights_dir)` with its `AutoProcessor` and `model.generate(..., return_dict_in_generate=True)`. Compare content tokens (blank and pad removed) and decoded text with this runtime. `transformers` is only a verification tool here; it must never become a runtime import.
+3. **Long-form regression.** Transcribe long recordings (tens of minutes) with the previous commit and the new one. Transcripts must be byte-identical unless the change intends otherwise.
+4. **Budget and session instrumentation.** Wrap the feature extractor and `MediaSession` for a mixed run. Check that:
+   - the tensor frames per batch equal the planned maximum;
+   - no chunk is over `max_chunk_feature_frames`;
+   - no padded batch is over `max_batch_feature_frames`;
+   - there is one session per file;
+   - decoded source frames equal container frames (no re-decoded overlap).
+5. **Memory bound.** Record peak CUDA allocation and working-set growth for two recordings of very different length. They must be the same.
+6. **Anomaly behavior.** Check that:
+   - silence gives `no_speech`;
+   - noise gives `empty_transcript`;
+   - NaN samples give `input_nonfinite`;
+   - a forced stuck joint gives `decoder_forced_advance` without raising;
+   - a simulated OOM stops once with no CSV;
+   - an M4A through FFmpeg gives the same text as its WAV source.
+
+Keep verification scripts outside the repository (a scratch directory). Report the actual numbers in the pull request.
+
+## 10. Performance work
+
+- **Measure first.** The dominant cost is the greedy TDT loop (about 85% of wall time on long audio). Media decoding is about 12%, and features about 2%.
+- **A/B protocol.**
+  1. Check out the baseline in a separate `git worktree`.
+  2. Point it at the same checkpoint (a directory junction or symlink; never copy or move the weights).
+  3. Run both versions on the same file for at least three rounds, alternating which one runs first.
+  4. Compare `Model generation seconds` and `Wall-clock seconds`.
+
+  Laptop GPUs drift several percent with temperature, so a difference smaller than the spread between rounds is noise.
+- **Output must not change.** Every performance change must keep token parity. Faster but different output is a behavior change and must be justified and measured as one.
+- **Windows:** `torch.compile` must not be used on Windows.
+- **Memory is the binding constraint on 4 GB GPUs.** After loading, only about 0.7 GB may be free when other processes hold VRAM. Batch and chunk budgets are the controls.
+
+## 11. Dependencies and environment
+
+- Runtime dependencies: PyTorch, soundfile (brings NumPy), the standard library. FFmpeg is optional and external.
+- Do not add torchaudio, torchcodec, librosa, NeMo, or Transformers as runtime dependencies. Do not hardcode an FFmpeg path; resolve it through `FFMPEG_BINARY`/`FFPROBE_BINARY` or `PATH`.
+- Install with `pip ... --no-cache-dir`. Do not pin versions (`==`, `>=`, `<=`, `~=`) in install commands or dependency files.
+- Never upgrade, downgrade, or reinstall PyTorch as a side effect of another install. If a package would change torch, stop and ask.
+- Use the repository's `venv` interpreter.
+
+## 12. Git and change management
+
+- **`main`** is the stable branch. It is protected by a ruleset: no deletion, no force push, changes only through pull requests.
+- **Branch names** use a prefix that says what the work is:
+  - `feature/` for new capability;
+  - `fix/` for defects (several small related fixes may share one branch);
+  - `perf/` for measured performance work;
+  - `experiment/` for exploratory work that may never merge;
+  - `research/` for research-specific pipelines.
+
+  Avoid vague names such as `latest`, `new`, or `final`.
+- **Commits** follow Conventional Commits (`feat`, `fix`, `perf`, `refactor`, `test`, `docs`). Each commit is one logical change with a body that explains why, what changed, and how it was verified. Do not write one-line commits for non-trivial changes.
+- **Pull requests** contain: a summary, the motivation, the behavior changes, the tests run, and the verification numbers (Section 9). For performance work, add before/after timings. Also list known limitations.
+- **Tags** mark milestones after merge to `main`, only when tests and verification passed.
+- **Never commit** weights (`*.safetensors`, `*.pth`), `venv/`, `logs/`, `docs/` sample audio, datasets, credentials, or generated CSVs. `.gitignore` covers these; check `git status` before committing.
+
+## 13. What agents may and must not modify
+
+May, with tests:
+
+- planning, scheduling, decoding orchestration, and merge logic, keeping every invariant in Section 4;
+- performance of the TDT loop, feature extraction, and media decoding, with A/B evidence and parity;
+- settings, adding validated keys;
+- statuses, adding objective ones;
+- documentation, kept consistent with the code.
+
+Must not, without an explicit request from the maintainer:
+
+- change the model architecture's math, activation choices, or state-dict attribute names;
+- modify the downloaded weights or the pinned hashes;
+- switch `torch.load` to `weights_only=False`;
+- add text post-processing (dedup, dictionaries, corrections);
+- add runtime dependencies listed as forbidden in Section 11, or pin versions;
+- add CLI flags (the public contract is `--transcribe <path>` only; tunables go in `config.toml`);
+- push to `main`, force-push, delete branches, or change repository settings;
+- create or overwrite README.md or AGENTS.md unasked.
+
+## 14. Troubleshooting
+
+| Message (excerpt) | Cause | Fix |
+|---|---|---|
+| `Out of memory during model generation for batch items [...]` | Batch too large for free accelerator memory. | Lower `inference.max_batch_feature_frames`, then `inference.max_chunk_feature_frames`. Close other GPU processes. |
+| `ffprobe was not found in PATH. Set FFPROBE_BINARY externally.` (in an `unreadable` reason) | FFmpeg not installed, and the file is not a libsndfile format. | Install FFmpeg or set `FFPROBE_BINARY`/`FFMPEG_BINARY`. |
+| `FFPROBE_BINARY points to a missing executable` | The environment variable is set to a wrong path. | Fix or unset the variable. |
+| `Input path does not exist` | Typo in `--transcribe`. | Check the path; nothing was loaded. |
+| `No readable audio files found under ...` | The folder has no decodable audio, or the extension filter excludes everything. | Check `inference.audio_extensions` and the files. |
+| `readiness marker is stale (model.pth missing or resized); re-preparing` (log) | `model.pth` changed since the marker was written. | None; preparation runs automatically. |
+| `Downloaded content identity mismatch for <file>` | Download corrupted, or the upstream file changed. | Retry. If it persists, upstream changed and the pins need a deliberate update plus re-verification. |
+| `Remote size changed for <file>` | Upstream artifact differs from the pinned size. | Same as above. |
+| `Strict state-dict load reported incompatibility` | The checkpoint does not match the architecture. | Delete `weights_dir/.ready` and `model.pth`, then rerun to reconvert. |
+| `Tensors were not materialized from the checkpoint` | A new non-persistent buffer was not created on CPU. | Create it with `device="cpu"` in the module constructor (Invariant 4). |
+| `inference.<key> must be ...` | Invalid `config.toml` value. | Fix the named key. |
+| `Error: the CSV could not be written ...; transcripts were saved to ...` | Output CSV locked (for example open in Excel) or folder not writable. | Close the file; the transcripts are at the printed fallback path. |
+
+## 15. Decision records
+
+- **D1. Native PyTorch instead of NeMo/Transformers at runtime.** Keeps the dependency set to PyTorch + soundfile, gives full control over batching and memory, and makes every numerical step inspectable. Parity with Transformers is verified instead of assumed.
+- **D2. Meta-device construction + `weights_only=True`.** Random initialization of 600M parameters that are immediately overwritten cost about 2.7 s per load. Building on the meta device and assigning the loaded tensors cut model load from about 5.5 s to about 2 s. `weights_only=True` closes arbitrary-code execution through a replaced `model.pth`.
+- **D3. Per-frame symbol guard.** Hugging Face's TDT generation has no per-frame limit and only truncates at `max_length`. The earlier runtime raised an exception there, which aborted a whole folder. The guard follows NeMo's greedy transducer behavior: bounded output, flagged by status. It never fires on normal speech (0 times across all verification audio), so parity is unaffected.
+- **D4. Explicit status column.** The CSV shows anomalies per file instead of hiding them in logs. It is the only way to avoid "normal-looking but wrong" output in batch runs.
+- **D5. No transcript-quality heuristics.** A repeated-adjacent-token rule marked natural speech and both long test recordings as gibberish. Statuses are limited to objective facts.
+- **D6. Padded batch budget.** Memory scales with rows x longest row, so the budget counts that. Summing unpadded frames allowed about 33% overshoot at default settings.
+- **D7. Lazy decoder sessions.** Opening every file up front could exhaust the process file limit (the Windows C runtime defaults to about 512). Sessions now live only while a file has pending chunks.
+- **D8. Pinned upstream hashes in code.** The checkpoint identity is part of the verified contract, so it is not user configuration.
+- **D9. Clamped normalization divisors.** Inputs with fewer than two valid frames produced NaN (division by n - 1 = 0) and hung decoding. Clamping keeps them finite and is bit-identical for n >= 2.
+- **D10. Linear resampling kept for now.** It is deterministic and dependency-free, but it aliases content above 8 kHz and differs from FFmpeg's filtered resampling. Replacing it needs a measured accuracy comparison (see Section 16).
+
+## 16. Open optimization items
+
+These are known and deliberately not done yet. Each one needs the verification of Sections 9 and 10.
+
+- **Decoding loop:**
+  - reduce per-step GPU synchronization (`finished.all()` and the decoder's blank fast path each sync once per step);
+  - reduce temporary tensors;
+  - consider fused kernels or CUDA Graphs for stable shapes.
+- **FFmpeg fallback:** keep one persistent process per file instead of one per chunk, and stop re-decoding overlap on that path.
+- **Resampling:** anti-aliased windowed-sinc or polyphase resampling, benchmarked for accuracy against the current linear path.
+- **Budget tuning:** benchmark chunk sizes (1000 to 1750 frames), overlaps (0 to 100 frames), and batch budgets (2500 to 3500 frames) for speed and boundary accuracy.
+- **Boundary merging:** evaluate token-time ownership against alternatives on recordings with speech crossing chunk boundaries.
+- **Precision:** evaluate BF16/FP16 inference for memory headroom on 4 GB GPUs. Adopt only with measured parity or a documented, measured accuracy trade-off.
+- **Metrics:** per-file runtime metrics in folder mode, CPU RAM measurement, a machine-readable benchmark output for development.
