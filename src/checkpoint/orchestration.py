@@ -14,18 +14,22 @@ converted repeatedly.
 from __future__ import annotations
 
 import json
-import os
-import tempfile
+import logging
+import pickle
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable
 
 import torch
 
-from ..configuration.config import DEFAULT_WEIGHTS_DIR
-from .conversion import convert_checkpoint
+from ..configuration.settings import CheckpointSettings
+from ..runtime.filesystem import write_json_atomic
 from .artifacts import sha256_file
+from .conversion import convert_checkpoint
 from .download import DownloadResult, ensure_checkpoint_files, load_manifest
+
+
+logger = logging.getLogger(__name__)
 
 
 CONVERSION_MANIFEST_FILENAME = "conversion_manifest.json"
@@ -82,26 +86,7 @@ def _load_conversion_manifest(checkpoint_dir: Path) -> dict[str, Any] | None:
 def _write_conversion_manifest(checkpoint_dir: Path, manifest: dict[str, Any]) -> None:
     """Atomically persist source and output conversion evidence."""
 
-    path = checkpoint_dir / CONVERSION_MANIFEST_FILENAME
-    with tempfile.NamedTemporaryFile(
-        mode="w",
-        encoding="utf-8",
-        dir=checkpoint_dir,
-        prefix="conversion_manifest.",
-        suffix=".tmp",
-        delete=False,
-    ) as temporary_file:
-        temporary_path = Path(temporary_file.name)
-        try:
-            json.dump(manifest, temporary_file, ensure_ascii=True, indent=2, sort_keys=True)
-            temporary_file.write("\n")
-            temporary_file.flush()
-            os.fsync(temporary_file.fileno())
-        except Exception:
-            temporary_path.unlink(missing_ok=True)
-            raise
-
-    temporary_path.replace(path)
+    write_json_atomic(checkpoint_dir / CONVERSION_MANIFEST_FILENAME, manifest)
 
 
 # =============================================================================
@@ -120,7 +105,7 @@ def _validate_existing_bundle(
 ) -> None:
     """Validate an existing pre-manifest model.pth before trusting it."""
 
-    bundle = torch.load(output_path, map_location="cpu", weights_only=False)
+    bundle = torch.load(output_path, map_location="cpu", weights_only=True)
     if not isinstance(bundle, dict):
         raise ValueError(f"Converted checkpoint must be a dictionary: {output_path}")
     if set(bundle) != {"state_dict", "config", "metadata"}:
@@ -196,10 +181,10 @@ def ensure_converted_checkpoint(
             progress_callback("model.pth: validating existing pre-manifest bundle")
         try:
             _validate_existing_bundle(output_path, checkpoint_dir)
-        except (OSError, ValueError, RuntimeError):
+        except (OSError, ValueError, RuntimeError, pickle.UnpicklingError) as error:
             # Invalid legacy output is replaced through the same conversion path
             # used for stale manifest outputs.
-            pass
+            logger.warning("existing model.pth rejected, reconverting: %s", error)
         else:
             output_sha256 = sha256_file(output_path)
             result = ConversionResult(
@@ -251,7 +236,8 @@ def ensure_converted_checkpoint(
 
 
 def prepare_checkpoint(
-    checkpoint_dir: Path = DEFAULT_WEIGHTS_DIR,
+    checkpoint_dir: Path,
+    checkpoint_settings: CheckpointSettings,
     progress_callback: Callable[[str], None] | None = None,
 ) -> CheckpointPreparationResult:
     """Download/validate all requested artifacts, then ensure model.pth exists."""
@@ -259,6 +245,7 @@ def prepare_checkpoint(
     resolved_dir = checkpoint_dir.resolve()
     downloads = ensure_checkpoint_files(
         resolved_dir,
+        checkpoint_settings,
         progress_callback=progress_callback,
     )
     conversion = ensure_converted_checkpoint(

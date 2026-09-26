@@ -5,7 +5,7 @@ from .conformer import ConvolutionModule, EncoderBlock, FeedForward
 from .decoder import Decoder, DecoderCache
 from .encoder import Encoder
 from .joint import JointNetwork
-from .parakeet import GenerationResult, ParakeetTDT, load_model, select_device
+from .parakeet import GenerationResult, ParakeetTDT, load_model
 from .subsampling import Subsampling
 
 
@@ -24,5 +24,4 @@ __all__ = [
     "Subsampling",
     "load_model",
     "repeat_key_value",
-    "select_device",
 ]

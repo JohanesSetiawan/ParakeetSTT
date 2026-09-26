@@ -1,9 +1,11 @@
 """
 Application settings loaded from the repository TOML configuration.
 
-User-controlled inference behavior belongs in ``config.toml`` rather than model
-or CLI implementation. This module validates the configuration before model
-allocation so invalid batch sizes or output names fail quickly.
+User-controlled behavior (paths, logging, checkpoint transfer policy, and
+inference budgets) belongs in ``config.toml`` rather than in module constants.
+Every field is required and validated before any model allocation, so a typo
+fails in milliseconds with the offending key named instead of silently falling
+back to a default.
 """
 
 from __future__ import annotations
@@ -11,11 +13,42 @@ from __future__ import annotations
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from .config import PROJECT_ROOT
 
 
 DEFAULT_SETTINGS_PATH = PROJECT_ROOT / "config.toml"
+
+
+# =============================================================================
+# Settings contracts
+# =============================================================================
+
+
+@dataclass(frozen=True)
+class PathSettings:
+    """Filesystem locations, already resolved to absolute paths."""
+
+    weights_dir: Path
+    log_dir: Path
+
+
+@dataclass(frozen=True)
+class LoggingSettings:
+    """Run-log verbosity."""
+
+    level: str
+
+
+@dataclass(frozen=True)
+class CheckpointSettings:
+    """Network and streaming policy for checkpoint acquisition."""
+
+    request_timeout_seconds: float
+    download_attempts: int
+    retry_backoff_seconds: float
+    stream_block_bytes: int
 
 
 @dataclass(frozen=True)
@@ -30,92 +63,212 @@ class InferenceSettings:
     overlap_feature_frames: int
     max_batch_feature_frames: int
     max_padding_fraction: float
+    progress_interval_seconds: float
 
 
-def load_inference_settings(
-    settings_path: Path = DEFAULT_SETTINGS_PATH,
-) -> InferenceSettings:
-    """
-    Load and validate the ``[inference]`` TOML section.
+@dataclass(frozen=True)
+class Settings:
+    """Complete validated application configuration."""
 
-    Args:
-        settings_path: TOML file containing the inference section.
+    paths: PathSettings
+    logging: LoggingSettings
+    checkpoint: CheckpointSettings
+    inference: InferenceSettings
 
-    Returns:
-        Immutable validated inference settings.
 
-    Raises:
-        FileNotFoundError: If the configuration file does not exist.
-        ValueError: If a required field has an invalid type or value.
-    """
+# =============================================================================
+# Field validators
+# =============================================================================
+# Each validator names the full "section.key" in its error so the user can find
+# the line in config.toml without reading this module.
+# =============================================================================
 
-    if not settings_path.is_file():
-        raise FileNotFoundError(f"Inference settings not found: {settings_path}")
 
-    with settings_path.open("rb") as input_file:
-        document = tomllib.load(input_file)
+def _section(document: dict[str, Any], name: str) -> dict[str, Any]:
+    section = document.get(name)
+    if not isinstance(section, dict):
+        raise ValueError(f"config.toml must contain a [{name}] section")
+    return section
 
-    raw_inference = document.get("inference")
-    if not isinstance(raw_inference, dict):
-        raise ValueError("config.toml must contain an [inference] section")
 
-    batch_size = raw_inference.get("batch_size")
-    recursive = raw_inference.get("recursive")
-    output_filename = raw_inference.get("output_filename")
-    audio_extensions = raw_inference.get("audio_extensions")
-    max_chunk_feature_frames = raw_inference.get("max_chunk_feature_frames")
-    overlap_feature_frames = raw_inference.get("overlap_feature_frames")
-    max_batch_feature_frames = raw_inference.get("max_batch_feature_frames")
-    max_padding_fraction = raw_inference.get("max_padding_fraction")
+def _integer(section: dict[str, Any], section_name: str, key: str, minimum: int) -> int:
+    value = section.get(key)
+    if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
+        raise ValueError(
+            f"{section_name}.{key} must be an integer >= {minimum}, got {value!r}"
+        )
+    return value
 
-    if not isinstance(batch_size, int) or isinstance(batch_size, bool) or batch_size <= 0:
-        raise ValueError("inference.batch_size must be a positive integer")
-    if not isinstance(recursive, bool):
-        raise ValueError("inference.recursive must be a boolean")
+
+def _number(
+    section: dict[str, Any],
+    section_name: str,
+    key: str,
+    minimum: float,
+    maximum: float | None = None,
+) -> float:
+    value = section.get(key)
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        raise ValueError(f"{section_name}.{key} must be a number, got {value!r}")
+    number = float(value)
+    if number < minimum or (maximum is not None and number > maximum):
+        upper = "" if maximum is None else f" and <= {maximum}"
+        raise ValueError(f"{section_name}.{key} must be >= {minimum}{upper}, got {value!r}")
+    return number
+
+
+def _boolean(section: dict[str, Any], section_name: str, key: str) -> bool:
+    value = section.get(key)
+    if not isinstance(value, bool):
+        raise ValueError(f"{section_name}.{key} must be a boolean, got {value!r}")
+    return value
+
+
+def _path(section: dict[str, Any], section_name: str, key: str, root: Path) -> Path:
+    value = section.get(key)
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{section_name}.{key} must be a non-empty path string")
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        path = root / path
+    return path.resolve()
+
+
+# =============================================================================
+# Section parsers
+# =============================================================================
+
+
+def _parse_paths(document: dict[str, Any], root: Path) -> PathSettings:
+    section = _section(document, "paths")
+    return PathSettings(
+        weights_dir=_path(section, "paths", "weights_dir", root),
+        log_dir=_path(section, "paths", "log_dir", root),
+    )
+
+
+def _parse_logging(document: dict[str, Any]) -> LoggingSettings:
+    section = _section(document, "logging")
+    level = section.get("level")
+    valid_levels = ("DEBUG", "INFO", "WARNING", "ERROR")
+    if not isinstance(level, str) or level.upper() not in valid_levels:
+        raise ValueError(f"logging.level must be one of {valid_levels}, got {level!r}")
+    return LoggingSettings(level=level.upper())
+
+
+def _parse_checkpoint(document: dict[str, Any]) -> CheckpointSettings:
+    section = _section(document, "checkpoint")
+    timeout = _number(section, "checkpoint", "request_timeout_seconds", minimum=0.0)
+    if timeout == 0.0:
+        raise ValueError("checkpoint.request_timeout_seconds must be greater than zero")
+    return CheckpointSettings(
+        request_timeout_seconds=timeout,
+        download_attempts=_integer(section, "checkpoint", "download_attempts", minimum=1),
+        retry_backoff_seconds=_number(section, "checkpoint", "retry_backoff_seconds", minimum=0.0),
+        stream_block_bytes=_integer(section, "checkpoint", "stream_block_bytes", minimum=1),
+    )
+
+
+def _parse_extensions(section: dict[str, Any]) -> tuple[str, ...]:
+    raw_extensions = section.get("audio_extensions")
+    if not isinstance(raw_extensions, list):
+        raise ValueError("inference.audio_extensions must be a list")
+
+    normalized_extensions: list[str] = []
+    for extension in raw_extensions:
+        if not isinstance(extension, str) or not extension.strip():
+            raise ValueError("Every inference.audio_extensions entry must be a non-empty string")
+        normalized = extension.strip().lower()
+        if not normalized.startswith("."):
+            normalized = f".{normalized}"
+        if normalized not in normalized_extensions:
+            normalized_extensions.append(normalized)
+    return tuple(normalized_extensions)
+
+
+def _parse_inference(document: dict[str, Any]) -> InferenceSettings:
+    section = _section(document, "inference")
+
+    output_filename = section.get("output_filename")
     if (
         not isinstance(output_filename, str)
         or not output_filename.strip()
         or Path(output_filename).name != output_filename
     ):
         raise ValueError("inference.output_filename must be a plain filename")
-    if not isinstance(audio_extensions, list):
-        raise ValueError("inference.audio_extensions must be a list")
-    for field_name, value in (
-        ("max_chunk_feature_frames", max_chunk_feature_frames),
-        ("overlap_feature_frames", overlap_feature_frames),
-        ("max_batch_feature_frames", max_batch_feature_frames),
-    ):
-        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
-            raise ValueError(f"inference.{field_name} must be a positive integer")
-    if overlap_feature_frames >= max_chunk_feature_frames:
-        raise ValueError(
-            "inference.overlap_feature_frames must be smaller than "
-            "max_chunk_feature_frames"
-        )
-    if (
-        not isinstance(max_padding_fraction, (int, float))
-        or isinstance(max_padding_fraction, bool)
-        or not 0.0 <= float(max_padding_fraction) <= 1.0
-    ):
-        raise ValueError("inference.max_padding_fraction must be between 0 and 1")
 
-    normalized_extensions: list[str] = []
-    for extension in audio_extensions:
-        if not isinstance(extension, str) or not extension.strip():
-            raise ValueError("Every inference audio extension must be a string")
-        normalized = extension.lower()
-        if not normalized.startswith("."):
-            normalized = f".{normalized}"
-        if normalized not in normalized_extensions:
-            normalized_extensions.append(normalized)
+    max_chunk_feature_frames = _integer(section, "inference", "max_chunk_feature_frames", minimum=1)
+    # Zero overlap is a legitimate benchmark setting: chunks then share no
+    # context and ownership boundaries coincide with chunk boundaries.
+    overlap_feature_frames = _integer(section, "inference", "overlap_feature_frames", minimum=0)
+    if max_chunk_feature_frames - 2 * overlap_feature_frames <= 0:
+        raise ValueError(
+            "inference.max_chunk_feature_frames must exceed twice "
+            "inference.overlap_feature_frames so every chunk owns some frames"
+        )
+
+    max_batch_feature_frames = _integer(section, "inference", "max_batch_feature_frames", minimum=1)
+    if max_batch_feature_frames < max_chunk_feature_frames:
+        raise ValueError(
+            "inference.max_batch_feature_frames must be at least "
+            "inference.max_chunk_feature_frames or a full chunk can never be scheduled"
+        )
+
+    progress_interval = _number(section, "inference", "progress_interval_seconds", minimum=0.0)
 
     return InferenceSettings(
-        batch_size=batch_size,
-        recursive=recursive,
+        batch_size=_integer(section, "inference", "batch_size", minimum=1),
+        recursive=_boolean(section, "inference", "recursive"),
         output_filename=output_filename,
-        audio_extensions=tuple(normalized_extensions),
+        audio_extensions=_parse_extensions(section),
         max_chunk_feature_frames=max_chunk_feature_frames,
         overlap_feature_frames=overlap_feature_frames,
         max_batch_feature_frames=max_batch_feature_frames,
-        max_padding_fraction=float(max_padding_fraction),
+        max_padding_fraction=_number(
+            section,
+            "inference",
+            "max_padding_fraction",
+            minimum=0.0,
+            maximum=1.0,
+        ),
+        progress_interval_seconds=progress_interval,
+    )
+
+
+# =============================================================================
+# Public loader
+# =============================================================================
+
+
+def load_settings(
+    settings_path: Path = DEFAULT_SETTINGS_PATH,
+    project_root: Path = PROJECT_ROOT,
+) -> Settings:
+    """
+    Load and validate every section of ``config.toml``.
+
+    Args:
+        settings_path: TOML file to read.
+        project_root: Base directory for relative paths in ``[paths]``.
+
+    Returns:
+        Immutable validated settings.
+
+    Raises:
+        FileNotFoundError: If the configuration file does not exist.
+        ValueError: If any required field is missing, mistyped, or conflicts
+            with another field.
+    """
+
+    if not settings_path.is_file():
+        raise FileNotFoundError(f"Settings file not found: {settings_path}")
+
+    with settings_path.open("rb") as input_file:
+        document = tomllib.load(input_file)
+
+    return Settings(
+        paths=_parse_paths(document, project_root),
+        logging=_parse_logging(document),
+        checkpoint=_parse_checkpoint(document),
+        inference=_parse_inference(document),
     )

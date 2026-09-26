@@ -17,6 +17,13 @@ import torch
 from ..configuration.config import ParakeetConfig
 
 
+# Constants of the reference ParakeetFeatureExtractor. They are part of the
+# checkpoint's input contract, not tunable settings: changing either shifts
+# every feature the model was trained on.
+LOG_GUARD = 2**-24
+NORMALIZATION_EPSILON = 1e-5
+
+
 # =============================================================================
 # Slaney mel-scale utilities
 # =============================================================================
@@ -192,7 +199,10 @@ class ParakeetFeatureExtractor:
             dtype=torch.long,
             device=device,
         )
-        max_audio_length = int(audio_lengths.max().item())
+        # At least one (padding) sample keeps torch.stft defined when every
+        # waveform in the batch is empty; the mask below still marks no frame
+        # of such a row as valid.
+        max_audio_length = max(1, int(audio_lengths.max().item()))
         padded_audio = torch.zeros(
             len(waveform_list),
             max_audio_length,
@@ -229,7 +239,7 @@ class ParakeetFeatureExtractor:
         magnitude = torch.sqrt(magnitude.pow(2).sum(dim=-1)).pow(2)
 
         mel_features = self._runtime_mel_filters(device, magnitude.dtype) @ magnitude
-        mel_features = torch.log(mel_features + 2**-24)
+        mel_features = torch.log(mel_features + LOG_GUARD)
         mel_features = mel_features.permute(0, 2, 1)
 
         feature_lengths = torch.floor_divide(
@@ -243,14 +253,23 @@ class ParakeetFeatureExtractor:
 
         # Normalize per recording, not across the padded batch. This preserves
         # the reference behavior for mixed-duration inference.
+        #
+        # The reference divides by n (mean) and n - 1 (variance). Rows with
+        # fewer than two valid frames would divide by zero and send NaN into
+        # the encoder, so the divisors are clamped to one. For n >= 2 the
+        # result is bit-identical to the reference; for n <= 1 the features
+        # become zeros, which the model decodes as silence.
         mask = attention_mask.unsqueeze(-1)
+        mean_divisor = feature_lengths.clamp(min=1).unsqueeze(-1)
+        variance_divisor = (feature_lengths - 1).clamp(min=1).unsqueeze(-1)
+
         masked_features = mel_features * mask
-        mean = (masked_features.sum(dim=1) / feature_lengths.unsqueeze(-1)).unsqueeze(1)
-        variance = (
-            ((masked_features - mean) ** 2) * mask
-        ).sum(dim=1) / (feature_lengths - 1).unsqueeze(-1)
+        mean = (masked_features.sum(dim=1) / mean_divisor).unsqueeze(1)
+        squared_deviation = ((masked_features - mean) ** 2) * mask
+        variance = squared_deviation.sum(dim=1) / variance_divisor
         standard_deviation = torch.sqrt(variance).unsqueeze(1)
-        mel_features = (mel_features - mean) / (standard_deviation + 1e-5)
+
+        mel_features = (mel_features - mean) / (standard_deviation + NORMALIZATION_EPSILON)
         mel_features = mel_features * mask
 
         return mel_features, attention_mask

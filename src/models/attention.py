@@ -44,10 +44,10 @@ class RelativePositionalEncoding(nn.Module):
         hidden_size = encoder["hidden_size"]
         self.max_position_embeddings = encoder["max_position_embeddings"]
 
-        inverse_frequency = 1.0 / (
-            10000.0
-            ** (torch.arange(0, hidden_size, 2, dtype=torch.float32) / hidden_size)
-        )
+        # Explicit CPU placement keeps this non-checkpoint buffer real when the
+        # model skeleton is built on the meta device by load_model().
+        even_dimensions = torch.arange(0, hidden_size, 2, dtype=torch.float32, device="cpu")
+        inverse_frequency = 1.0 / (10000.0 ** (even_dimensions / hidden_size))
         self.register_buffer("inv_freq", inverse_frequency, persistent=False)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:

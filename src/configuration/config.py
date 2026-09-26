@@ -22,18 +22,21 @@ from typing import Any
 
 
 # =============================================================================
-# Repository paths
+# Repository root
 # =============================================================================
-# Paths are derived from this file's physical location instead of the current
-# working directory. This allows scripts to run from VS Code, PowerShell, tests,
-# or another process without silently pointing at a different checkpoint.
+# The root is derived from this file's physical location instead of the current
+# working directory, so config.toml is found no matter where the process starts.
+# Every other location (weights, logs) comes from config.toml [paths].
 # =============================================================================
 
 # This module lives under src/configuration, so two parents reach src and the
-# third reaches the repository root that owns weights/, docs/, and config.toml.
+# third reaches the repository root that owns config.toml.
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
-DEFAULT_WEIGHTS_DIR = PROJECT_ROOT / "weights" / "parakeet-tdt-0.6b-v3"
-DEFAULT_AUDIO_DIR = PROJECT_ROOT / "docs"
+
+# Activation functions this runtime implements. The checkpoint names them in
+# config.json; any other value would load weights into the wrong math.
+SUPPORTED_ENCODER_ACTIVATION = "silu"
+SUPPORTED_JOINT_ACTIVATION = "relu"
 
 
 @dataclass(frozen=True)
@@ -195,6 +198,26 @@ def validate_config(configuration: ParakeetConfig) -> None:
         raise ValueError("durations must contain non-negative integers")
     if len(set(durations)) != len(durations):
         raise ValueError("durations must not contain duplicate values")
+    _require_positive_integer(model, "max_symbols_per_step", "model")
+
+    # These fields select math that the native modules hard-wire. Rejecting
+    # other values is safer than loading a checkpoint that would run silently
+    # with the wrong activation or input scaling.
+    if model.get("hidden_act") != SUPPORTED_JOINT_ACTIVATION:
+        raise ValueError(
+            f"model.hidden_act must be {SUPPORTED_JOINT_ACTIVATION!r}, "
+            f"got {model.get('hidden_act')!r}"
+        )
+    if encoder.get("hidden_act") != SUPPORTED_ENCODER_ACTIVATION:
+        raise ValueError(
+            f"encoder.hidden_act must be {SUPPORTED_ENCODER_ACTIVATION!r}, "
+            f"got {encoder.get('hidden_act')!r}"
+        )
+    if encoder.get("scale_input") is not False:
+        raise ValueError(
+            "encoder.scale_input must be false; input scaling is not implemented, "
+            f"got {encoder.get('scale_input')!r}"
+        )
 
     hidden_size = _require_positive_integer(encoder, "hidden_size", "encoder")
     attention_heads = _require_positive_integer(
@@ -241,7 +264,7 @@ def validate_config(configuration: ParakeetConfig) -> None:
         )
 
 
-def load_config(weights_dir: Path = DEFAULT_WEIGHTS_DIR) -> ParakeetConfig:
+def load_config(weights_dir: Path) -> ParakeetConfig:
     """
     Load and validate all JSON artifacts needed by native inference.
 

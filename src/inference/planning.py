@@ -57,6 +57,7 @@ class WorkItem:
 class ExecutionPlan:
     """Deterministic bounded work plan for one file or a mixed folder."""
 
+    metadata: tuple[AudioMetadata, ...]
     items: tuple[WorkItem, ...]
     batches: tuple[tuple[WorkItem, ...], ...]
     target_sample_rate: int
@@ -64,27 +65,27 @@ class ExecutionPlan:
     max_batch_feature_frames: int
 
 
-
 def estimate_feature_frames(
     sample_count: int,
     sample_rate: int,
     target_sample_rate: int,
-    n_fft: int,
     hop_length: int,
 ) -> int:
-    """Estimate valid mel frames using the same padded-STFT contract as runtime."""
+    """
+    Return the STFT frame count the feature extractor will allocate.
+
+    Centered ``torch.stft`` yields ``samples // hop + 1`` frames regardless of
+    the FFT size. That tensor length (one more than the valid-frame count) is
+    what occupies memory, so it is what the budget must bound.
+    """
 
     if sample_count < 0:
         raise ValueError("sample_count must be non-negative")
-    if min(sample_rate, target_sample_rate, n_fft, hop_length) <= 0:
-        raise ValueError("sample rates, FFT size, and hop length must be positive")
+    if min(sample_rate, target_sample_rate, hop_length) <= 0:
+        raise ValueError("sample rates and hop length must be positive")
 
     target_samples = round(sample_count * target_sample_rate / sample_rate)
-    # torch.stft with centered padding produces one additional edge frame for
-    # the valid lengths used by the feature extractor. The planner must use the
-    # same contract or its resource budget can undercount every work item.
-    del n_fft
-    return max(1, target_samples // hop_length + 1)
+    return target_samples // hop_length + 1
 
 
 def _chunk_ranges(
@@ -98,8 +99,10 @@ def _chunk_ranges(
         return [(0, 0, 0, 0)]
     if max_frames <= 0:
         raise ValueError("max_frames must be positive")
-    if overlap_frames < 0 or overlap_frames >= max_frames:
-        raise ValueError("overlap_frames must be non-negative and smaller than max_frames")
+    # Overlap may exceed the core: the budget only requires core + 2 * overlap
+    # to fit, and source ranges stay monotonic because starts clamp at zero.
+    if overlap_frames < 0:
+        raise ValueError("overlap_frames must be non-negative")
 
     ranges: list[tuple[int, int, int, int]] = []
     core_start = 0
@@ -195,7 +198,6 @@ def build_execution_plan(
     metadata: Iterable[AudioMetadata],
     *,
     target_sample_rate: int,
-    n_fft: int,
     hop_length: int,
     max_chunk_feature_frames: int,
     overlap_feature_frames: int,
@@ -203,34 +205,34 @@ def build_execution_plan(
     max_batch_feature_frames: int,
     max_padding_fraction: float,
 ) -> ExecutionPlan:
-    """Create an automatic cost-aware plan without a duration cutoff."""
+    """
+    Create an automatic cost-aware plan without a duration cutoff.
+
+    Each file is cut into chunks whose STFT tensor never exceeds
+    ``max_chunk_feature_frames``: a core interval the chunk owns, plus up to
+    ``overlap_feature_frames`` of context on each side that it does not own.
+    Chunks from all files are interleaved round-robin and packed into
+    micro-batches bounded by count, total frames, and padding fraction.
+    """
 
     metadata_list = tuple(metadata)
     if not metadata_list:
         raise ValueError("At least one audio metadata record is required")
-    if max_chunk_feature_frames <= overlap_feature_frames:
-        raise ValueError("max_chunk_feature_frames must exceed overlap_feature_frames")
+
+    maximum_core_feature_frames = max_chunk_feature_frames - 2 * overlap_feature_frames
+    if maximum_core_feature_frames <= 0:
+        raise ValueError(
+            "max_chunk_feature_frames must exceed twice overlap_feature_frames"
+        )
+    # Frames are samples // hop + 1, so a window of exactly N * hop samples
+    # would need N + 1 frames. One sample less keeps the worst case at the
+    # configured hard budget (the 1500 vs 1501 off-by-one).
+    maximum_core_frames = maximum_core_feature_frames * hop_length - 1
+    overlap_source_frames = overlap_feature_frames * hop_length
 
     items: list[WorkItem] = []
     for file_index, record in enumerate(metadata_list):
         target_frames = round(record.frame_count * target_sample_rate / record.sample_rate)
-        target_feature_frames = estimate_feature_frames(
-            record.frame_count,
-            record.sample_rate,
-            target_sample_rate,
-            n_fft,
-            hop_length,
-        )
-        maximum_core_feature_frames = max_chunk_feature_frames - 2 * overlap_feature_frames
-        if maximum_core_feature_frames <= 0:
-            raise ValueError(
-                "max_chunk_feature_frames must leave room for both overlap sides"
-            )
-        # Valid feature frames are floor(samples / hop) + 1. Reserve one
-        # sample so a source window at the exact boundary cannot become one
-        # frame larger than the configured hard budget after centered padding.
-        maximum_core_frames = maximum_core_feature_frames * hop_length - 1
-        overlap_source_frames = overlap_feature_frames * hop_length
         ranges = _chunk_ranges(
             target_frames,
             maximum_core_frames,
@@ -241,11 +243,8 @@ def build_execution_plan(
                 source_end - source_start,
                 target_sample_rate,
                 target_sample_rate,
-                n_fft,
                 hop_length,
             )
-            if target_feature_frames <= max_chunk_feature_frames:
-                feature_frames = target_feature_frames
             items.append(
                 WorkItem(
                     file_index=file_index,
@@ -267,6 +266,7 @@ def build_execution_plan(
         max_padding_fraction,
     )
     return ExecutionPlan(
+        metadata=metadata_list,
         items=tuple(scheduled),
         batches=batches,
         target_sample_rate=target_sample_rate,

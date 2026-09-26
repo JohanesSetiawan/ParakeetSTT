@@ -1,19 +1,18 @@
 """
 Standalone PyTorch Parakeet runtime package.
 
-Public consumers should import configuration, processing, tokenization, model,
-and inference services from this package. Internal module names are organized by
-responsibility and do not use a redundant ``Native`` prefix because the package
-itself defines the native runtime boundary.
+Public consumers should import configuration, audio processing, tokenization,
+model, and inference services from this package. Internal module names are
+organized by responsibility.
 """
 
 from .audio import (
     DecodedSegment,
+    MediaSession,
     ParakeetFeatureExtractor,
     build_mel_filter_bank,
     inspect_media,
-    read_media_segment,
-    read_wav,
+    open_media_session,
 )
 from .checkpoint import (
     BootstrapResult,
@@ -25,50 +24,41 @@ from .checkpoint import (
     readiness_marker_path,
 )
 from .configuration import (
-    DEFAULT_AUDIO_DIR,
-    DEFAULT_WEIGHTS_DIR,
-    InferenceSettings,
     PROJECT_ROOT,
+    CheckpointSettings,
+    InferenceSettings,
     ParakeetConfig,
+    Settings,
     load_config,
-    load_inference_settings,
+    load_settings,
 )
 from .inference.offline import (
-    AudioMetadata,
     ChunkResult,
-    ExecutionPlan,
+    FileStatus,
     OfflineFileResult,
     OfflineRunResult,
     OfflineTranscriber,
-    QualityAssessment,
-    WorkItem,
 )
-from .inference.planning import build_execution_plan
-from .inference.service import Transcriber, TranscriptionBatch
-from .models import (
-    Attention,
-    GenerationResult,
-    ParakeetTDT,
-    load_model,
-    select_device,
-)
+from .inference.planning import AudioMetadata, ExecutionPlan, WorkItem, build_execution_plan
+from .models import GenerationResult, ParakeetTDT, load_model
+from .runtime import describe_runtime, select_device
 from .text import BpeTokenizer
 
 
 __all__ = [
-    "Attention",
     "AudioMetadata",
     "BootstrapResult",
     "BpeTokenizer",
-    "ChunkResult",
     "CheckpointPreparationResult",
+    "CheckpointSettings",
+    "ChunkResult",
     "ConversionResult",
-    "DEFAULT_AUDIO_DIR",
-    "DEFAULT_WEIGHTS_DIR",
     "DecodedSegment",
     "ExecutionPlan",
+    "FileStatus",
     "GenerationResult",
     "InferenceSettings",
+    "MediaSession",
     "OfflineFileResult",
     "OfflineRunResult",
     "OfflineTranscriber",
@@ -76,21 +66,19 @@ __all__ = [
     "ParakeetConfig",
     "ParakeetFeatureExtractor",
     "ParakeetTDT",
-    "QualityAssessment",
-    "Transcriber",
-    "TranscriptionBatch",
+    "Settings",
     "WorkItem",
     "build_execution_plan",
     "build_mel_filter_bank",
-    "load_config",
-    "load_inference_settings",
-    "load_model",
-    "prepare_checkpoint",
-    "ensure_first_run_ready",
     "clear_readiness_marker",
-    "readiness_marker_path",
-    "read_wav",
+    "describe_runtime",
+    "ensure_first_run_ready",
     "inspect_media",
-    "read_media_segment",
+    "load_config",
+    "load_model",
+    "load_settings",
+    "open_media_session",
+    "prepare_checkpoint",
+    "readiness_marker_path",
     "select_device",
 ]

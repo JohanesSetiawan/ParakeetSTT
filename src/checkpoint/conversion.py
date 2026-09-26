@@ -16,12 +16,16 @@ Safetensors byte layout
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, BinaryIO, Callable
 
 import torch
+
+
+SAFETENSORS_PREFIX_BYTES = 8
 
 
 SAFETENSORS_DTYPE_TO_TORCH: dict[str, torch.dtype] = {
@@ -119,20 +123,40 @@ class ConvertedCheckpoint:
 
 
 def read_safetensors_file(path: Path) -> SafetensorsFile:
-    """Parse one safetensors file and return tensors with owned CPU storage."""
+    """
+    Parse one safetensors file and return tensors with owned CPU storage.
 
-    raw_bytes = path.read_bytes()
-    if len(raw_bytes) < 8:
+    Each tensor is read straight from its file offset into its own buffer, so
+    peak memory is the size of the resulting state dict plus one tensor, not
+    the whole file held twice.
+    """
+
+    file_size = path.stat().st_size
+    if file_size < SAFETENSORS_PREFIX_BYTES:
         raise ValueError(f"Safetensors file is shorter than its header prefix: {path}")
 
-    header_length = int.from_bytes(raw_bytes[:8], byteorder="little", signed=False)
-    header_end = 8 + header_length
-    if header_end > len(raw_bytes):
-        raise ValueError(f"Safetensors JSON header is truncated: {path}")
+    with path.open("rb") as source:
+        prefix = source.read(SAFETENSORS_PREFIX_BYTES)
+        header_length = int.from_bytes(prefix, byteorder="little", signed=False)
+        header_end = SAFETENSORS_PREFIX_BYTES + header_length
+        if header_end > file_size:
+            raise ValueError(f"Safetensors JSON header is truncated: {path}")
 
-    header = json.loads(raw_bytes[8:header_end].decode("utf-8"))
-    if not isinstance(header, dict):
-        raise ValueError(f"Safetensors header must be a JSON object: {path}")
+        header = json.loads(source.read(header_length).decode("utf-8"))
+        if not isinstance(header, dict):
+            raise ValueError(f"Safetensors header must be a JSON object: {path}")
+
+        return _read_tensors(path, source, header, header_end, file_size)
+
+
+def _read_tensors(
+    path: Path,
+    source: BinaryIO,
+    header: dict[str, Any],
+    header_end: int,
+    file_size: int,
+) -> SafetensorsFile:
+    """Validate descriptors and read every tensor payload from ``source``."""
 
     raw_metadata = header.pop("__metadata__", {})
     if not isinstance(raw_metadata, dict) or not all(
@@ -166,19 +190,42 @@ def read_safetensors_file(path: Path) -> SafetensorsFile:
         start_offset, end_offset = offsets
         absolute_start = header_end + start_offset
         absolute_end = header_end + end_offset
-        if start_offset < 0 or end_offset < start_offset or absolute_end > len(raw_bytes):
+        if start_offset < 0 or end_offset < start_offset or absolute_end > file_size:
             raise ValueError(f"Out-of-range payload for tensor {tensor_name!r}")
 
-        tensor_bytes = bytearray(raw_bytes[absolute_start:absolute_end])
-        tensor = torch.frombuffer(
-            tensor_bytes,
-            dtype=SAFETENSORS_DTYPE_TO_TORCH[dtype_name],
-        )
-        if shape:
-            tensor = tensor.reshape(shape)
-        tensors[tensor_name] = tensor.clone()
+        dtype = SAFETENSORS_DTYPE_TO_TORCH[dtype_name]
+        expected_bytes = math.prod(shape) * torch.empty((), dtype=dtype).element_size()
+        if absolute_end - absolute_start != expected_bytes:
+            raise ValueError(
+                f"Payload size of tensor {tensor_name!r} does not match shape {shape} "
+                f"and dtype {dtype_name}"
+            )
+
+        source.seek(absolute_start)
+        # bytearray gives the tensor its own writable storage, so no clone.
+        tensor_bytes = bytearray(source.read(absolute_end - absolute_start))
+        if len(tensor_bytes) != expected_bytes:
+            raise ValueError(f"Unexpected end of file while reading {tensor_name!r} from {path}")
+
+        if expected_bytes == 0:
+            tensor = torch.empty(shape, dtype=dtype)
+        else:
+            tensor = torch.frombuffer(tensor_bytes, dtype=dtype).reshape(shape)
+        tensors[tensor_name] = tensor
 
     return SafetensorsFile(tensors=tensors, metadata=dict(raw_metadata))
+
+
+def _shard_path(checkpoint_dir: Path, shard_name: object) -> Path:
+    """
+    Resolve one shard file name from an index, rejecting anything but a plain
+    file name. The index is external input; ``../x`` or an absolute path must
+    not make the converter read outside the checkpoint directory.
+    """
+
+    if not isinstance(shard_name, str) or not shard_name or Path(shard_name).name != shard_name:
+        raise ValueError(f"Safetensors index names an invalid shard file: {shard_name!r}")
+    return checkpoint_dir / shard_name
 
 
 def resolve_safetensors_files(checkpoint_dir: Path) -> list[Path]:
@@ -191,7 +238,7 @@ def resolve_safetensors_files(checkpoint_dir: Path) -> list[Path]:
         if not isinstance(weight_map, dict):
             raise ValueError(f"Safetensors index has no weight_map: {index_path}")
         shard_names = sorted(set(weight_map.values()))
-        shard_paths = [checkpoint_dir / shard_name for shard_name in shard_names]
+        shard_paths = [_shard_path(checkpoint_dir, shard_name) for shard_name in shard_names]
         missing_shards = [str(path) for path in shard_paths if not path.is_file()]
         if missing_shards:
             raise FileNotFoundError(f"Missing safetensors shards: {missing_shards}")

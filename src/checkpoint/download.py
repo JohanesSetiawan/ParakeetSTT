@@ -15,21 +15,31 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import tempfile
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
+from ..configuration.settings import CheckpointSettings
+from ..runtime.filesystem import write_json_atomic
+
+
+logger = logging.getLogger(__name__)
+
 
 # =============================================================================
 # Download specification and manifest
 # =============================================================================
-# The URL map is configuration for the requested checkpoint source. The expected
-# digest is learned only after a successful download and persisted locally; the
-# remote URLs do not provide a trusted SHA-256 sidecar in this workflow.
+# The URLs, sizes, and digests below are pinned on purpose. They identify the
+# exact upstream revision this runtime was verified against (token parity with
+# the reference implementation); changing the source without changing the pins
+# is rejected by the identity check, which is the point. They are an integrity
+# invariant, not a user setting, so they stay in code.
 # =============================================================================
 
 
@@ -173,28 +183,7 @@ def load_manifest(checkpoint_dir: Path) -> dict[str, Any]:
 def write_manifest(checkpoint_dir: Path, manifest: dict[str, Any]) -> None:
     """Atomically persist the per-file download manifest."""
 
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    manifest_path = checkpoint_dir / MANIFEST_FILENAME
-
-    with tempfile.NamedTemporaryFile(
-        mode="w",
-        encoding="utf-8",
-        dir=checkpoint_dir,
-        prefix="download_manifest.",
-        suffix=".tmp",
-        delete=False,
-    ) as temporary_file:
-        temporary_path = Path(temporary_file.name)
-        try:
-            json.dump(manifest, temporary_file, ensure_ascii=True, indent=2, sort_keys=True)
-            temporary_file.write("\n")
-            temporary_file.flush()
-            os.fsync(temporary_file.fileno())
-        except Exception:
-            temporary_path.unlink(missing_ok=True)
-            raise
-
-    temporary_path.replace(manifest_path)
+    write_json_atomic(checkpoint_dir / MANIFEST_FILENAME, manifest)
 
 
 # =============================================================================
@@ -246,7 +235,10 @@ def _remote_metadata(spec: DownloadSpec, timeout_seconds: float) -> dict[str, An
             content_length = response.headers.get("Content-Length")
             etag = response.headers.get("ETag")
             repository_commit = response.headers.get("X-Repo-Commit")
-    except (urllib.error.HTTPError, urllib.error.URLError, OSError):
+    except (urllib.error.HTTPError, urllib.error.URLError, OSError) as error:
+        # Metadata is only a cheap preflight; the download and hash checks
+        # still run, so an unreachable HEAD is logged, not fatal.
+        logger.info("HEAD %s unavailable: %s", spec.filename, error)
         return {
             "content_length": None,
             "etag": None,
@@ -284,22 +276,23 @@ def _evidence_matches_spec(evidence: FileEvidence, spec: DownloadSpec) -> bool:
 def _download_to_temporary(
     spec: DownloadSpec,
     checkpoint_dir: Path,
-    timeout_seconds: float,
-    block_size: int,
+    settings: CheckpointSettings,
     progress_callback: Callable[[str], None] | None,
     remote_content_length: int | None,
     remote_etag: str | None,
-    download_attempts: int,
 ) -> FileEvidence:
     """Stream one URL to a same-directory temporary file and atomically replace it."""
 
     target_path = checkpoint_dir / spec.filename
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    if download_attempts <= 0:
-        raise ValueError("download_attempts must be positive")
+    timeout_seconds = settings.request_timeout_seconds
+    block_size = settings.stream_block_bytes
+    download_attempts = settings.download_attempts
 
     last_network_error: Exception | None = None
     for attempt in range(1, download_attempts + 1):
+        if attempt > 1:
+            time.sleep(settings.retry_backoff_seconds * (attempt - 1))
         digest = hashlib.sha256()
         size_bytes = 0
         response_content_length: str | None = None
@@ -319,6 +312,9 @@ def _download_to_temporary(
             spec.url,
             headers={"User-Agent": "javanese-exp-v2-checkpoint-downloader"},
         )
+        # One progress line per whole percent keeps a 2.5 GB transfer to about
+        # 100 lines instead of one line per streamed block.
+        last_reported_percent = -1
         try:
             with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
                 response_content_length = response.headers.get("Content-Length")
@@ -327,16 +323,26 @@ def _download_to_temporary(
                         output_file.write(block)
                         digest.update(block)
                         size_bytes += len(block)
-                        if progress_callback is not None:
+                        percent = min(100, size_bytes * 100 // spec.expected_size_bytes)
+                        if progress_callback is not None and percent > last_reported_percent:
+                            last_reported_percent = percent
                             progress_callback(
-                                f"{spec.filename}: downloaded {size_bytes} bytes "
-                                f"(attempt {attempt}/{download_attempts})"
+                                f"{spec.filename}: {size_bytes} / {spec.expected_size_bytes} bytes, "
+                                f"Progress: {percent} percent "
+                                f"(attempt {attempt} / {download_attempts})"
                             )
                     output_file.flush()
                     os.fsync(output_file.fileno())
         except (urllib.error.URLError, OSError) as error:
             temporary_path.unlink(missing_ok=True)
             last_network_error = error
+            logger.warning(
+                "%s: attempt %d/%d failed: %s",
+                spec.filename,
+                attempt,
+                download_attempts,
+                error,
+            )
             if progress_callback is not None:
                 progress_callback(
                     f"{spec.filename}: attempt {attempt}/{download_attempts} failed: {error}"
@@ -403,10 +409,8 @@ def _download_to_temporary(
 
 def ensure_checkpoint_files(
     checkpoint_dir: Path,
+    settings: CheckpointSettings,
     specifications: tuple[DownloadSpec, ...] = CHECKPOINT_DOWNLOADS,
-    timeout_seconds: float = 120.0,
-    block_size: int = 1024 * 1024,
-    download_attempts: int = 3,
     progress_callback: Callable[[str], None] | None = None,
 ) -> list[DownloadResult]:
     """
@@ -418,10 +422,8 @@ def ensure_checkpoint_files(
 
     Args:
         checkpoint_dir: Destination directory under ``weights``.
+        settings: Timeout, retry, backoff, and block size from config.toml.
         specifications: Ordered remote artifact specifications.
-        timeout_seconds: Per-request timeout.
-        block_size: Streaming read/hash block size.
-        download_attempts: Maximum GET attempts for transient network failures.
         progress_callback: Optional callback for plain-text progress messages.
 
     Returns:
@@ -439,7 +441,7 @@ def ensure_checkpoint_files(
     for spec in specifications:
         target_path = checkpoint_dir / spec.filename
         existing_entry = manifest["files"].get(spec.filename)
-        remote_metadata = _remote_metadata(spec, timeout_seconds)
+        remote_metadata = _remote_metadata(spec, settings.request_timeout_seconds)
         remote_content_length = remote_metadata["content_length"]
         remote_etag = remote_metadata["etag"]
         if (
@@ -481,12 +483,10 @@ def ensure_checkpoint_files(
                     evidence = _download_to_temporary(
                         spec,
                         checkpoint_dir,
-                        timeout_seconds,
-                        block_size,
+                        settings,
                         progress_callback,
                         remote_content_length,
                         remote_etag,
-                        download_attempts,
                     )
                     action = "downloaded"
             else:
@@ -498,12 +498,10 @@ def ensure_checkpoint_files(
                 evidence = _download_to_temporary(
                     spec,
                     checkpoint_dir,
-                    timeout_seconds,
-                    block_size,
+                    settings,
                     progress_callback,
                     remote_content_length,
                     remote_etag,
-                    download_attempts,
                 )
                 if evidence.size_bytes == 0:
                     raise ValueError(f"Downloaded file is empty: {target_path}")

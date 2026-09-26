@@ -6,9 +6,7 @@ from .media import (
     MediaSession,
     inspect_media,
     open_media_session,
-    read_media_segment,
 )
-from .reader import read_wav
 
 __all__ = [
     "DecodedSegment",
@@ -17,6 +15,4 @@ __all__ = [
     "build_mel_filter_bank",
     "inspect_media",
     "open_media_session",
-    "read_media_segment",
-    "read_wav",
 ]

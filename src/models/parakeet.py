@@ -16,7 +16,8 @@ from typing import Any
 import torch
 from torch import nn
 
-from ..configuration.config import DEFAULT_WEIGHTS_DIR, ParakeetConfig, load_config
+from ..configuration.config import ParakeetConfig, load_config
+from ..runtime.device import select_device
 from .decoder import Decoder, DecoderCache
 from .encoder import Encoder
 from .joint import JointNetwork
@@ -24,13 +25,31 @@ from .joint import JointNetwork
 
 @dataclass(frozen=True)
 class GenerationResult:
-    """Token IDs and per-step frame durations produced by greedy TDT decoding."""
+    """
+    Token IDs and per-step frame bookkeeping produced by greedy TDT decoding.
+
+    Every tensor is ``(B, U)`` except the per-row summaries. Rows that finish
+    early are right-padded with ``pad_token_id`` and zero durations.
+
+    Attributes:
+        sequences: Emitted token per step; step 0 is the decoder start token.
+        durations: Encoder frames advanced after each step.
+        frame_starts: Encoder frame each step was emitted on.
+        frame_ends: ``frame_starts + durations``.
+        encoder_lengths: Valid encoder frames per row ``(B,)``.
+        forced_advances: Times the per-frame symbol guard forced progress
+            ``(B,)``; zero on well-behaved audio.
+        encoder_finite: Whether every valid encoder state was finite ``(B,)``.
+            Non-finite rows are not decoded and emit no tokens.
+    """
 
     sequences: torch.LongTensor
     durations: torch.LongTensor
-    frame_starts: torch.LongTensor | None = None
-    frame_ends: torch.LongTensor | None = None
-    encoder_lengths: torch.LongTensor | None = None
+    frame_starts: torch.LongTensor
+    frame_ends: torch.LongTensor
+    encoder_lengths: torch.LongTensor
+    forced_advances: torch.LongTensor
+    encoder_finite: torch.BoolTensor
 
 
 # =============================================================================
@@ -59,6 +78,15 @@ class ParakeetTDT(nn.Module):
         self.decoder = Decoder(configuration)
         self.joint = JointNetwork(configuration)
         self.max_symbols_per_step = configuration.model["max_symbols_per_step"]
+
+        # Duration classes map a joint-output index to a frame count. The
+        # buffer is not persistent, so the checkpoint key set is unchanged, and
+        # it is created on CPU so it stays real under meta-device construction.
+        self.register_buffer(
+            "duration_values",
+            torch.tensor(configuration.durations, dtype=torch.long, device="cpu"),
+            persistent=False,
+        )
 
     def encode(
         self,
@@ -95,67 +123,84 @@ class ParakeetTDT(nn.Module):
         """
         Run batched greedy TDT decoding until every encoder stream is exhausted.
 
-        At each iteration, the model selects one token class and one duration
-        class. The selected duration advances the encoder frame pointer. Blank
-        tokens are forced to advance by at least one frame so decoding cannot
-        remain forever on a frame with ``duration=0``.
+        At each step the joint network picks one token class and one duration
+        class; the duration's frame count advances that row's encoder pointer.
+        Two rules guarantee progress:
+
+        * a blank token with duration 0 advances one frame (reference behavior);
+        * after ``max_symbols_per_step`` consecutive non-blank tokens on the same
+          frame, the last one is forced to advance one frame. This mirrors the
+          NeMo greedy transducer guard. It never fires on normal speech, and it
+          turns degenerate input into bounded output instead of a hang.
 
         Args:
             input_features: Padded normalized features ``(B, T_in, M)``.
             attention_mask: Valid feature-frame mask ``(B, T_in)``.
 
         Returns:
-            Padded token and duration sequences with shape ``(B, U)``.
+            Padded token, duration, and frame bookkeeping; see
+            :class:`GenerationResult`.
         """
 
         encoder_states, encoder_mask = self.encode(input_features, attention_mask)
         batch_size, encoder_length, _ = encoder_states.shape
+        device = encoder_states.device
         valid_lengths = encoder_mask.sum(dim=-1)
 
-        frame_indices = torch.zeros(
-            batch_size,
-            dtype=torch.long,
-            device=encoder_states.device,
-        )
-        finished = valid_lengths <= 0
+        # One reduction per batch (not per step): padded frames are excluded
+        # because their values are never read by the decoder.
+        finite_or_padding = torch.isfinite(encoder_states) | ~encoder_mask[:, :, None]
+        encoder_finite = finite_or_padding.all(dim=2).all(dim=1)
+
+        blank_token_id = self.configuration.blank_token_id
+        pad_token_id = self.configuration.pad_token_id
+        vocab_size = self.configuration.vocab_size
+
+        frame_indices = torch.zeros(batch_size, dtype=torch.long, device=device)
+        symbols_on_frame = torch.zeros_like(frame_indices)
+        forced_advances = torch.zeros_like(frame_indices)
+        finished = (valid_lengths <= 0) | ~encoder_finite
+
         decoder_input_ids = torch.full(
             (batch_size, 1),
-            self.configuration.blank_token_id,
+            blank_token_id,
             dtype=torch.long,
-            device=encoder_states.device,
+            device=device,
         )
         decoder_cache = DecoderCache(self.configuration)
-        # This upper bound mirrors the reference generation buffer policy. The
-        # normal stopping condition is encoder exhaustion; reaching this bound
-        # indicates every frame emitted max_symbols_per_step zero-duration tokens.
+
+        # With the per-frame guard each frame consumes at most
+        # max_symbols_per_step steps, so this bound is a safety net that only a
+        # logic error can reach.
         maximum_steps = self.max_symbols_per_step * max(1, encoder_length)
         output_capacity = maximum_steps + 1
         sequence_buffer = torch.full(
             (batch_size, output_capacity),
-            self.configuration.pad_token_id,
+            pad_token_id,
             dtype=torch.long,
-            device=encoder_states.device,
+            device=device,
         )
         duration_buffer = torch.zeros_like(sequence_buffer)
         frame_start_buffer = torch.zeros_like(sequence_buffer)
-        frame_end_buffer = torch.zeros_like(sequence_buffer)
-        sequence_buffer[:, 0] = decoder_input_ids[:, 0]
+        sequence_buffer[:, 0] = blank_token_id
         output_length = 1
-        batch_indices = torch.arange(
-            batch_size,
-            device=encoder_states.device,
+
+        batch_indices = torch.arange(batch_size, device=device)
+        blank_ids = torch.full((batch_size,), blank_token_id, dtype=torch.long, device=device)
+        pad_ids = torch.full_like(blank_ids, pad_token_id)
+        max_symbols = self.max_symbols_per_step
+
+        # This loop runs once per emitted symbol, so each elementwise op below
+        # is a kernel launch paid thousands of times per batch. An identity
+        # duration table (Parakeet's 0..4) therefore skips the lookup.
+        duration_classes_are_frames = self.configuration.durations == tuple(
+            range(len(self.configuration.durations))
         )
-        blank_input_ids = torch.full_like(
-            decoder_input_ids,
-            self.configuration.blank_token_id,
-        )
-        pad_token_ids = torch.full_like(
-            decoder_input_ids,
-            self.configuration.pad_token_id,
-        )
-        zero_durations = torch.zeros_like(decoder_input_ids)
 
         for _step in range(maximum_steps):
+            if bool(finished.all()):
+                break
+
             decoder_hidden_states = self.decoder(
                 decoder_input_ids,
                 decoder_cache,
@@ -167,82 +212,68 @@ class ParakeetTDT(nn.Module):
                 safe_frame_indices,
                 None,
                 :,
-            ]
+            ]  # (B, 1, H_decoder)
             logits = self.joint(
                 decoder_hidden_states,
                 current_encoder_states,
-            ).squeeze(1)
+            ).squeeze(1)  # (B, vocab + durations)
 
-            token_ids = logits[:, : self.configuration.vocab_size].argmax(dim=-1)
-            duration_ids = logits[:, self.configuration.vocab_size :].argmax(dim=-1)
+            token_ids = logits[:, :vocab_size].argmax(dim=-1)
+            frame_advance = logits[:, vocab_size:].argmax(dim=-1)
+            if not duration_classes_are_frames:
+                frame_advance = self.duration_values[frame_advance]
+
             active = ~finished
-            blank_mask = token_ids == self.configuration.blank_token_id
+            blank_mask = token_ids == blank_token_id
+            zero_advance = (frame_advance == 0) & active
 
-            duration_ids = torch.where(
-                active & blank_mask & (duration_ids == 0),
-                torch.ones_like(duration_ids),
-                duration_ids,
-            )
-            emitted_token_ids = torch.where(
-                active,
-                token_ids,
-                pad_token_ids[:, 0],
-            )
-            emitted_durations = torch.where(
-                active,
-                duration_ids,
-                zero_durations[:, 0],
-            )
-            emitted_frame_starts = torch.where(
-                active,
-                frame_indices,
-                zero_durations[:, 0],
-            )
-            emitted_frame_ends = torch.where(
-                active,
-                frame_indices + emitted_durations,
-                zero_durations[:, 0],
-            )
+            # Count consecutive non-blank zero-duration emissions on the current
+            # frame. Counting modulo max_symbols restarts the count at 1 right
+            # after a forced advance, so no separate reset op is needed.
+            stays_on_frame = zero_advance & ~blank_mask
+            symbols_on_frame = (symbols_on_frame % max_symbols + 1) * stays_on_frame
+            guard_fires = symbols_on_frame == max_symbols
+            forced_advances += guard_fires
+
+            # A blank with duration 0 (reference rule) and a guarded token both
+            # advance exactly one frame.
+            frame_advance = frame_advance + (zero_advance & (blank_mask | guard_fires))
+
+            emitted_token_ids = torch.where(active, token_ids, pad_ids)
+            emitted_durations = frame_advance * active
             sequence_buffer[:, output_length] = emitted_token_ids
             duration_buffer[:, output_length] = emitted_durations
-            frame_start_buffer[:, output_length] = emitted_frame_starts
-            frame_end_buffer[:, output_length] = emitted_frame_ends
+            frame_start_buffer[:, output_length] = frame_indices * active
             output_length += 1
 
-            frame_indices = torch.where(
-                active,
-                frame_indices + emitted_durations,
-                frame_indices,
-            )
+            frame_indices = frame_indices + emitted_durations
             finished = finished | (frame_indices >= valid_lengths)
 
-
-            # Completed rows receive blank decoder input to preserve cache state;
-            # emitted output for those rows is already padded above.
-            decoder_input_ids = torch.where(
-                finished,
-                blank_input_ids[:, 0],
-                emitted_token_ids,
-            )[:, None]
-
-            if bool(finished.all()):
-                break
+            # Completed rows receive blank decoder input so their cache row is
+            # left untouched; their emitted output is already padded above.
+            decoder_input_ids = torch.where(finished, blank_ids, emitted_token_ids)[:, None]
         else:
-            raise RuntimeError(
-                "TDT decoding reached the maximum step bound before encoder exhaustion"
-            )
+            if not bool(finished.all()):
+                raise RuntimeError(
+                    "TDT decoding reached the maximum step bound before encoder "
+                    "exhaustion despite the per-frame symbol guard"
+                )
 
+        durations = duration_buffer[:, :output_length]
+        frame_starts = frame_start_buffer[:, :output_length]
         return GenerationResult(
             sequences=sequence_buffer[:, :output_length],
-            durations=duration_buffer[:, :output_length],
-            frame_starts=frame_start_buffer[:, :output_length],
-            frame_ends=frame_end_buffer[:, :output_length],
+            durations=durations,
+            frame_starts=frame_starts,
+            frame_ends=frame_starts + durations,
             encoder_lengths=valid_lengths,
+            forced_advances=forced_advances,
+            encoder_finite=encoder_finite,
         )
 
 
 # =============================================================================
-# Device and checkpoint loading
+# Checkpoint loading
 # =============================================================================
 # Model construction always starts on CPU. The state dict is loaded strictly
 # before moving the model to the selected accelerator, which avoids allocating
@@ -250,18 +281,8 @@ class ParakeetTDT(nn.Module):
 # =============================================================================
 
 
-def select_device() -> torch.device:
-    """Select CUDA, then MPS, then CPU from actual PyTorch availability."""
-
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        return torch.device("mps")
-    return torch.device("cpu")
-
-
 def load_model(
-    weights_dir: Path = DEFAULT_WEIGHTS_DIR,
+    weights_dir: Path,
     device: torch.device | None = None,
 ) -> tuple[ParakeetTDT, ParakeetConfig, dict[str, Any]]:
     """
@@ -281,24 +302,34 @@ def load_model(
     """
 
     configuration = load_config(weights_dir)
-    model = ParakeetTDT(configuration)
+
+    # The meta device builds the module graph without allocating or randomly
+    # initializing 600M parameters that the checkpoint overwrites anyway;
+    # load_state_dict(assign=True) then adopts the loaded CPU tensors directly.
+    with torch.device("meta"):
+        model = ParakeetTDT(configuration)
+
+    # weights_only=True refuses arbitrary pickled objects, so a replaced or
+    # tampered model.pth cannot execute code during load.
     checkpoint = torch.load(
         configuration.checkpoint_path,
         map_location="cpu",
-        weights_only=False,
+        weights_only=True,
     )
-
     if not isinstance(checkpoint, dict) or "state_dict" not in checkpoint:
         raise ValueError("model.pth must contain a dictionary with state_dict")
 
     incompatibility = model.load_state_dict(
         checkpoint["state_dict"],
         strict=True,
+        assign=True,
     )
     if incompatibility.missing_keys or incompatibility.unexpected_keys:
         raise RuntimeError(
             f"Strict state-dict load reported incompatibility: {incompatibility}"
         )
+
+    _require_materialized(model)
 
     resolved_device = device or select_device()
     model = model.to(resolved_device)
@@ -309,3 +340,23 @@ def load_model(
         raise ValueError("model.pth metadata must be a dictionary")
 
     return model, configuration, metadata
+
+
+def _require_materialized(model: nn.Module) -> None:
+    """
+    Fail loudly if any tensor is still on the meta device after loading.
+
+    Parameters and persistent buffers come from the checkpoint; non-persistent
+    buffers must be created on CPU in their module constructors. A meta tensor
+    here means a new buffer was added without following that rule.
+    """
+
+    leftovers = [
+        name
+        for name, tensor in list(model.named_parameters()) + list(model.named_buffers())
+        if tensor.is_meta
+    ]
+    if leftovers:
+        raise RuntimeError(
+            f"Tensors were not materialized from the checkpoint: {leftovers[:10]}"
+        )
