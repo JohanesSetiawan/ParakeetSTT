@@ -13,8 +13,8 @@ looking like a normal transcript.
 
 from __future__ import annotations
 
+import dataclasses
 import logging
-import math
 import time
 from dataclasses import dataclass
 from enum import StrEnum
@@ -29,7 +29,15 @@ from ..configuration.config import ParakeetConfig
 from ..configuration.settings import InferenceSettings
 from ..models.parakeet import GenerationResult, ParakeetTDT
 from ..text.tokenization import BpeTokenizer
-from .planning import AudioMetadata, ExecutionPlan, WorkItem, build_execution_plan
+from .merging import ChunkWords, TimedToken, group_words, merge_chunks
+from .planning import (
+    AudioMetadata,
+    ExecutionPlan,
+    WorkItem,
+    build_execution_plan,
+    estimate_feature_frames,
+)
+from .recovery import Window, longest_untranscribed_gap, recovery_windows
 
 
 logger = logging.getLogger(__name__)
@@ -46,6 +54,9 @@ class FileStatus(StrEnum):
         replaced by zeros before inference.
     DECODER_FORCED_ADVANCE: the per-frame symbol guard fired, so part of the
         transcript comes from a degenerate decoding loop.
+    UNTRANSCRIBED_GAP: a long non-silent stretch produced no words, even
+        after re-decoding with shifted windows. Either the decoder collapsed
+        there or the audio is not speech (music, noise).
     NO_SPEECH: every chunk was digital silence and nothing was transcribed.
     EMPTY_TRANSCRIPT: audio was not silent but no token was produced.
     UNREADABLE: the file could not be decoded as audio and was not
@@ -55,6 +66,7 @@ class FileStatus(StrEnum):
     NUMERICAL_FAILURE = "numerical_failure"
     INPUT_NONFINITE = "input_nonfinite"
     DECODER_FORCED_ADVANCE = "decoder_forced_advance"
+    UNTRANSCRIBED_GAP = "untranscribed_gap"
     NO_SPEECH = "no_speech"
     EMPTY_TRANSCRIPT = "empty_transcript"
     UNREADABLE = "unreadable"
@@ -76,6 +88,16 @@ class ChunkResult:
     features_finite: bool
     encoder_finite: bool
     forced_advances: int
+    gap_start_sample: int = 0
+    gap_end_sample: int = 0
+    gap_rms: float = 0.0
+    recovered: bool = False
+
+    @property
+    def gap_samples(self) -> int:
+        """Length of the longest stretch of the core with no word."""
+
+        return self.gap_end_sample - self.gap_start_sample
 
     @property
     def numerically_valid(self) -> bool:
@@ -106,6 +128,7 @@ class OfflineRunResult:
     media_decode_seconds: float
     feature_seconds: float
     generation_seconds: float
+    recovery_seconds: float = 0.0
 
     @property
     def total_audio_seconds(self) -> float:
@@ -161,12 +184,24 @@ class _GenerationOnHost:
         )
 
 
-def classify_file(transcript: str, chunks: tuple[ChunkResult, ...]) -> FileStatus:
+def classify_file(
+    transcript: str,
+    chunks: tuple[ChunkResult, ...],
+    untranscribed_gap: bool = False,
+) -> FileStatus:
     """
     Derive one file status from objective chunk facts.
 
     Problems anywhere in the file win over the transcript state, because a
     single bad chunk makes the whole transcript incomplete or suspect.
+
+    Args:
+        transcript: The merged transcript.
+        chunks: All chunks of the file.
+        untranscribed_gap: Whether a chunk still has a long non-silent
+            stretch without words after recovery. It is reported only for
+            non-empty transcripts; an empty one is covered by NO_SPEECH or
+            EMPTY_TRANSCRIPT.
     """
 
     if any(not chunk.numerically_valid for chunk in chunks):
@@ -175,6 +210,8 @@ def classify_file(transcript: str, chunks: tuple[ChunkResult, ...]) -> FileStatu
         return FileStatus.INPUT_NONFINITE
     if any(chunk.forced_advances > 0 for chunk in chunks):
         return FileStatus.DECODER_FORCED_ADVANCE
+    if transcript and untranscribed_gap:
+        return FileStatus.UNTRANSCRIBED_GAP
     if not transcript:
         if all(chunk.silent for chunk in chunks):
             return FileStatus.NO_SPEECH
@@ -211,6 +248,14 @@ class OfflineTranscriber:
         self.samples_per_encoder_frame = self.hop_length * int(
             configuration.encoder["subsampling_factor"]
         )
+        self.merge_tolerance_samples = settings.merge_tolerance_feature_frames * self.hop_length
+        self.gap_threshold_samples = round(settings.untranscribed_gap_seconds * self.target_sample_rate)
+        self.recovery_offsets_samples = tuple(
+            offset * self.hop_length for offset in settings.recovery_start_offsets_feature_frames
+        )
+        # Same one-sample reserve as the planner, so a recovery window never
+        # needs one more feature frame than the configured chunk budget.
+        self.max_chunk_samples = settings.max_chunk_feature_frames * self.hop_length - 1
         self.special_token_ids = {
             configuration.blank_token_id,
             configuration.pad_token_id,
@@ -321,6 +366,29 @@ class OfflineTranscriber:
         segments = self._decode_batch_audio(items, sessions, sequential_state, remaining_chunks)
         decode_seconds = time.perf_counter() - decode_started
 
+        results, feature_seconds, generation_seconds = self._infer_segments(items, segments)
+        timings = {
+            "decode": decode_seconds,
+            "feature": feature_seconds,
+            "generation": generation_seconds,
+        }
+        logger.debug(
+            "batch items=%s feature_frames=%s decode=%.3fs feature=%.3fs generation=%.3fs",
+            [f"{item.path.name}#{item.chunk_index}" for item in items],
+            [item.feature_frames for item in items],
+            decode_seconds,
+            feature_seconds,
+            generation_seconds,
+        )
+        return results, timings
+
+    def _infer_segments(
+        self,
+        items: tuple[WorkItem, ...],
+        segments: tuple[DecodedSegment, ...],
+    ) -> tuple[tuple[ChunkResult, ...], float, float]:
+        """Run features and generation on decoded segments; stop on OOM."""
+
         feature_started = time.perf_counter()
         try:
             features, attention_mask = self.feature_extractor(
@@ -352,20 +420,7 @@ class OfflineTranscriber:
             self._chunk_result(item, segment, host, row_index)
             for row_index, (item, segment) in enumerate(zip(items, segments))
         )
-        timings = {
-            "decode": decode_seconds,
-            "feature": feature_seconds,
-            "generation": generation_seconds,
-        }
-        logger.debug(
-            "batch items=%s feature_frames=%s decode=%.3fs feature=%.3fs generation=%.3fs",
-            [f"{item.path.name}#{item.chunk_index}" for item in items],
-            [item.feature_frames for item in items],
-            decode_seconds,
-            feature_seconds,
-            generation_seconds,
-        )
-        return results, timings
+        return results, feature_seconds, generation_seconds
 
     def _chunk_result(
         self,
@@ -374,9 +429,9 @@ class OfflineTranscriber:
         host: _GenerationOnHost,
         row_index: int,
     ) -> ChunkResult:
-        """Assemble one row's tokens and health facts from host-side lists."""
+        """Assemble one row's tokens, health facts, and longest word gap."""
 
-        return ChunkResult(
+        chunk = ChunkResult(
             item=item,
             token_ids=tuple(host.sequences[row_index]),
             durations=tuple(host.durations[row_index]),
@@ -389,10 +444,110 @@ class OfflineTranscriber:
             encoder_finite=host.encoder_finite[row_index],
             forced_advances=host.forced_advances[row_index],
         )
+        word_starts = [word.start_sample for word in self._chunk_words(chunk).words]
+        gap = longest_untranscribed_gap(word_starts, item.core_start_frame, item.core_end_frame)
+        gap_waveform = segment.waveform[
+            max(0, gap.start - item.source_start_frame) : max(0, gap.end - item.source_start_frame)
+        ]
+        gap_rms = float(torch.sqrt(torch.mean(gap_waveform.square()))) if gap_waveform.numel() else 0.0
+        return dataclasses.replace(
+            chunk,
+            gap_start_sample=gap.start,
+            gap_end_sample=gap.end,
+            gap_rms=gap_rms,
+        )
+
+    # -------------------------------------------------------------------------
+    # Decoder collapse recovery
+    # -------------------------------------------------------------------------
+
+    def _has_untranscribed_gap(self, chunk: ChunkResult) -> bool:
+        """A long stretch of the core with no word whose audio is not silence."""
+
+        return (
+            chunk.numerically_valid
+            and chunk.gap_samples >= self.gap_threshold_samples
+            and chunk.gap_rms >= self.settings.gap_silence_rms
+        )
+
+    def _recover_chunk(self, chunk: ChunkResult, metadata: AudioMetadata) -> ChunkResult:
+        """
+        Re-decode a collapsed chunk with shifted windows; keep the first that
+        no longer has an untranscribed gap, otherwise the smallest gap seen.
+        """
+
+        item = chunk.item
+        file_end = round(metadata.frame_count * self.target_sample_rate / metadata.sample_rate)
+        windows = recovery_windows(
+            Window(item.source_start_frame, item.source_end_frame),
+            Window(item.core_start_frame, item.core_end_frame),
+            self.recovery_offsets_samples,
+            file_end,
+            self.max_chunk_samples,
+        )
+        best = chunk
+        with open_media_session(item.path) as session:
+            for window in windows:
+                shifted_item = dataclasses.replace(
+                    item,
+                    source_start_frame=window.start,
+                    source_end_frame=window.end,
+                    feature_frames=estimate_feature_frames(
+                        window.end - window.start,
+                        self.target_sample_rate,
+                        self.target_sample_rate,
+                        self.hop_length,
+                    ),
+                )
+                segment = session.read_segment(window.start, window.end, self.target_sample_rate)
+                (candidate,), _feature_seconds, _generation_seconds = self._infer_segments(
+                    (shifted_item,),
+                    (segment,),
+                )
+                candidate = dataclasses.replace(candidate, recovered=True)
+                if not self._has_untranscribed_gap(candidate):
+                    logger.info(
+                        "recovered collapsed chunk %s#%d with window start shifted by %.3f s",
+                        item.path.name,
+                        item.chunk_index,
+                        (window.start - item.source_start_frame) / self.target_sample_rate,
+                    )
+                    return candidate
+                if candidate.gap_samples < best.gap_samples:
+                    best = candidate
+        logger.warning(
+            "chunk %s#%d keeps an untranscribed gap of %.1f s after %d re-decodes",
+            item.path.name,
+            item.chunk_index,
+            best.gap_samples / self.target_sample_rate,
+            len(windows),
+        )
+        return best
 
     # -------------------------------------------------------------------------
     # Merge
     # -------------------------------------------------------------------------
+
+    def _chunk_words(self, chunk: ChunkResult) -> ChunkWords:
+        """Convert one chunk's content tokens to timed words in source samples."""
+
+        origin = chunk.item.source_start_frame
+        timed_tokens = [
+            TimedToken(
+                token_id=token,
+                start_sample=origin + start * self.samples_per_encoder_frame,
+                end_sample=origin + end * self.samples_per_encoder_frame,
+            )
+            for token, start, end in zip(chunk.token_ids, chunk.frame_starts, chunk.frame_ends)
+            if token not in self.special_token_ids
+        ]
+        return ChunkWords(
+            words=group_words(timed_tokens, self.tokenizer.id_to_token.get),
+            source_start=chunk.item.source_start_frame,
+            source_end=chunk.item.source_end_frame,
+            core_start=chunk.item.core_start_frame,
+            core_end=chunk.item.core_end_frame,
+        )
 
     def _merge_file(
         self,
@@ -400,44 +555,32 @@ class OfflineTranscriber:
         chunks: tuple[ChunkResult, ...],
     ) -> OfflineFileResult:
         """
-        Keep each token only in the chunk whose core owns its midpoint.
+        Merge a file's chunk transcripts at word level (see ``merging``).
 
-        Overlap context is decoded by two neighboring chunks; ownership by
-        token midpoint assigns every position to exactly one of them. Repeated
-        words are never collapsed, because natural speech repeats words.
+        Neighbouring chunks both transcribe their overlap. Words they agree
+        on inside the overlap are taken once; otherwise whole words go to the
+        chunk whose core holds their start. Words are never split between
+        chunks, and repeated words inside a chunk are never collapsed.
         """
 
         ordered_chunks = tuple(sorted(chunks, key=lambda chunk: chunk.item.chunk_index))
-        last_chunk_index = ordered_chunks[-1].item.chunk_index if ordered_chunks else -1
-        merged_tokens: list[int] = []
-        for chunk in ordered_chunks:
-            if not chunk.numerically_valid:
-                continue
-
-            # The last core has no successor to hand tokens to. Its midpoint
-            # can land at or past the end of the audio (last encoder frame,
-            # or a long duration), and such a token must still be kept.
-            core_start = chunk.item.core_start_frame
-            if chunk.item.chunk_index == last_chunk_index:
-                core_end: float = math.inf
-            else:
-                core_end = chunk.item.core_end_frame
-
-            for token, start, end in zip(chunk.token_ids, chunk.frame_starts, chunk.frame_ends):
-                if token in self.special_token_ids:
-                    continue
-                token_start = chunk.item.source_start_frame + start * self.samples_per_encoder_frame
-                token_end = chunk.item.source_start_frame + end * self.samples_per_encoder_frame
-                midpoint = (token_start + token_end) // 2
-                if core_start <= midpoint < core_end:
-                    merged_tokens.append(token)
+        chunk_words = tuple(
+            self._chunk_words(chunk)
+            for chunk in ordered_chunks
+            if chunk.numerically_valid
+        )
+        merged_tokens = merge_chunks(chunk_words, self.merge_tolerance_samples)
 
         transcript = self.tokenizer.decode(merged_tokens)
         return OfflineFileResult(
             path=metadata.path,
             duration_seconds=metadata.duration_seconds,
             transcript=transcript,
-            status=classify_file(transcript, ordered_chunks),
+            status=classify_file(
+                transcript,
+                ordered_chunks,
+                untranscribed_gap=any(self._has_untranscribed_gap(chunk) for chunk in ordered_chunks),
+            ),
             chunks=ordered_chunks,
         )
 
@@ -497,7 +640,7 @@ class OfflineTranscriber:
         sessions: dict[Path, MediaSession] = {}
         sequential_state: dict[Path, tuple[int, torch.Tensor]] = {}
         chunk_results: dict[int, list[ChunkResult]] = {index: [] for index in range(len(path_tuple))}
-        stage_totals = {"decode": 0.0, "feature": 0.0, "generation": 0.0}
+        stage_totals = {"decode": 0.0, "feature": 0.0, "generation": 0.0, "recovery": 0.0}
         try:
             for batch_index, batch in enumerate(plan.batches):
                 results, timings = self._transcribe_batch(
@@ -515,6 +658,14 @@ class OfflineTranscriber:
         finally:
             for session in sessions.values():
                 session.close()
+
+        recovery_started = time.perf_counter()
+        for index, record in enumerate(metadata_tuple):
+            chunk_results[index] = [
+                self._recover_chunk(chunk, record) if self._has_untranscribed_gap(chunk) else chunk
+                for chunk in chunk_results[index]
+            ]
+        stage_totals["recovery"] = time.perf_counter() - recovery_started
 
         file_results = tuple(
             self._merge_file(record, tuple(chunk_results[index]))
@@ -550,4 +701,5 @@ class OfflineTranscriber:
             media_decode_seconds=stage_totals["decode"],
             feature_seconds=stage_totals["feature"],
             generation_seconds=stage_totals["generation"],
+            recovery_seconds=stage_totals["recovery"],
         )

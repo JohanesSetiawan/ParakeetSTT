@@ -150,6 +150,7 @@ Every file gets exactly one status. When a file has several conditions, the most
 | `numerical_failure` | Features or encoder states were NaN/Inf for at least one chunk. The tokens from that chunk were discarded. | Report it; this should not happen with valid audio. |
 | `input_nonfinite` | The decoded audio contained NaN/Inf samples. They were replaced with zeros before inference. | Check the source file. |
 | `decoder_forced_advance` | The decoder emitted too many tokens on one frame and a safety guard forced it forward. Part of the transcript comes from a degenerate decoding loop. | Listen to the audio; the transcript may contain junk. |
+| `untranscribed_gap` | A stretch of more than `untranscribed_gap_seconds` of non-silent audio produced no words, even after re-decoding with shifted windows (see [How long audio is processed](#how-long-audio-is-processed)). The rest of the transcript is normal. | Listen to that stretch; it is often laughter, music, or noise, but it may be missed speech. The log gives its position. |
 | `no_speech` | Every chunk was digital silence (all-zero samples). | Nothing. |
 | `empty_transcript` | The audio was not silent, but no token was produced (noise, music, or speech too short). | Check whether the file contains speech. |
 | `unreadable` | Neither libsndfile nor FFmpeg could read the file. No transcript was attempted. | Install FFmpeg, or convert the file. |
@@ -195,6 +196,10 @@ All settings live in `config.toml` at the repository root. Every key is required
 | `overlap_feature_frames` | `50` | Context added on each side of a chunk (0.5 s). May be 0. `max_chunk_feature_frames` must be greater than twice this value. |
 | `max_batch_feature_frames` | `3000` | Limit on a batch's padded size: rows times the longest row. Must be at least `max_chunk_feature_frames`. |
 | `max_padding_fraction` | `0.25` | The largest share of a batch that may be padding, between 0 and 1. |
+| `merge_tolerance_feature_frames` | `100` | How far apart (1.0 s) two neighboring chunks may place the same word and still be recognized as one word at the seam. `0` disables seam alignment. |
+| `untranscribed_gap_seconds` | `4.0` | A stretch of a chunk this long with no word, and not silent, is treated as a possible decoder collapse and re-decoded. |
+| `gap_silence_rms` | `0.001` | RMS below which such a stretch counts as silence (about -60 dBFS) and is left alone. |
+| `recovery_start_offsets_feature_frames` | `[-25, 25, -50, 50]` | Window-start shifts tried, in order, when re-decoding a collapsed chunk. Each must be at most `overlap_feature_frames` in size. An empty list disables recovery. |
 | `progress_interval_seconds` | `2.0` | Minimum time between two progress lines. The final line is always printed. |
 
 `max_batch_feature_frames` and `max_chunk_feature_frames` are the memory controls. If a run stops with an out-of-memory error, lower them. The error message names both keys.
@@ -204,7 +209,7 @@ All settings live in `config.toml` at the repository root. Every key is required
 libsndfile handles WAV (PCM and float), FLAC, OGG/Vorbis, MP3 and the other formats it supports. It is always tried first. Any other file is probed with `ffprobe` and decoded with `ffmpeg`.
 
 - **Channels:** multi-channel audio is averaged to mono.
-- **Sample rate:** any rate is resampled to 16 kHz.
+- **Sample rate:** any rate is resampled to 16 kHz with an anti-aliased windowed-sinc filter, so content above 8 kHz is removed instead of folding into the speech band. With 9 to 15 kHz hiss mixed into 48 kHz speech, word error rate stayed at 3.7% (the clean value); the old linear interpolation reached 15.6%.
 - **Non-finite samples:** NaN/Inf samples are replaced with zero and reported as `input_nonfinite`.
 - **Missing FFmpeg:** if `ffprobe` is not installed, formats libsndfile cannot read are reported as `unreadable` and the rest of the folder is still processed.
 - **Misconfigured FFmpeg path:** if `FFMPEG_BINARY` or `FFPROBE_BINARY` is set but points to a missing file, the run stops. That is treated as a setup error, not a property of one file.
@@ -217,7 +222,8 @@ There is no duration limit, and memory use does not grow with the length of the 
 2. **Scheduling.** Chunks from all files are interleaved round-robin, so one long file cannot delay every short file behind it. They are then packed into micro-batches bounded by `batch_size`, by the padded size `max_batch_feature_frames`, and by `max_padding_fraction`.
 3. **Decoding.** Each file keeps one decoder handle open from its first chunk to its last. The overlap samples a chunk shares with the previous one are reused rather than decoded twice. Only the current chunk and one overlap tail per in-progress file are held in memory.
 4. **Inference.** Each batch goes through feature extraction, the encoder, and greedy TDT decoding on the selected device.
-5. **Merging.** A token is kept only by the chunk whose core contains the token's midpoint in time, so every position is transcribed by exactly one chunk. Repeated words are kept as spoken; nothing is deduplicated or corrected against a word list.
+5. **Collapse recovery.** On rare windows the model skips seconds of clear speech and emits nothing. The Hugging Face reference does the same on the same samples, so it is a property of the model. Moving the window start by a few hundred milliseconds usually fixes it. A chunk with a long non-silent stretch and no words is re-decoded with the shifted windows from `recovery_start_offsets_feature_frames`, and the first result without the gap is used. If none works, the file gets the status `untranscribed_gap`.
+6. **Merging.** Tokens are grouped into words and a word is never split between chunks. In the overlap, the words both chunks agree on are taken once, from the chunk with more context at that point. Neighboring chunks can place the same word up to about half a second apart, so agreement is checked within `merge_tolerance_feature_frames`. Without agreement, each whole word goes to the chunk whose core holds its start. Repeated words are kept as spoken; nothing is corrected against a word list.
 
 If the accelerator runs out of memory, the run stops with a diagnostic. It does not retry, shrink the batch, fall back to CPU, or write a partial CSV.
 
@@ -296,7 +302,7 @@ venv\Scripts\python.exe -m pytest -m full             # real checkpoint and spee
 
 The `full` tier uses five LibriSpeech clips committed under `tests/data/librispeech/` (CC BY 4.0; see `SOURCE.md` there). If the checkpoint has not been prepared, the whole tier is skipped with a message rather than downloading it. To also run your own long recordings through the long-form checks, list them in `PARAKEET_TEST_LONG_AUDIO`, separated by `;` on Windows or `:` elsewhere.
 
-On the development machine the full suite (175 tests) takes about 70 seconds. Two `full` tests are marked as expected failures for the known chunk-boundary defect (see [Known limitations](#known-limitations)). pytest runs with strict expected failures, so fixing the defect makes those tests fail until their markers are removed.
+On the development machine the full suite takes about 70 seconds.
 
 ## Project layout
 
@@ -323,8 +329,8 @@ tests/
 
 ## Known limitations
 
-- **Chunk boundaries cost accuracy.** Audio longer than about 15 s is split into chunks, and merging them can insert a stray subword fragment at a boundary: for example "smile atile at one" where the unchunked reference says "smile at one". On the test clips, word error rate rises from 6.4% (each clip transcribed alone) to 13.3% when the same speech is transcribed as one 196-second recording cut into 15 chunks. The `full` test tier tracks this as a known defect.
-- **Resampling** is linear interpolation without a low-pass filter. Audio above 16 kHz sample rate with strong content above 8 kHz is aliased slightly, and the FFmpeg path resamples differently from the libsndfile path.
+- **Chunking still costs a little accuracy.** On the test clips, word error rate is 3.7% when each clip is transcribed alone and 4.6% when the same speech is one 196-second recording cut into 15 chunks. Each chunk sees less context than the whole recording.
+- **Decoder collapse cannot always be recovered.** The first chunk of a file has no earlier audio to shift into, and some windows stay collapsed at every tried shift. Such files are marked `untranscribed_gap` rather than passed off as complete.
 - **The FFmpeg fallback** starts one `ffmpeg` process per chunk and decodes overlap regions twice. libsndfile formats are not affected.
 - **The greedy decoding loop** synchronizes with the GPU once per step. It is the dominant cost of a run.
 - **Precision:** only float32 inference is implemented.

@@ -23,11 +23,16 @@ from support import SpeechClip, word_error_rate
 SAMPLE_RATE = 16000
 GAP = np.zeros(SAMPLE_RATE // 2, dtype=np.float32)
 
-# Measured: 9.17 percent WER at 1 pass (49 s, 4 chunks) and 13.30 percent at
-# 4 passes (196 s, 15 chunks), against 6.42 percent for the same clips
-# transcribed one by one. The gap is the known chunk-boundary defect; this
-# budget stops it from getting worse while it is open.
-LONG_FORM_WER_BUDGET = 0.14
+# Measured with word-level merging and collapse recovery: 4.59 percent WER at
+# 4 passes (196 s, 15 chunks), against 3.67 percent for the same clips
+# transcribed one by one (titles normalized). Before those fixes it was 13.30
+# percent. The budget allows about four extra word errors in 436 words.
+LONG_FORM_WER_BUDGET = 0.055
+
+# How much worse long-form transcription may be than clip-by-clip, in WER
+# points. Chunk seams and a different context per chunk cost a little; more
+# than this means seams are losing or repeating words again.
+CHUNKING_COST_BUDGET = 0.015
 
 
 def write_concatenation(path: Path, clips: tuple[SpeechClip, ...], repeats: int) -> str:
@@ -60,11 +65,7 @@ def test_long_recording_is_chunked_and_stays_accurate(transcriber, speech_clips,
     assert wer <= LONG_FORM_WER_BUDGET, f"long-form WER {wer:.4f}"
 
 
-@pytest.mark.xfail(
-    reason="Known defect: every chunk boundary adds word errors (6.4 percent per clip vs 13.3 percent over 15 chunks).",
-    strict=True,
-)
-def test_chunking_costs_no_accuracy(transcriber, speech_clips, tmp_path: Path) -> None:
+def test_chunking_costs_almost_no_accuracy(transcriber, speech_clips, tmp_path: Path) -> None:
     path = tmp_path / "long.wav"
     reference = write_concatenation(path, speech_clips, repeats=4)
     per_clip = transcriber.transcribe([clip.path for clip in speech_clips])
@@ -75,7 +76,10 @@ def test_chunking_costs_no_accuracy(transcriber, speech_clips, tmp_path: Path) -
 
     long_form = transcriber.transcribe([path]).files[0]
 
-    assert word_error_rate([reference], [long_form.transcript]) <= per_clip_wer + 0.01
+    long_form_wer = word_error_rate([reference], [long_form.transcript])
+    assert long_form_wer <= per_clip_wer + CHUNKING_COST_BUDGET, (
+        f"long-form {long_form_wer:.4f} vs clip-by-clip {per_clip_wer:.4f}"
+    )
 
 
 @pytest.mark.cuda

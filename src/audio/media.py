@@ -6,7 +6,8 @@ soundfile/libsndfile for container decoding, because neither the Python
 standard library nor PyTorch decodes MP3. Formats libsndfile cannot open fall
 back to FFmpeg, resolved from ``FFMPEG_BINARY``/``FFPROBE_BINARY`` or ``PATH``.
 Source segments are sought and read in bounded blocks, downmixed to mono, and
-resampled to the checkpoint rate before feature extraction.
+resampled to the checkpoint rate with an anti-aliased windowed-sinc filter
+before feature extraction.
 """
 
 from __future__ import annotations
@@ -24,6 +25,7 @@ import torch
 from torch.nn import functional as torch_functional
 
 from ..inference.planning import AudioMetadata
+from .resampling import plan_block, resample_block
 
 
 # soundfile raises LibsndfileError (a RuntimeError) for unsupported or corrupt
@@ -230,30 +232,6 @@ def inspect_media(path: Path) -> AudioMetadata:
 # =============================================================================
 
 
-def _resample_waveform(
-    waveform: torch.Tensor,
-    source_rate: int,
-    target_rate: int,
-    target_frames: int,
-) -> torch.Tensor:
-    """Resample a bounded mono waveform with deterministic linear interpolation."""
-
-    if target_frames <= 0:
-        return torch.empty(0, dtype=torch.float32)
-    if source_rate == target_rate and waveform.numel() == target_frames:
-        return waveform.to(dtype=torch.float32).contiguous()
-    if waveform.numel() == 0:
-        return torch.zeros(target_frames, dtype=torch.float32)
-
-    resampled = torch_functional.interpolate(
-        waveform.reshape(1, 1, -1),
-        size=target_frames,
-        mode="linear",
-        align_corners=False,
-    )  # (1, 1, target_frames)
-    return resampled.reshape(-1).to(dtype=torch.float32).contiguous()
-
-
 def _build_decoded_segment(
     waveform: torch.Tensor,
     target_start_frame: int,
@@ -394,32 +372,25 @@ class MediaSession:
             self._source.close()
             self._source = None
 
-    def _decode_target_range(
-        self,
-        target_start_frame: int,
-        target_end_frame: int,
-        target_sample_rate: int,
-    ) -> torch.Tensor:
+    def _read_mono(self, source_start: int, source_end: int) -> torch.Tensor:
         """
-        Decode ``[start, end)`` target-rate frames as a mono float32 tensor.
+        Read ``[source_start, source_end)`` source samples as mono float32.
 
-        The source range is widened to whole source samples (floor/ceil). A read
-        that ends early because the range rounds past end-of-file is zero-padded
-        to the requested source length, so resampling never stretches the tail.
+        Positions before the file start or past its end are returned as zeros,
+        which is what the resampling filter expects outside the signal.
         """
 
         if self._source is None:
             raise RuntimeError("Decoder handle is closed or unavailable")
 
-        source_rate = int(self._source.samplerate)
         source_channels = int(self._source.channels)
-        source_start = math.floor(target_start_frame * source_rate / target_sample_rate)
-        source_end = math.ceil(target_end_frame * source_rate / target_sample_rate)
-        requested_frames = max(0, source_end - source_start)
+        file_frames = int(self._source.frames)
+        read_start = min(max(0, source_start), file_frames)
+        read_end = min(max(read_start, source_end), file_frames)
 
-        self._source.seek(source_start)
+        self._source.seek(read_start)
         decoded = self._source.read(
-            frames=requested_frames,
+            frames=read_end - read_start,
             dtype="float32",
             always_2d=True,
         )  # (frames, channels)
@@ -434,16 +405,39 @@ class MediaSession:
         else:
             mono = waveform[:, 0]
 
-        missing_frames = requested_frames - mono.numel()
-        if missing_frames > 0:
-            mono = torch_functional.pad(mono, (0, missing_frames))
+        # A short read at end-of-file and positions outside the file become
+        # zeros, so the returned length always matches the request.
+        leading_zeros = read_start - source_start
+        trailing_zeros = (source_end - source_start) - leading_zeros - mono.numel()
+        return torch_functional.pad(mono, (leading_zeros, max(0, trailing_zeros)))
 
-        return _resample_waveform(
-            mono,
-            source_rate,
-            target_sample_rate,
-            target_end_frame - target_start_frame,
-        )
+    def _decode_target_range(
+        self,
+        target_start_frame: int,
+        target_end_frame: int,
+        target_sample_rate: int,
+    ) -> torch.Tensor:
+        """
+        Decode ``[start, end)`` target-rate frames as a mono float32 tensor.
+
+        At the target rate the samples are read directly. Otherwise a block
+        aligned to the resampling period, with filter context on both sides,
+        is read and resampled (see ``resampling``). The result is the same as
+        resampling the whole file and slicing it, so chunk pieces agree at
+        every seam. Around each piece the filter context re-reads a few dozen
+        source samples; the overlap itself is never decoded twice.
+        """
+
+        if self._source is None:
+            raise RuntimeError("Decoder handle is closed or unavailable")
+
+        source_rate = int(self._source.samplerate)
+        if source_rate == target_sample_rate:
+            return self._read_mono(target_start_frame, target_end_frame)
+
+        plan = plan_block(target_start_frame, target_end_frame, source_rate, target_sample_rate)
+        block = self._read_mono(plan.block_start, plan.block_end)
+        return resample_block(block, plan, source_rate, target_sample_rate)
 
     def read_segment(
         self,

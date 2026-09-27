@@ -63,6 +63,10 @@ class InferenceSettings:
     overlap_feature_frames: int
     max_batch_feature_frames: int
     max_padding_fraction: float
+    merge_tolerance_feature_frames: int
+    untranscribed_gap_seconds: float
+    gap_silence_rms: float
+    recovery_start_offsets_feature_frames: tuple[int, ...]
     progress_interval_seconds: float
 
 
@@ -216,6 +220,24 @@ def _parse_inference(document: dict[str, Any]) -> InferenceSettings:
 
     progress_interval = _number(section, "inference", "progress_interval_seconds", minimum=0.0)
 
+    untranscribed_gap_seconds = _number(section, "inference", "untranscribed_gap_seconds", minimum=0.0)
+    if untranscribed_gap_seconds == 0.0:
+        raise ValueError("inference.untranscribed_gap_seconds must be greater than zero")
+    raw_offsets = section.get("recovery_start_offsets_feature_frames")
+    if not isinstance(raw_offsets, list) or not all(
+        isinstance(offset, int) and not isinstance(offset, bool) and offset != 0
+        for offset in raw_offsets
+    ):
+        raise ValueError(
+            "inference.recovery_start_offsets_feature_frames must be a list of non-zero integers"
+        )
+    if any(abs(offset) > overlap_feature_frames for offset in raw_offsets):
+        raise ValueError(
+            "inference.recovery_start_offsets_feature_frames must not exceed "
+            "inference.overlap_feature_frames in size, or a shifted window would "
+            "leave part of the chunk core undecoded"
+        )
+
     return InferenceSettings(
         batch_size=_integer(section, "inference", "batch_size", minimum=1),
         recursive=_boolean(section, "inference", "recursive"),
@@ -231,6 +253,15 @@ def _parse_inference(document: dict[str, Any]) -> InferenceSettings:
             minimum=0.0,
             maximum=1.0,
         ),
+        merge_tolerance_feature_frames=_integer(
+            section,
+            "inference",
+            "merge_tolerance_feature_frames",
+            minimum=0,
+        ),
+        untranscribed_gap_seconds=untranscribed_gap_seconds,
+        gap_silence_rms=_number(section, "inference", "gap_silence_rms", minimum=0.0),
+        recovery_start_offsets_feature_frames=tuple(raw_offsets),
         progress_interval_seconds=progress_interval,
     )
 

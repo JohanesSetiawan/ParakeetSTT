@@ -38,6 +38,10 @@ max_chunk_feature_frames = 1000
 overlap_feature_frames = 0
 max_batch_feature_frames = 2000
 max_padding_fraction = 0.3
+merge_tolerance_feature_frames = 100
+untranscribed_gap_seconds = 4.0
+gap_silence_rms = 0.001
+recovery_start_offsets_feature_frames = []
 progress_interval_seconds = 1
 """
 
@@ -85,6 +89,9 @@ def test_valid_file_is_normalized(tmp_path: Path) -> None:
         ("max_padding_fraction = 0.3", "max_padding_fraction = 1.5", "max_padding_fraction"),
         ('audio_extensions = ["WAV", ".mp3", "wav"]', 'audio_extensions = ".wav"', "audio_extensions"),
         ("recursive = false", 'recursive = "no"', "recursive"),
+        ("recovery_start_offsets_feature_frames = []", "recovery_start_offsets_feature_frames = [5]", "must not exceed"),
+        ("recovery_start_offsets_feature_frames = []", "recovery_start_offsets_feature_frames = [0]", "non-zero"),
+        ("untranscribed_gap_seconds = 4.0", "untranscribed_gap_seconds = 0", "untranscribed_gap_seconds"),
     ],
 )
 def test_invalid_values_name_the_offending_key(tmp_path: Path, old: str, new: str, message: str) -> None:
