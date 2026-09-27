@@ -632,3 +632,20 @@ def test_decoder_collapse_inside_a_chunk_is_re_decoded(tmp_path: Path, tiny_conf
 
     assert file_result.chunks[1].recovered
     assert file_result.status is FileStatus.OK
+
+
+# =============================================================================
+# Fixed with the persistent FFmpeg stream (PR #5)
+# =============================================================================
+
+
+def test_empty_ffmpeg_output_is_an_empty_waveform_not_a_crash() -> None:
+    """
+    When FFmpeg had nothing left to decode (container duration slightly longer
+    than the audio), torch.frombuffer on zero bytes raised ValueError.
+    """
+
+    from src.audio.media import _float32_samples
+
+    assert _float32_samples(b"").numel() == 0
+    assert _float32_samples(bytes(8)).tolist() == [0.0, 0.0]
