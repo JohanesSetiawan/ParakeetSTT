@@ -92,6 +92,7 @@ class ChunkResult:
     gap_end_sample: int = 0
     gap_rms: float = 0.0
     recovered: bool = False
+    processing_seconds: float = 0.0
 
     @property
     def gap_samples(self) -> int:
@@ -115,6 +116,25 @@ class OfflineFileResult:
     transcript: str
     status: FileStatus
     chunks: tuple[ChunkResult, ...]
+
+    @property
+    def processing_seconds(self) -> float:
+        """
+        Time spent on this file: its own decode time plus its share of each
+        batch's feature and generation time (by feature frames), plus any
+        collapse re-decodes. Batches mix files, so this is an attribution,
+        not a separately timed run.
+        """
+
+        return sum(chunk.processing_seconds for chunk in self.chunks)
+
+    @property
+    def real_time_factor(self) -> float:
+        """Attributed processing seconds per second of audio."""
+
+        if self.duration_seconds <= 0:
+            return 0.0
+        return self.processing_seconds / self.duration_seconds
 
 
 @dataclass(frozen=True)
@@ -295,9 +315,11 @@ class OfflineTranscriber:
         sessions: dict[Path, MediaSession],
         sequential_state: dict[Path, tuple[int, torch.Tensor]],
         remaining_chunks: dict[Path, int],
-    ) -> tuple[DecodedSegment, ...]:
+    ) -> tuple[tuple[DecodedSegment, ...], tuple[float, ...]]:
         """
         Decode each item in plan order, reusing per-file overlap tails.
+
+        Returns the segments and each item's own decode time.
 
         A file's decoder session is opened at its first chunk and closed after
         its last one, so single-chunk files never hold a handle beyond their
@@ -306,7 +328,9 @@ class OfflineTranscriber:
         """
 
         segments: list[DecodedSegment] = []
+        decode_seconds: list[float] = []
         for item in items:
+            item_started = time.perf_counter()
             session = sessions.get(item.path)
             if session is None:
                 session = open_media_session(item.path)
@@ -330,7 +354,8 @@ class OfflineTranscriber:
             else:
                 sequential_state.pop(item.path, None)
                 sessions.pop(item.path).close()
-        return tuple(segments)
+            decode_seconds.append(time.perf_counter() - item_started)
+        return tuple(segments), tuple(decode_seconds)
 
     def _out_of_memory(self, stage: str, items: tuple[WorkItem, ...]) -> RuntimeError:
         """Build the stop-the-run error for an accelerator OOM."""
@@ -363,10 +388,16 @@ class OfflineTranscriber:
         """Decode, extract, and infer one bounded batch, stopping on OOM."""
 
         decode_started = time.perf_counter()
-        segments = self._decode_batch_audio(items, sessions, sequential_state, remaining_chunks)
+        segments, item_decode_seconds = self._decode_batch_audio(
+            items,
+            sessions,
+            sequential_state,
+            remaining_chunks,
+        )
         decode_seconds = time.perf_counter() - decode_started
 
         results, feature_seconds, generation_seconds = self._infer_segments(items, segments)
+        results = self._attribute_time(results, item_decode_seconds, feature_seconds + generation_seconds)
         timings = {
             "decode": decode_seconds,
             "feature": feature_seconds,
@@ -381,6 +412,23 @@ class OfflineTranscriber:
             generation_seconds,
         )
         return results, timings
+
+    @staticmethod
+    def _attribute_time(
+        results: tuple[ChunkResult, ...],
+        item_decode_seconds: tuple[float, ...],
+        shared_seconds: float,
+    ) -> tuple[ChunkResult, ...]:
+        """Give each chunk its decode time plus a frame-weighted share of the batch."""
+
+        total_frames = sum(result.item.feature_frames for result in results) or 1
+        return tuple(
+            dataclasses.replace(
+                result,
+                processing_seconds=decode_seconds + shared_seconds * result.item.feature_frames / total_frames,
+            )
+            for result, decode_seconds in zip(results, item_decode_seconds, strict=True)
+        )
 
     def _infer_segments(
         self,
@@ -486,6 +534,7 @@ class OfflineTranscriber:
             self.max_chunk_samples,
         )
         best = chunk
+        recovery_started = time.perf_counter()
         with open_media_session(item.path) as session:
             for window in windows:
                 shifted_item = dataclasses.replace(
@@ -504,7 +553,11 @@ class OfflineTranscriber:
                     (shifted_item,),
                     (segment,),
                 )
-                candidate = dataclasses.replace(candidate, recovered=True)
+                candidate = dataclasses.replace(
+                    candidate,
+                    recovered=True,
+                    processing_seconds=chunk.processing_seconds + time.perf_counter() - recovery_started,
+                )
                 if not self._has_untranscribed_gap(candidate):
                     logger.info(
                         "recovered collapsed chunk %s#%d with window start shifted by %.3f s",
@@ -515,6 +568,10 @@ class OfflineTranscriber:
                     return candidate
                 if candidate.gap_samples < best.gap_samples:
                     best = candidate
+        best = dataclasses.replace(
+            best,
+            processing_seconds=chunk.processing_seconds + time.perf_counter() - recovery_started,
+        )
         logger.warning(
             "chunk %s#%d keeps an untranscribed gap of %.1f s after %d re-decodes",
             item.path.name,
@@ -675,12 +732,15 @@ class OfflineTranscriber:
             log_level = logging.INFO if file_result.status is FileStatus.OK else logging.WARNING
             logger.log(
                 log_level,
-                "file=%s status=%s duration_seconds=%.3f chunks=%d words=%d",
+                "file=%s status=%s duration_seconds=%.3f chunks=%d words=%d "
+                "processing_seconds=%.3f real_time_factor=%.5f",
                 file_result.path.name,
                 file_result.status.value,
                 file_result.duration_seconds,
                 len(file_result.chunks),
                 len(file_result.transcript.split()),
+                file_result.processing_seconds,
+                file_result.real_time_factor,
             )
 
         if self.device.type == "cuda":

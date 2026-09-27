@@ -35,6 +35,7 @@ from ..models.parakeet import load_model
 from ..runtime.device import describe_runtime
 from ..runtime.filesystem import write_text_atomic
 from ..runtime.logging_setup import configure_run_logging
+from ..runtime.memory import peak_process_memory_bytes
 from .reporting import ProgressReporter
 
 
@@ -244,6 +245,7 @@ def _print_stage_summary(result: OfflineRunResult, wall_seconds: float) -> None:
         print(f"Throughput audio seconds per second: {total_audio / wall_seconds:.3f}")
     print(f"Work items: {len(result.plan.items)}, batches: {len(result.plan.batches)}")
     print(f"Peak accelerator memory allocated: {_format_bytes(result.peak_memory.get('peak_allocated_bytes'))}")
+    print(f"Peak process memory: {_format_bytes(peak_process_memory_bytes())}")
 
 
 def _print_status_counts(result: OfflineRunResult, unreadable_count: int) -> None:

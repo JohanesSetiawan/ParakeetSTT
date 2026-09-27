@@ -2,6 +2,7 @@
 
 from .config import PROJECT_ROOT, ParakeetConfig, load_config
 from .settings import (
+    BenchmarkSettings,
     CheckpointSettings,
     InferenceSettings,
     LoggingSettings,
@@ -11,6 +12,7 @@ from .settings import (
 )
 
 __all__ = [
+    "BenchmarkSettings",
     "CheckpointSettings",
     "InferenceSettings",
     "LoggingSettings",
