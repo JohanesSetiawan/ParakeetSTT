@@ -76,19 +76,36 @@ def test_session_reads_bounded_finite_segments(tmp_path: Path) -> None:
     assert first.rms > 0.0
 
 
-@pytest.mark.parametrize(("max_chunk", "overlap"), [(120, 10), (100, 0), (21, 10), (300, 50)])
-def test_overlap_reuse_is_bit_identical_to_fresh_decode(tmp_path: Path, max_chunk: int, overlap: int) -> None:
-    """48 kHz stereo input, including overlap longer than the core (21, 10)."""
+# Resampled pieces are computed from different source blocks, so their float32
+# sums can differ in the last bit (measured up to 1.2e-7); anything larger
+# would mean the pieces are on different sample grids.
+RESAMPLING_TOLERANCE = 1e-6
 
-    path = tmp_path / "stereo48k.wav"
-    samples = np.random.default_rng(7).uniform(-0.5, 0.5, size=(240_001, 2)).astype(np.float32)
-    soundfile.write(str(path), samples, 48000, subtype="FLOAT")
+
+@pytest.mark.parametrize("rate", [48000, 44100, 22050])
+@pytest.mark.parametrize(("max_chunk", "overlap"), [(120, 10), (100, 0), (21, 10), (300, 50)])
+def test_overlap_reuse_matches_fresh_decode(tmp_path: Path, rate: int, max_chunk: int, overlap: int) -> None:
+    """Stereo input at common rates, including overlap longer than the core (21, 10)."""
+
+    path = tmp_path / "stereo.wav"
+    samples = np.random.default_rng(7).uniform(-0.5, 0.5, size=(rate * 5 + 1, 2)).astype(np.float32)
+    soundfile.write(str(path), samples, rate, subtype="FLOAT")
 
     pairs = read_plan_sequentially_and_fresh(path, max_chunk=max_chunk, overlap=overlap)
 
     assert len(pairs) > 1
     for item, segment, reference in pairs:
         assert segment.waveform.numel() == item.source_frame_count
+        assert torch.allclose(segment.waveform, reference.waveform, atol=RESAMPLING_TOLERANCE), item.chunk_index
+
+
+def test_native_rate_input_is_read_exactly(tmp_path: Path) -> None:
+    """At 16 kHz there is no resampling, so overlap reuse is bit-identical."""
+
+    path = tmp_path / "native.wav"
+    write_float_wav(path, torch.sin(torch.arange(80_000, dtype=torch.float32) / 5.0), TARGET_RATE)
+
+    for item, segment, reference in read_plan_sequentially_and_fresh(path, max_chunk=120, overlap=10):
         assert torch.equal(segment.waveform, reference.waveform), item.chunk_index
 
 

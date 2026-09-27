@@ -200,8 +200,14 @@ def test_natural_repetition_is_not_flagged_as_gibberish() -> None:
     assert classify_file("ha ha ha ha ha", (chunk,)) is FileStatus.OK
 
 
-def test_end_of_file_read_is_padded_not_stretched(tmp_path: Path) -> None:
-    """A 48 kHz file not divisible by 3 ended one source sample short and was time-stretched."""
+def test_end_of_file_chunk_is_not_stretched(tmp_path: Path) -> None:
+    """
+    A 48 kHz file not divisible by 3 ended one source sample short and the last
+    chunk was time-stretched. The last chunk must equal the same interval of the
+    whole file resampled in one piece.
+    """
+
+    from src.audio.resampling import plan_block, resample_block
 
     path = tmp_path / "stereo48k.wav"
     samples = np.random.default_rng(7).uniform(-0.5, 0.5, size=(400_001, 2)).astype(np.float32)
@@ -209,9 +215,12 @@ def test_end_of_file_read_is_padded_not_stretched(tmp_path: Path) -> None:
 
     last_item, last_segment = sequential_chunks(path, max_chunk=120, overlap=10)[-1]
 
-    # Linear resampling by 3 with align_corners=False samples source index 3i + 1.
-    mono = torch.nn.functional.pad(torch.from_numpy(samples.mean(axis=1)), (0, 3))
-    expected = mono[3 * last_item.source_start_frame + 1 :: 3][: last_item.source_frame_count]
+    mono = torch.from_numpy(samples.mean(axis=1))
+    total = round(len(mono) * TARGET_RATE / 48000)
+    plan = plan_block(0, total, 48000, TARGET_RATE)
+    block = torch.nn.functional.pad(mono, (-plan.block_start, plan.block_end - len(mono)))
+    whole = resample_block(block, plan, 48000, TARGET_RATE)
+    expected = whole[last_item.source_start_frame : last_item.source_end_frame]
     assert torch.allclose(last_segment.waveform, expected, atol=1e-6)
 
 
