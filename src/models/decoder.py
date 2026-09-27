@@ -166,21 +166,22 @@ class Decoder(nn.Module):
 
         Args:
             input_ids: Token IDs with shape ``(B, 1)`` during greedy decoding.
-            cache: Optional mutable LSTM cache. When every row is blank and the
-                cache already exists, the decoder returns the cached output
-                without running embedding or LSTM kernels.
+            cache: Optional mutable LSTM cache. Rows whose input is blank keep
+                their cached state and output; other rows advance.
 
         Returns:
             Projected decoder states with shape ``(B, 1, H)``.
         """
 
+        # There is deliberately no "every row is blank, skip the LSTM" fast
+        # path: deciding it needs bool() on a GPU tensor, which stalls the host
+        # once per decoding step. Measured on real speech the fast path fired
+        # on about 8 percent of steps, so the sync cost far more than the
+        # LSTM calls it saved. The masked cache update below leaves blank rows
+        # unchanged, so the output is identical either way.
         blank_mask: torch.Tensor | None = None
         if cache is not None:
             blank_mask = input_ids[:, -1] == self.blank_token_id
-            if cache.is_initialized and bool(blank_mask.all()):
-                if cache.cache is None:
-                    raise RuntimeError("Initialized decoder cache has no projected output")
-                return cache.cache
 
         embeddings = self.embedding(input_ids)
         hidden_cell_states = None

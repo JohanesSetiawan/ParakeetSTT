@@ -23,6 +23,13 @@ from .encoder import Encoder
 from .joint import JointNetwork
 
 
+# Decoding steps between two host-side completion checks. Each check costs a
+# GPU-to-host synchronization; at most this many minus one extra steps of
+# padding run after the batch is done. It only trades latency for syncs and
+# never changes the output, so it is an implementation constant, not a setting.
+FINISHED_CHECK_INTERVAL = 8
+
+
 @dataclass(frozen=True)
 class GenerationResult:
     """
@@ -197,8 +204,11 @@ class ParakeetTDT(nn.Module):
             range(len(self.configuration.durations))
         )
 
-        for _step in range(maximum_steps):
-            if bool(finished.all()):
+        for step in range(maximum_steps):
+            # Checking for completion copies a flag to the host and stalls the
+            # GPU queue, so it runs only every few steps. Steps taken after
+            # every row finished emit padding only and are trimmed below.
+            if step % FINISHED_CHECK_INTERVAL == 0 and bool(finished.all()):
                 break
 
             decoder_hidden_states = self.decoder(
@@ -258,6 +268,13 @@ class ParakeetTDT(nn.Module):
                     "TDT decoding reached the maximum step bound before encoder "
                     "exhaustion despite the per-frame symbol guard"
                 )
+
+        # Drop trailing columns in which every row only padded (the steps run
+        # between completion and the next check), so the result is the same
+        # as stopping at the exact step. Column 0 is the start token, never
+        # padding, so at least one column remains.
+        written = sequence_buffer[:, :output_length] != pad_token_id  # (B, U)
+        output_length = int(written.any(dim=0).nonzero().max()) + 1
 
         durations = duration_buffer[:, :output_length]
         frame_starts = frame_start_buffer[:, :output_length]
