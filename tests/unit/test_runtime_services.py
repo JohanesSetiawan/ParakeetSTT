@@ -19,6 +19,7 @@ VALID_TOML = """
 [paths]
 weights_dir = "weights/model"
 log_dir = "logs"
+metrics_dir = "metrics"
 
 [logging]
 level = "info"
@@ -43,6 +44,10 @@ untranscribed_gap_seconds = 4.0
 gap_silence_rms = 0.001
 recovery_start_offsets_feature_frames = []
 progress_interval_seconds = 1
+
+[benchmark]
+warmup_rounds = 0
+measured_rounds = 2
 """
 
 
@@ -92,6 +97,8 @@ def test_valid_file_is_normalized(tmp_path: Path) -> None:
         ("recovery_start_offsets_feature_frames = []", "recovery_start_offsets_feature_frames = [5]", "must not exceed"),
         ("recovery_start_offsets_feature_frames = []", "recovery_start_offsets_feature_frames = [0]", "non-zero"),
         ("untranscribed_gap_seconds = 4.0", "untranscribed_gap_seconds = 0", "untranscribed_gap_seconds"),
+        ("measured_rounds = 2", "measured_rounds = 0", "measured_rounds"),
+        ("warmup_rounds = 0", "warmup_rounds = -1", "warmup_rounds"),
     ],
 )
 def test_invalid_values_name_the_offending_key(tmp_path: Path, old: str, new: str, message: str) -> None:
@@ -99,7 +106,7 @@ def test_invalid_values_name_the_offending_key(tmp_path: Path, old: str, new: st
         load_toml(tmp_path, VALID_TOML.replace(old, new))
 
 
-@pytest.mark.parametrize("section", ["paths", "logging", "checkpoint", "inference"])
+@pytest.mark.parametrize("section", ["paths", "logging", "checkpoint", "inference", "benchmark"])
 def test_every_section_is_required(tmp_path: Path, section: str) -> None:
     with pytest.raises(ValueError, match=rf"\[{section}\]"):
         load_toml(tmp_path, VALID_TOML.replace(f"[{section}]", "[renamed]"))

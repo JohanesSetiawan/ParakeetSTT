@@ -17,6 +17,7 @@ Output parity with the reference implementation was verified: token-for-token an
 - [Supported input](#supported-input)
 - [How long audio is processed](#how-long-audio-is-processed)
 - [Measured performance](#measured-performance)
+- [Benchmarking](#benchmarking)
 - [Checkpoint preparation](#checkpoint-preparation)
 - [Logs](#logs)
 - [Running the tests](#running-the-tests)
@@ -90,11 +91,11 @@ venv\Scripts\python.exe inference.py --transcribe path\to\folder
 
 The first run downloads the checkpoint from Hugging Face, verifies every file against pinned hashes, converts it to `model.pth`, and writes a readiness marker. Later runs skip all of that.
 
-A folder run prints plain-text progress. This example is from a two-file run on an RTX 3050 Ti Laptop GPU:
+A folder run prints plain-text progress. This example is the five test clips in `tests/data/librispeech/` on an RTX 3050 Ti Laptop GPU:
 
 ```text
-Run id: 6e8d715c7ad0
-Log file: ...\logs\log_2026-09-26.txt
+Run id: 07d4afc4f690
+Log file: ...\logs\log_2026-09-27.txt
 Weights: ready
 Device: cuda:0
 Accelerator: CUDA
@@ -104,22 +105,26 @@ Precision: float32
 PyTorch: 2.14.0+cu132
 CUDA runtime: 13.2
 Python: 3.13.13
-Model load seconds: 1.863
-Transcribing 2 file(s)
-Batch: 1 / 1, Progress: 100.00 percent, Elapsed: 0.6 s, ETA: 0.0 s
+Model load seconds: 3.481
+Transcribing 5 file(s)
+Batch: 1 / 6, Progress: 16.67 percent, Elapsed: 0.9 s, ETA: 4.7 s
+Batch: 6 / 6, Progress: 100.00 percent, Elapsed: 1.8 s, ETA: 0.0 s
 CSV: ...\transcriptions.csv
-Files: 2
-File statuses: ok=2
-Total audio seconds: 17.220
-Wall-clock seconds: 0.636
-Media decode seconds: 0.002
-Feature extraction seconds: 0.298
-Model generation seconds: 0.332
-Real-time factor: 0.036912
-Throughput audio seconds per second: 27.091
-Work items: 2, batches: 1
-Peak accelerator memory allocated: 2511.6 MiB
+Files: 5
+File statuses: ok=5
+Total audio seconds: 46.630
+Wall-clock seconds: 1.801
+Media decode seconds: 0.018
+Feature extraction seconds: 0.535
+Model generation seconds: 1.239
+Real-time factor: 0.038623
+Throughput audio seconds per second: 25.892
+Work items: 7, batches: 6
+Peak accelerator memory allocated: 2496.2 MiB
+Peak process memory: 3856.9 MiB
 ```
+
+`Peak process memory` is the largest resident memory of the whole process so far (peak working set on Windows, peak RSS elsewhere). Most of it is the checkpoint, which is read into CPU memory before it moves to the GPU.
 
 ## Output
 
@@ -168,6 +173,7 @@ All settings live in `config.toml` at the repository root. Every key is required
 |---|---|---|
 | `weights_dir` | `"weights/parakeet-tdt-0.6b-v3"` | Checkpoint directory: downloads, `model.pth`, manifests, readiness marker. |
 | `log_dir` | `"logs"` | Directory for dated run logs and fallback CSVs. |
+| `metrics_dir` | `"metrics"` | Directory for benchmark results (see [Benchmarking](#benchmarking)). |
 
 ### `[logging]`
 
@@ -204,6 +210,17 @@ All settings live in `config.toml` at the repository root. Every key is required
 
 `max_batch_feature_frames` and `max_chunk_feature_frames` are the memory controls. If a run stops with an out-of-memory error, lower them. The error message names both keys.
 
+On Windows, the NVIDIA driver can place allocations that do not fit in VRAM into shared system memory instead of raising an out-of-memory error. The run then continues, but several times slower. If a run is suddenly much slower than usual and `Peak accelerator memory allocated` is close to the card's size, lower the same two keys.
+
+### `[benchmark]`
+
+Used only by the development benchmark command, not by transcription.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `warmup_rounds` | `1` | Rounds run and discarded before measuring (CUDA kernel selection, file cache). At least 0. |
+| `measured_rounds` | `3` | Rounds that are timed and compared. At least 1. |
+
 ## Supported input
 
 libsndfile handles WAV (PCM and float), FLAC, OGG/Vorbis, MP3 and the other formats it supports. It is always tried first. Any other file is probed with `ffprobe` and decoded with `ffmpeg`.
@@ -211,6 +228,7 @@ libsndfile handles WAV (PCM and float), FLAC, OGG/Vorbis, MP3 and the other form
 - **Channels:** multi-channel audio is averaged to mono.
 - **Sample rate:** any rate is resampled to 16 kHz with an anti-aliased windowed-sinc filter, so content above 8 kHz is removed instead of folding into the speech band. With 9 to 15 kHz hiss mixed into 48 kHz speech, word error rate stayed at 3.7% (the clean value); the old linear interpolation reached 15.6%.
 - **Non-finite samples:** NaN/Inf samples are replaced with zero and reported as `input_nonfinite`.
+- **FFmpeg decoding:** one `ffmpeg` process per file decodes the whole stream to 16 kHz mono in order, and each chunk continues exactly where the previous one stopped. Overlap regions are reused, not decoded again. A non-zero `ffmpeg` exit stops that file with the last lines of its error output.
 - **Missing FFmpeg:** if `ffprobe` is not installed, formats libsndfile cannot read are reported as `unreadable` and the rest of the folder is still processed.
 - **Misconfigured FFmpeg path:** if `FFMPEG_BINARY` or `FFPROBE_BINARY` is set but points to a missing file, the run stops. That is treated as a setup error, not a property of one file.
 
@@ -236,12 +254,35 @@ These numbers come from one machine: an NVIDIA GeForce RTX 3050 Ti Laptop GPU wi
 | One MP3, 48 kHz stereo | 36 min (2163 s) | 27 to 31 s | about 0.013 | 2591 MiB |
 | One MP3, 48 kHz stereo | 74 min (4420 s) | 57 to 62 s | about 0.013 | 2591 MiB |
 | Folder: 15 short WAV + both MP3s | 112 min | about 88 s | about 0.013 | 2591 MiB |
+| The 36-minute recording as M4A (AAC, through FFmpeg) | 36 min (2163 s) | 30.5 s (one run) | about 0.014 | not recorded |
 
-- **Where the time goes:** in the 36-minute run, about 85% of the time is greedy decoding, about 12% is media decoding, and about 2% is feature extraction.
+- **Where the time goes:** in the 36-minute MP3 run, about 85% of the time is greedy decoding, about 12% is media decoding, and about 2% is feature extraction. For the M4A, media decoding takes 1.7 s of the total.
 - **Model load:** 2 to 4 seconds once the checkpoint is prepared and the file is in the OS cache.
 - **Memory does not grow with length:** peak VRAM and RAM growth were the same for the 36- and 74-minute files.
+- **Process memory:** about 3.9 GB peak, most of it the checkpoint staged on CPU during loading.
 
 CPU and Apple MPS execution is supported by the code but has not been benchmarked.
+
+## Benchmarking
+
+For development, a separate command times the real pipeline repeatably:
+
+```powershell
+venv\Scripts\python.exe -m src.commands.benchmark --input path\to\audio_or_folder
+```
+
+It loads the model once and reports that cold start on its own. It then runs `[benchmark] warmup_rounds` transcriptions that are discarded, and `measured_rounds` that are timed. Nothing is written next to the audio. Each run appends one JSON line to `<metrics_dir>/benchmark_<YYYY-MM-DD>.jsonl` with:
+
+- the git commit and whether the working tree had uncommitted changes;
+- the device report and the `[inference]` and `[benchmark]` settings;
+- the input (files, audio seconds, unreadable files);
+- the cold start (weights action, bootstrap and load seconds);
+- every measured round: wall, media decode, feature, generation, and recovery seconds, real-time factor, work items, batches, peak accelerator memory, and per-file status, chunks, recovered chunks, processing seconds, and real-time factor;
+- mean, min, max, and standard deviation of wall and generation seconds;
+- whether every round produced the same transcripts;
+- the peak process memory.
+
+To compare two commits, run both on the same input and compare the summaries. A laptop GPU's clock varies with temperature, so a difference smaller than the spread between rounds is noise.
 
 ## Checkpoint preparation
 
@@ -278,11 +319,13 @@ A run logs:
 - the device report
 - the model load time
 - the plan (files, work items, batches)
-- one line per file (status, duration, chunks, word count)
+- one line per file (status, duration, chunks, word count, processing seconds, real-time factor)
 - unreadable files
 - full tracebacks on failure
 
 Transcripts themselves are not written to the log.
+
+A file's processing seconds are its own media decoding plus a share of each batch's feature and generation time, split by feature frames, plus any collapse re-decodes. Batches mix files, so this is an attribution, not a separately timed run.
 
 ## Running the tests
 
@@ -310,13 +353,13 @@ On the development machine the full suite takes about 70 seconds.
 inference.py                  Command launcher (python inference.py --transcribe ...)
 config.toml                   All runtime settings
 src/
-  audio/                      Media probing and decoding (media.py), log-mel features (features.py)
+  audio/                      Media probing and decoding (media.py), resampling (resampling.py), log-mel features (features.py)
   checkpoint/                 Download and verification, safetensors -> model.pth, readiness marker
-  commands/                   CLI entry points and terminal progress reporting
+  commands/                   CLI entry points (inference.py, prepare_checkpoint.py, benchmark.py) and progress reporting
   configuration/              Checkpoint JSON validation (config.py), config.toml settings (settings.py)
-  inference/                  Chunk planning (planning.py), offline orchestration and merging (offline.py)
+  inference/                  Chunk planning (planning.py), orchestration (offline.py), seam merging (merging.py), collapse recovery (recovery.py)
   models/                     Subsampling, attention, Conformer blocks, encoder, LSTM decoder, joint, TDT loop
-  runtime/                    Device selection and report, dated logging, atomic file writes
+  runtime/                    Device selection and report, dated logging, atomic file writes, process memory
   text/                       Tokenizer decoding from tokenizer.json
 tests/
   unit/                       Fast isolated tests (tiny fixture checkpoint)
@@ -331,8 +374,7 @@ tests/
 
 - **Chunking still costs a little accuracy.** On the test clips, word error rate is 3.7% when each clip is transcribed alone and 4.6% when the same speech is one 196-second recording cut into 15 chunks. Each chunk sees less context than the whole recording.
 - **Decoder collapse cannot always be recovered.** The first chunk of a file has no earlier audio to shift into, and some windows stay collapsed at every tried shift. Such files are marked `untranscribed_gap` rather than passed off as complete.
-- **The FFmpeg fallback** starts one `ffmpeg` process per chunk and decodes overlap regions twice. libsndfile formats are not affected.
-- **The greedy decoding loop** synchronizes with the GPU once per step. It is the dominant cost of a run.
+- **The greedy decoding loop** is the dominant cost of a run. Each step launches dozens of small GPU kernels, so on a small GPU the loop is limited by launch overhead rather than arithmetic.
 - **Precision:** only float32 inference is implemented.
 - **Scope:** the runtime does offline transcription only. There is no streaming, speaker diarization, word-level timestamps in the output, beam search, or language-model rescoring.
 - **Language:** the model has no language selection. It transcribes whatever it recognizes among its 25 languages.

@@ -32,6 +32,7 @@ class PathSettings:
 
     weights_dir: Path
     log_dir: Path
+    metrics_dir: Path
 
 
 @dataclass(frozen=True)
@@ -71,6 +72,14 @@ class InferenceSettings:
 
 
 @dataclass(frozen=True)
+class BenchmarkSettings:
+    """Rounds for the development benchmark command."""
+
+    warmup_rounds: int
+    measured_rounds: int
+
+
+@dataclass(frozen=True)
 class Settings:
     """Complete validated application configuration."""
 
@@ -78,6 +87,7 @@ class Settings:
     logging: LoggingSettings
     checkpoint: CheckpointSettings
     inference: InferenceSettings
+    benchmark: BenchmarkSettings
 
 
 # =============================================================================
@@ -148,6 +158,7 @@ def _parse_paths(document: dict[str, Any], root: Path) -> PathSettings:
     return PathSettings(
         weights_dir=_path(section, "paths", "weights_dir", root),
         log_dir=_path(section, "paths", "log_dir", root),
+        metrics_dir=_path(section, "paths", "metrics_dir", root),
     )
 
 
@@ -266,6 +277,14 @@ def _parse_inference(document: dict[str, Any]) -> InferenceSettings:
     )
 
 
+def _parse_benchmark(document: dict[str, Any]) -> BenchmarkSettings:
+    section = _section(document, "benchmark")
+    return BenchmarkSettings(
+        warmup_rounds=_integer(section, "benchmark", "warmup_rounds", minimum=0),
+        measured_rounds=_integer(section, "benchmark", "measured_rounds", minimum=1),
+    )
+
+
 # =============================================================================
 # Public loader
 # =============================================================================
@@ -302,4 +321,5 @@ def load_settings(
         logging=_parse_logging(document),
         checkpoint=_parse_checkpoint(document),
         inference=_parse_inference(document),
+        benchmark=_parse_benchmark(document),
     )

@@ -49,11 +49,17 @@ inference.py --transcribe <file|folder>
     inference/offline.py        OfflineTranscriber.transcribe
       inference/planning.py       chunks, round-robin scheduling, micro-batches
       per batch:
-        audio/media.py            MediaSession.read_sequential_segment (decode, mono, 16 kHz)
+        audio/media.py            MediaSession.read_sequential_segment (decode, mono, 16 kHz;
+                                  libsndfile, or one persistent ffmpeg stream per file)
         audio/features.py         log-mel features + per-recording normalization
         models/parakeet.py        ParakeetTDT.generate (encoder + greedy TDT loop)
-      merge                       token ownership by midpoint, tokenizer decode, status
+      inference/recovery.py       re-decode chunks with a long non-silent wordless stretch
+      inference/merging.py        word-level seam merge, then tokenizer decode and status
     CSV (folder) or terminal (single file)
+
+python -m src.commands.benchmark --input <file|folder>
+  same load and OfflineTranscriber, warm-up + measured rounds,
+  one JSON line appended to <metrics_dir>/benchmark_<date>.jsonl
 ```
 
 ### Model
@@ -83,15 +89,18 @@ Greedy TDT rules (`generate`):
 |---|---|---|
 | `configuration/config.py` | Load and validate checkpoint JSON (`config.json`, processor, generation) | standard library only |
 | `configuration/settings.py` | Load and validate `config.toml` | standard library, `config.py` |
-| `runtime/` | Device selection and report, dated run logging, atomic writes | standard library, torch |
+| `runtime/` | Device selection and report, dated run logging, atomic writes, peak process memory | standard library, torch |
 | `text/` | Tokenizer decoding from `tokenizer.json` | standard library, torch |
 | `models/` | Network modules and the TDT loop, strict checkpoint loading | torch, `configuration`, `runtime.device` |
 | `audio/features.py` | Feature extraction | torch, `configuration` |
-| `audio/media.py` | Probe and decode media, sequential chunk reading | torch, soundfile, subprocess, `inference.planning` (for `AudioMetadata`) |
+| `audio/resampling.py` | Windowed-sinc resampling on a global grid | torch |
+| `audio/media.py` | Probe and decode media, sequential chunk reading, persistent FFmpeg stream | torch, soundfile, subprocess, threading, `audio/resampling.py`, `inference.planning` (for `AudioMetadata`) |
 | `inference/planning.py` | Pure planning math: chunks, schedule, batches | standard library only |
+| `inference/merging.py` | Word grouping and seam alignment | standard library only |
+| `inference/recovery.py` | Gap detection and recovery windows | standard library only |
 | `inference/offline.py` | Orchestration, merge, statuses | everything above except `commands` and `checkpoint` |
 | `checkpoint/` | Download, verify, convert, readiness marker | standard library, torch, `configuration.settings`, `runtime` |
-| `commands/` | CLI parsing, terminal output, wiring | anything |
+| `commands/` | CLI parsing, terminal output, wiring, the benchmark command | anything |
 
 Rules:
 
@@ -125,6 +134,7 @@ A change that breaks any of these is a regression, whatever else it improves.
 10. **Batch budget is padded.** `len(batch) * max(item.feature_frames) <= max_batch_feature_frames`. Do not revert to summing unpadded frames.
 11. **Cores tile the file.** Cores are contiguous, non-overlapping, and cover `[0, total_samples)`. Sources are the core plus at most `overlap` on each side, clamped at 0 and at the end of the file.
 12. **Sequential decoding.** Chunks of one file are read in order through `read_sequential_segment`. Only `previous_end - current_start` samples are reused, and never through `tensor[-k:]` with `k == 0`, which selects the whole tensor. A non-positive overlap decodes fresh. The result must match a fresh decode of the same interval: bit-identical at the native 16 kHz, and within 1e-6 after resampling (float32 summation order; a real grid mismatch shows up as differences of order 1e-2).
+    - **FFmpeg path.** Formats libsndfile cannot read are decoded by one `ffmpeg` process per file (`_FfmpegStream`), which resamples the whole stream continuously. Chunks read in order must equal the same slices of one continuous decode. A request behind the stream position (collapse recovery) uses a one-off decode of that range. The process is closed with its session, and a non-zero exit raises instead of passing as a short read.
 12a. **Resampling on a global grid** (`audio/resampling.py`). Windowed-sinc (Hann, 6 zero crossings, 0.99 roll-off) polyphase resampling. Every source block starts on a multiple of the reduced source period, so any target interval equals the same slice of the whole file resampled in one piece. Never resample a piece independently from its own start, because for ratios like 44.1 kHz to 16 kHz that shifts the grid at every seam.
 13. **Session lifetime.** A decoder session opens at a file's first chunk and closes after its last. Never open all files up front.
 14. **Word-level ownership** (`inference/merging.py`). Tokens are grouped into words (a word starts at a piece beginning with the SentencePiece marker), and a word is never split between chunks. In the overlap, the longest run of words both chunks agree on is found: same letters and digits, start times within `merge_tolerance_feature_frames`. Each agreed word is taken once, from the chunk whose core holds its start. Without agreement, whole words go to the chunk whose core holds their start. Neighboring chunks disagree on word times by up to about 0.5 s, so never go back to token-level or midpoint ownership.
@@ -147,12 +157,15 @@ A change that breaks any of these is a regression, whatever else it improves.
   - `0 <= max_padding_fraction <= 1`
   - `request_timeout_seconds > 0`
   - `download_attempts >= 1`
+  - `untranscribed_gap_seconds > 0`
+  - every `recovery_start_offsets_feature_frames` entry is non-zero and at most `overlap_feature_frames` in size
+  - `warmup_rounds >= 0`, `measured_rounds >= 1`
 - Constants that belong to the checkpoint's input contract (feature constants, pinned hashes) stay in code with a comment explaining why they are not settings.
 - Adding a setting means:
   1. add a field to the dataclass;
   2. add the parser and its validation;
   3. add the key to `config.toml` with a comment;
-  4. add a test in `tests/test_runtime_services.py`;
+  4. add a test in `tests/unit/test_runtime_services.py`;
   5. add a row to the README configuration table.
 
 ## 6. Error handling, statuses, and logging
@@ -191,7 +204,7 @@ Never swallow an exception without logging it. Never report success for work tha
 ### Logging
 
 - `logs/log_<YYYY-MM-DD>.txt` in `paths.log_dir`, appended. Each line carries `run=<id>`.
-- INFO: run start, input, checkpoint action, device report, load time, plan summary, one line per file.
+- INFO: run start, input, checkpoint action, device report, load time, plan summary, one line per file (status, duration, chunks, words, `processing_seconds`, `real_time_factor`). Per-file processing time is attributed: the file's own decode time plus a feature-frame share of each batch it was in, plus collapse re-decodes.
 - WARNING: non-`ok` files, unreadable files, stale readiness marker, rejected legacy checkpoint.
 - DEBUG: one line per batch with its items, frames, and stage timings.
 - Never log secrets or full transcripts.
@@ -222,7 +235,7 @@ venv\Scripts\python.exe -m pytest -m regression       # only the fixed-defect gu
 
 | Tier | Location | Needs | Contents |
 |---|---|---|---|
-| unit | `tests/unit/` | nothing | `test_planning.py` (frame estimate, tiling and batch properties), `test_model.py` (config validation, features, TDT loop, duration table, non-finite rows, strict loading, tokenizer, attention), `test_offline.py` (sequential decoding bit-identity, downmix, ffprobe metadata, merge, statuses), `test_merging.py` (word grouping, seam alignment, fallback ownership), `test_recovery.py` (gap detection, recovery windows, collapse recovery wiring), `test_resampling.py` (pass band, alias rejection, interval equals whole file), `test_checkpoint.py` (download reuse, retry, pin rejection, conversion, against a real local HTTP server), `test_bootstrap.py`, `test_cli.py`, `test_runtime_services.py` |
+| unit | `tests/unit/` | nothing | `test_planning.py` (frame estimate, tiling and batch properties), `test_model.py` (config validation, features, TDT loop, duration table, non-finite rows, strict loading, tokenizer, attention), `test_offline.py` (sequential decoding bit-identity, downmix, ffprobe metadata, merge, statuses), `test_merging.py` (word grouping, seam alignment, fallback ownership), `test_recovery.py` (gap detection, recovery windows, collapse recovery wiring), `test_resampling.py` (pass band, alias rejection, interval equals whole file), `test_ffmpeg_stream.py` (persistent stream equals one continuous decode, one process per file, reads behind the stream, process closed; skipped without FFmpeg), `test_benchmark.py` (peak process memory, summary statistics, warm-up and measured rounds appended as one JSON line), `test_checkpoint.py` (download reuse, retry, pin rejection, conversion, against a real local HTTP server), `test_bootstrap.py`, `test_cli.py`, `test_runtime_services.py` |
 | regression | `tests/regression/test_fixed_defects.py` | nothing | one test per fixed defect; each docstring states the original failure and each section names the fixing commit |
 | full | `tests/full/` | prepared checkpoint | `test_accuracy.py` (exact transcripts, corpus WER budget, batching parity, determinism), `test_long_form.py` (chunking at scale, WER budget, CUDA memory bound, optional user recordings), `test_anomalies.py` (silence, noise, NaN samples, 48 kHz stereo), `test_command.py` (the real `inference.py` in a subprocess, folder CSV, FFmpeg fallback, error exit), `test_reference_parity.py` (HF `ParakeetForTDT` on CPU, skipped without `transformers`) |
 
@@ -297,17 +310,21 @@ Keep verification scripts outside the repository (a scratch directory). Report t
 
 ## 10. Performance work
 
-- **Measure first.** The dominant cost is the greedy TDT loop (about 85% of wall time on long audio). Media decoding is about 12%, and features about 2%.
+- **Measure first.** The dominant cost is the greedy TDT loop (about 85% of wall time on long audio). Media decoding is about 12% for MP3, and features about 2%.
+- **Where the loop time goes** (RTX 3050 Ti Laptop, one batch of two 15 s chunks, float32): about 291 ms in total, of which the encoder takes 142 ms and the decoding loop 149 ms over 108 steps. The loop issues thousands of small kernel launches, so it is bound by launch overhead, not arithmetic. cuDNN's LSTM step costs about 0.30 ms; a hand-written fused LSTM cell was slower (0.98 ms) and was dropped.
+- **Batch size and speed:** per chunk, 1 row took 243 ms, 2 rows 136 ms, 3 rows 111 ms, 4 rows 107 ms, 6 rows 126 ms, and 8 rows 131 ms. Four 15 s rows peaked at 2781 MiB allocated.
+- **Benchmark command.** `python -m src.commands.benchmark --input <path>` loads once, warms up, runs the measured rounds, and appends one JSON record with the commit, settings, per-round stage timings, per-file metrics, memory peaks, and whether the transcripts stayed identical. Use it for A/B comparisons.
 - **A/B protocol.**
   1. Check out the baseline in a separate `git worktree`.
-  2. Point it at the same checkpoint (a directory junction or symlink; never copy or move the weights).
-  3. Run both versions on the same file for at least three rounds, alternating which one runs first.
-  4. Compare `Model generation seconds` and `Wall-clock seconds`.
+  2. Point it at the same checkpoint (a directory junction or symlink; never copy or move the weights). Remove the junction with `rmdir` before removing the worktree, never by deleting through it.
+  3. Run both versions on the same input for at least three rounds, alternating which one runs first.
+  4. Compare wall and generation seconds (mean and spread) and the transcripts.
 
   Laptop GPUs drift several percent with temperature, so a difference smaller than the spread between rounds is noise.
 - **Output must not change.** Every performance change must keep token parity. Faster but different output is a behavior change and must be justified and measured as one.
 - **Windows:** `torch.compile` must not be used on Windows.
 - **Memory is the binding constraint on 4 GB GPUs.** After loading, only about 0.7 GB may be free when other processes hold VRAM. Batch and chunk budgets are the controls.
+- **Windows sysmem fallback.** Under WDDM the NVIDIA driver can back allocations that do not fit in VRAM with shared system memory instead of raising OOM. A budget that looks faster in a short test can therefore become several times slower on a busier GPU. Check the peak allocation against free VRAM, not just the timing.
 
 ## 11. Dependencies and environment
 
@@ -370,6 +387,8 @@ Must not, without an explicit request from the maintainer:
 | `Strict state-dict load reported incompatibility` | The checkpoint does not match the architecture. | Delete `weights_dir/.ready` and `model.pth`, then rerun to reconvert. |
 | `Tensors were not materialized from the checkpoint` | A new non-persistent buffer was not created on CPU. | Create it with `device="cpu"` in the module constructor (Invariant 4). |
 | `inference.<key> must be ...` | Invalid `config.toml` value. | Fix the named key. |
+| `FFmpeg failed while decoding <file> (exit N): ...` (in the log) | ffmpeg could not decode part of the stream; the message ends with ffmpeg's own error lines. | Check the file with `ffmpeg -i`. |
+| A run is several times slower than usual, with no error | On Windows, VRAM was overcommitted and the driver moved allocations to shared system memory. | Lower `inference.max_batch_feature_frames`, close other GPU processes, and compare `Peak accelerator memory allocated` with free VRAM. |
 | `Error: the CSV could not be written ...; transcripts were saved to ...` | Output CSV locked (for example open in Excel) or folder not writable. | Close the file; the transcripts are at the printed fallback path. |
 
 ## 15. Decision records
@@ -387,17 +406,17 @@ Must not, without an explicit request from the maintainer:
 - **D11. Word-level chunk merging.** Neighboring chunks timestamp the same word up to about 0.5 s apart. Token-midpoint ownership therefore split words across seams ("smile atile at one"), and WER over 15 chunks was 13.30% against 6.42% per clip. Grouping tokens into words and aligning the overlap on agreed words removes those artifacts. Chunk-by-chunk accuracy is now within one point of clip-by-clip.
 - **D12. Collapse recovery by shifted windows.** On some windows the decoder emits only long blanks and skips seconds of speech, and the Hugging Face reference does the same on the same samples. Probing showed a start shift of 0.25 to 0.5 s restores the speech, but not one fixed shift for every case, so several offsets are tried in order. Cost on a 36-minute podcast: 6 of 155 chunks re-decoded, about 3 s extra, 16 words recovered. Doubling the overlap instead cost 7% more time and still left a gap, so the default overlap stays 0.5 s.
 
+- **D13. One persistent FFmpeg process per file.** Spawning ffmpeg per chunk meant one process start, one seek, and one resampler restart per chunk, plus overlap decoded twice. On a 36-minute M4A (155 chunks) media decoding took 12.18 s; with one stream per file it takes 1.72 s, and wall time went from 41.4 s to 30.5 s.
+- **D14. Fewer host synchronizations in the decoding loop.** The completion check (`finished.all()`) now runs every `FINISHED_CHECK_INTERVAL` (8) steps, and the extra steps, which only emit padding, are trimmed. The decoder's all-blank fast path was removed, because deciding it needed a host read every step. About 1% faster on the 36-minute recording, byte-identical transcripts.
+- **D15. No micro-optimization of temporary tensors.** The loop is bound by kernel launches, not memory traffic. Removing a few temporaries saves a few launches out of dozens per step, within measurement noise. Capturing a step in a CUDA Graph removes the launch cost for every op at once, so that is the planned fix.
+
 ## 16. Open optimization items
 
 These are known and deliberately not done yet. Each one needs the verification of Sections 9 and 10.
 
-- **Decoding loop:**
-  - reduce per-step GPU synchronization (`finished.all()` and the decoder's blank fast path each sync once per step);
-  - reduce temporary tensors;
-  - consider fused kernels or CUDA Graphs for stable shapes.
-- **FFmpeg fallback:** keep one persistent process per file instead of one per chunk, and stop re-decoding overlap on that path.
-- **Budget tuning:** benchmark chunk sizes (1000 to 1750 frames), overlaps (0 to 100 frames), and batch budgets (2500 to 3500 frames) for speed and boundary accuracy.
+- **Decoding loop:** capture the per-step work in a CUDA Graph (the loop is launch-bound, see D15); consider TF32 for the encoder and custom kernels only where measurement shows a gain. `torch.compile` stays out (Section 10).
+- **Budget tuning:** benchmark chunk sizes (1000 to 1750 frames), overlaps (0 to 100 frames), and batch budgets for speed and boundary accuracy. Four rows per batch was fastest per chunk (Section 10), which suggests `max_batch_feature_frames` around 6000, but check VRAM headroom and the Windows sysmem fallback first.
 - **First-chunk collapse:** the first chunk of a file cannot shift its start, so a collapse there is reported, not recovered. Shrinking the window end instead is a possible extension.
 - **Overlap tuning:** overlap 1.0 s gave lower WER on the LibriSpeech concatenation (5.28% against 7.57% before titles were normalized), but on a real podcast it cost 7% more time and left one untranscribed gap. Decide with a larger labeled long-form set.
 - **Precision:** evaluate BF16/FP16 inference for memory headroom on 4 GB GPUs. Adopt only with measured parity or a documented, measured accuracy trade-off.
-- **Metrics:** per-file runtime metrics in folder mode, CPU RAM measurement, a machine-readable benchmark output for development.
+- **Media diagnostics:** an ffprobe capability report, classification of codec errors, explicit channel-layout handling, and clipping and silence metadata per file.

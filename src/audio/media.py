@@ -17,6 +17,8 @@ import math
 import os
 import shutil
 import subprocess
+import threading
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -269,6 +271,19 @@ def _build_decoded_segment(
 # =============================================================================
 
 
+def _float32_samples(payload: bytes) -> torch.Tensor:
+    """
+    Interpret raw little-endian float32 bytes from FFmpeg as a 1-D tensor.
+
+    An empty payload (the stream already ended) is a valid zero-length
+    result, which torch.frombuffer would reject.
+    """
+
+    if not payload:
+        return torch.zeros(0, dtype=torch.float32)
+    return torch.frombuffer(bytearray(payload), dtype=torch.float32).clone()
+
+
 def _read_ffmpeg_segment(
     path: Path,
     target_start_frame: int,
@@ -314,7 +329,7 @@ def _read_ffmpeg_segment(
     except (OSError, subprocess.CalledProcessError) as error:
         raise ValueError(f"FFmpeg could not decode media segment from {path}: {error}") from error
 
-    waveform = torch.frombuffer(bytearray(completed.stdout), dtype=torch.float32).clone()
+    waveform = _float32_samples(completed.stdout)
     # FFmpeg may return a few samples more or fewer than requested around codec
     # frame boundaries; the planner's sample budget is the contract.
     if waveform.numel() > target_frames:
@@ -330,6 +345,125 @@ def _read_ffmpeg_segment(
         source_sample_rate=target_sample_rate,
         source_channels=1,
     )
+
+
+
+# =============================================================================
+# Persistent FFmpeg stream (sequential fallback decoding)
+# =============================================================================
+
+
+class _FfmpegStream:
+    """
+    One FFmpeg process that decodes a whole file to mono target-rate float32.
+
+    Chunks of a file are read in order, so each new piece continues exactly
+    where the previous one stopped. One process per file replaces one process
+    (plus a seek) per chunk, and FFmpeg's resampler runs over the file
+    continuously instead of restarting at every chunk.
+    """
+
+    STDERR_LINES_KEPT = 20
+
+    def __init__(self, path: Path, target_sample_rate: int) -> None:
+        executable = _codec_binary("FFMPEG_BINARY", "ffmpeg")
+        if executable is None:
+            raise CodecUnavailableError(
+                "The media format is not supported by soundfile/libsndfile and "
+                "ffmpeg was not found in PATH. Set FFMPEG_BINARY externally."
+            )
+        self.path = path
+        self.position = 0
+        self.exhausted = False
+        self._stderr_tail: deque[str] = deque(maxlen=self.STDERR_LINES_KEPT)
+        self._process = subprocess.Popen(
+            [
+                executable,
+                "-v",
+                "error",
+                "-nostdin",
+                "-i",
+                str(path),
+                "-map",
+                "0:a:0",
+                "-vn",
+                "-sn",
+                "-dn",
+                "-ac",
+                "1",
+                "-ar",
+                str(target_sample_rate),
+                "-f",
+                "f32le",
+                "pipe:1",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        # Drain stderr on a thread: a full stderr pipe would block FFmpeg and,
+        # through the stdout reads below, this process too.
+        self._stderr_thread = threading.Thread(target=self._drain_stderr, daemon=True)
+        self._stderr_thread.start()
+
+    def _drain_stderr(self) -> None:
+        assert self._process.stderr is not None
+        for line in self._process.stderr:
+            self._stderr_tail.append(line.decode("utf-8", errors="replace").rstrip())
+
+    def read(self, start: int, end: int) -> torch.Tensor:
+        """
+        Return target samples ``[start, end)``; ``start`` must not be behind
+        the stream. Samples between the current position and ``start`` are
+        skipped. Samples past the end of the audio are zeros.
+
+        Raises:
+            ValueError: If FFmpeg exits with an error.
+        """
+
+        if start < self.position:
+            raise ValueError(f"FFmpeg stream for {self.path} is already past sample {start}")
+        skipped = self._read_bytes((start - self.position) * 4)
+        self.position += len(skipped) // 4
+        payload = self._read_bytes((end - start) * 4)
+        self.position = start + len(payload) // 4
+
+        waveform = _float32_samples(payload)
+        missing = (end - start) - waveform.numel()
+        if missing > 0:
+            waveform = torch_functional.pad(waveform, (0, missing))
+            self.position = end
+        return waveform
+
+    def _read_bytes(self, count: int) -> bytes:
+        assert self._process.stdout is not None
+        chunks: list[bytes] = []
+        remaining = count
+        while remaining > 0 and not self.exhausted:
+            data = self._process.stdout.read(remaining)
+            if not data:
+                self._finish()
+                break
+            chunks.append(data)
+            remaining -= len(data)
+        return b"".join(chunks)
+
+    def _finish(self) -> None:
+        """Mark end of stream and fail loudly if FFmpeg reported an error."""
+
+        self.exhausted = True
+        return_code = self._process.wait()
+        self._stderr_thread.join(timeout=5)
+        if return_code != 0:
+            detail = " | ".join(self._stderr_tail) or "no error output"
+            raise ValueError(f"FFmpeg failed while decoding {self.path} (exit {return_code}): {detail}")
+
+    def close(self) -> None:
+        if self._process.poll() is None:
+            self._process.kill()
+        self._process.wait()
+        for pipe in (self._process.stdout, self._process.stderr):
+            if pipe is not None:
+                pipe.close()
 
 
 # =============================================================================
@@ -351,12 +485,13 @@ class MediaSession:
 
         self.path = path
         self._source: soundfile.SoundFile | None
+        # FFmpeg fallback stream, started on the first sequential read.
+        self._stream: _FfmpegStream | None = None
         try:
             self._source = soundfile.SoundFile(str(path), mode="r")
         except SOUNDFILE_OPEN_ERRORS:
             _require_openable(path)
-            # A format libsndfile cannot decode: FFmpeg fallback, with
-            # per-segment subprocesses spawned on demand.
+            # A format libsndfile cannot decode: FFmpeg fallback.
             self._source = None
 
     def __enter__(self) -> "MediaSession":
@@ -371,6 +506,9 @@ class MediaSession:
         if self._source is not None:
             self._source.close()
             self._source = None
+        if self._stream is not None:
+            self._stream.close()
+            self._stream = None
 
     def _read_mono(self, source_start: int, source_end: int) -> torch.Tensor:
         """
@@ -517,7 +655,16 @@ class MediaSession:
                     "chunks must be read in order"
                 )
 
-        if self._source is None or reusable_frames <= 0:
+        if self._source is None:
+            return self._read_sequential_through_ffmpeg(
+                source_start_frame,
+                source_end_frame,
+                target_sample_rate,
+                previous_waveform,
+                reusable_frames,
+            )
+
+        if reusable_frames <= 0:
             segment = self.read_segment(
                 source_start_frame,
                 source_end_frame,
@@ -543,6 +690,50 @@ class MediaSession:
             target_sample_rate,
             source_sample_rate=int(self._source.samplerate),
             source_channels=int(self._source.channels),
+        )
+        return segment, segment.waveform
+
+
+    def _read_sequential_through_ffmpeg(
+        self,
+        source_start_frame: int,
+        source_end_frame: int,
+        target_sample_rate: int,
+        previous_waveform: torch.Tensor | None,
+        reusable_frames: int,
+    ) -> tuple[DecodedSegment, torch.Tensor]:
+        """
+        Continue the file's FFmpeg stream; fall back to a one-off decode only
+        when the request lies behind the stream (never for in-order chunks).
+        """
+
+        new_start_frame = source_start_frame + max(0, reusable_frames)
+        if self._stream is None:
+            self._stream = _FfmpegStream(self.path, target_sample_rate)
+
+        if new_start_frame < self._stream.position:
+            segment = _read_ffmpeg_segment(
+                self.path,
+                source_start_frame,
+                source_end_frame,
+                target_sample_rate,
+            )
+            return segment, segment.waveform
+
+        new_waveform = self._stream.read(new_start_frame, source_end_frame)
+        if reusable_frames > 0 and previous_waveform is not None:
+            overlap_tail = previous_waveform[previous_waveform.numel() - reusable_frames :]
+            waveform = torch.cat((overlap_tail, new_waveform))
+        else:
+            waveform = new_waveform
+
+        segment = _build_decoded_segment(
+            waveform,
+            source_start_frame,
+            source_end_frame,
+            target_sample_rate,
+            source_sample_rate=target_sample_rate,
+            source_channels=1,
         )
         return segment, segment.waveform
 

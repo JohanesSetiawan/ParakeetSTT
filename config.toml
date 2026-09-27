@@ -4,6 +4,8 @@
 [paths]
 weights_dir = "weights/parakeet-tdt-0.6b-v3"
 log_dir = "logs"
+# Benchmark results (JSON lines), see `python -m src.commands.benchmark`.
+metrics_dir = "metrics"
 
 [logging]
 # Python logging level for the dated run log (DEBUG adds per-batch detail).
@@ -41,3 +43,9 @@ gap_silence_rms = 0.001
 recovery_start_offsets_feature_frames = [-25, 25, -50, 50]
 # Minimum wall-clock gap between two terminal progress lines.
 progress_interval_seconds = 2.0
+
+[benchmark]
+# Development benchmark: rounds run and discarded before measuring (CUDA
+# kernel selection, file cache), then rounds that are measured and compared.
+warmup_rounds = 1
+measured_rounds = 3
