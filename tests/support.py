@@ -160,6 +160,10 @@ def inference_settings(**overrides: object) -> InferenceSettings:
         "overlap_feature_frames": 5,
         "max_batch_feature_frames": 200,
         "max_padding_fraction": 0.5,
+        "merge_tolerance_feature_frames": 10,
+        "untranscribed_gap_seconds": 4.0,
+        "gap_silence_rms": 0.001,
+        "recovery_start_offsets_feature_frames": (),
         "progress_interval_seconds": 0.0,
     }
     values.update(overrides)
@@ -224,9 +228,16 @@ def load_speech_clips() -> tuple[SpeechClip, ...]:
 # =============================================================================
 
 
+# LibriSpeech spells titles out ("MISTER"); the model writes either "mister"
+# or "Mr". Mapping both to one form keeps a spelling choice from counting as
+# a recognition error. This mirrors the title handling of common English ASR
+# normalizers and is limited to titles LibriSpeech actually spells out.
+SPELLED_TITLES = {"mr": "mister", "mrs": "missus", "dr": "doctor"}
+
+
 def normalize_words(text: str) -> list[str]:
     """
-    Lowercase, drop punctuation except apostrophes, split on whitespace.
+    Lowercase, drop punctuation except apostrophes, spell out titles, split.
 
     LibriSpeech references are uppercase without punctuation, while the model
     writes cased, punctuated text; both must meet in the same form.
@@ -234,7 +245,7 @@ def normalize_words(text: str) -> list[str]:
 
     lowered = text.lower().replace("-", " ")
     letters_only = re.sub(r"[^a-z0-9' ]+", " ", lowered)
-    return letters_only.split()
+    return [SPELLED_TITLES.get(word, word) for word in letters_only.split()]
 
 
 def word_errors(reference: list[str], hypothesis: list[str]) -> int:
@@ -301,4 +312,47 @@ class ScriptedModel(nn.Module):
             encoder_lengths=encoder_lengths,
             forced_advances=torch.zeros(batch_size, dtype=torch.long),
             encoder_finite=torch.full((batch_size,), self.encoder_finite),
+        )
+
+
+class SteadySpeechModel(nn.Module):
+    """
+    Emit one word every ``every`` encoder frames, like steady speech; on the
+    generate calls listed in ``collapse_calls`` emit nothing at all, like the
+    real model's decoder collapse. Calls are counted from 0.
+    """
+
+    def __init__(self, token_id: int, every: int = 4, collapse_calls: frozenset[int] = frozenset()) -> None:
+        super().__init__()
+        self.anchor = nn.Parameter(torch.zeros(1))
+        self.token_id = token_id
+        self.every = every
+        self.collapse_calls = collapse_calls
+        self.calls = 0
+
+    def generate(self, features: torch.Tensor, mask: torch.Tensor) -> GenerationResult:
+        call = self.calls
+        self.calls += 1
+        batch_size = features.shape[0]
+        encoder_lengths = (mask.sum(dim=1) + 7) // 8
+        longest = int(encoder_lengths.max())
+        starts = torch.arange(0, max(longest, 1), self.every, dtype=torch.long)
+        steps = starts.numel()
+        sequences = torch.full((batch_size, steps), self.token_id, dtype=torch.long)
+        frame_starts = starts.repeat(batch_size, 1)
+        durations = torch.full((batch_size, steps), self.every, dtype=torch.long)
+        for row in range(batch_size):
+            beyond = frame_starts[row] >= encoder_lengths[row]
+            sequences[row, beyond] = 2
+            durations[row, beyond] = 0
+            if call in self.collapse_calls:
+                sequences[row] = TINY_BLANK_ID
+        return GenerationResult(
+            sequences=sequences,
+            durations=durations,
+            frame_starts=frame_starts,
+            frame_ends=frame_starts + durations,
+            encoder_lengths=encoder_lengths,
+            forced_advances=torch.zeros(batch_size, dtype=torch.long),
+            encoder_finite=torch.ones(batch_size, dtype=torch.bool),
         )

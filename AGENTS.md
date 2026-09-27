@@ -126,7 +126,8 @@ A change that breaks any of these is a regression, whatever else it improves.
 11. **Cores tile the file.** Cores are contiguous, non-overlapping, and cover `[0, total_samples)`. Sources are the core plus at most `overlap` on each side, clamped at 0 and at the end of the file.
 12. **Sequential decoding.** Chunks of one file are read in order through `read_sequential_segment`. Only `previous_end - current_start` samples are reused, and never through `tensor[-k:]` with `k == 0`, which selects the whole tensor. A non-positive overlap decodes fresh. The result must be bit-identical to a fresh decode of the same interval.
 13. **Session lifetime.** A decoder session opens at a file's first chunk and closes after its last. Never open all files up front.
-14. **Ownership.** A token belongs to the chunk whose core contains its midpoint. The last chunk of a file owns everything from its core start onward, because end-of-audio tokens can have a midpoint past the end.
+14. **Word-level ownership** (`inference/merging.py`). Tokens are grouped into words (a word starts at a piece beginning with the SentencePiece marker), and a word is never split between chunks. In the overlap, the longest run of words both chunks agree on is found: same letters and digits, start times within `merge_tolerance_feature_frames`. Each agreed word is taken once, from the chunk whose core holds its start. Without agreement, whole words go to the chunk whose core holds their start. Neighboring chunks disagree on word times by up to about 0.5 s, so never go back to token-level or midpoint ownership.
+    - **Collapse recovery** (`inference/recovery.py`, `OfflineTranscriber._recover_chunk`). A chunk whose core has a stretch longer than `untranscribed_gap_seconds` with no word start and RMS at least `gap_silence_rms` is re-decoded. The window start is shifted by each configured offset in turn. Offsets are at most the overlap, so the core is always covered and the budget kept. The first result without the gap wins. Otherwise the smallest gap is kept and the file is `untranscribed_gap`.
 15. **No text rewriting.** No deduplication of repeated words, no dictionary, word list, phrase, or name correction.
 
 ### Resource policy
@@ -164,6 +165,7 @@ A change that breaks any of these is a regression, whatever else it improves.
 | `numerical_failure` | features or encoder states non-finite for any chunk; that chunk's tokens are dropped |
 | `input_nonfinite` | decoded samples contained NaN/Inf (zeroed before inference) |
 | `decoder_forced_advance` | the per-frame guard fired |
+| `untranscribed_gap` | transcript not empty, but a chunk still has a long non-silent stretch without words after collapse recovery |
 | `no_speech` | transcript empty and every chunk is digital silence |
 | `empty_transcript` | transcript empty and audio not silent |
 | `unreadable` | assigned by `commands/inference.py` for files discovery could not read |
@@ -219,7 +221,7 @@ venv\Scripts\python.exe -m pytest -m regression       # only the fixed-defect gu
 
 | Tier | Location | Needs | Contents |
 |---|---|---|---|
-| unit | `tests/unit/` | nothing | `test_planning.py` (frame estimate, tiling and batch properties), `test_model.py` (config validation, features, TDT loop, duration table, non-finite rows, strict loading, tokenizer, attention), `test_offline.py` (sequential decoding bit-identity, downmix, ffprobe metadata, merge, statuses), `test_checkpoint.py` (download reuse, retry, pin rejection, conversion, against a real local HTTP server), `test_bootstrap.py`, `test_cli.py`, `test_runtime_services.py` |
+| unit | `tests/unit/` | nothing | `test_planning.py` (frame estimate, tiling and batch properties), `test_model.py` (config validation, features, TDT loop, duration table, non-finite rows, strict loading, tokenizer, attention), `test_offline.py` (sequential decoding bit-identity, downmix, ffprobe metadata, merge, statuses), `test_merging.py` (word grouping, seam alignment, fallback ownership), `test_recovery.py` (gap detection, recovery windows, collapse recovery wiring), `test_checkpoint.py` (download reuse, retry, pin rejection, conversion, against a real local HTTP server), `test_bootstrap.py`, `test_cli.py`, `test_runtime_services.py` |
 | regression | `tests/regression/test_fixed_defects.py` | nothing | one test per fixed defect; each docstring states the original failure and each section names the fixing commit |
 | full | `tests/full/` | prepared checkpoint | `test_accuracy.py` (exact transcripts, corpus WER budget, batching parity, determinism), `test_long_form.py` (chunking at scale, WER budget, CUDA memory bound, optional user recordings), `test_anomalies.py` (silence, noise, NaN samples, 48 kHz stereo), `test_command.py` (the real `inference.py` in a subprocess, folder CSV, FFmpeg fallback, error exit), `test_reference_parity.py` (HF `ParakeetForTDT` on CPU, skipped without `transformers`) |
 
@@ -246,14 +248,16 @@ If a deliberate change alters a transcript, update `expected_transcript` in the 
 
 ### Known-defect tests
 
-Two `full` tests are `xfail(strict=True)` for the chunk-boundary defect (Section 16). Strict means that once the defect is fixed they pass unexpectedly and fail the run. Remove the marker and update `expected_transcript` for the chunked clip in the same change.
+pytest runs with `xfail_strict = true`. When a known defect is tracked by an `xfail` test, fixing the defect makes the test pass unexpectedly and fail the run. Remove the marker in the same change that fixes the defect. There are no known-defect tests at the moment. The chunk-boundary tests were converted to budgets when word-level merging landed.
 
 ### Thresholds
 
-The WER budgets are measured values plus a small margin, with the measurement written next to each constant:
+The WER budgets are measured values plus a small margin, with the measurement written next to each constant. WER normalization spells out titles ("Mr" becomes "mister"), because LibriSpeech references spell them out.
 
-- corpus 6.42% measured, budget 7.5%;
-- long form 13.30% measured, budget 14%.
+- corpus (clip by clip) 3.67% measured, budget 4.6%;
+- chunked clip against the unchunked reference 1.49% measured, budget 3%;
+- long form (196 s, 15 chunks) 4.59% measured, budget 5.5%;
+- cost of chunking over clip by clip: at most 1.5 points.
 
 Tighten a budget when accuracy improves. Never loosen one without a written reason.
 
@@ -379,6 +383,8 @@ Must not, without an explicit request from the maintainer:
 - **D8. Pinned upstream hashes in code.** The checkpoint identity is part of the verified contract, so it is not user configuration.
 - **D9. Clamped normalization divisors.** Inputs with fewer than two valid frames produced NaN (division by n - 1 = 0) and hung decoding. Clamping keeps them finite and is bit-identical for n >= 2.
 - **D10. Linear resampling kept for now.** It is deterministic and dependency-free, but it aliases content above 8 kHz and differs from FFmpeg's filtered resampling. Replacing it needs a measured accuracy comparison (see Section 16).
+- **D11. Word-level chunk merging.** Neighboring chunks timestamp the same word up to about 0.5 s apart. Token-midpoint ownership therefore split words across seams ("smile atile at one"), and WER over 15 chunks was 13.30% against 6.42% per clip. Grouping tokens into words and aligning the overlap on agreed words removes those artifacts. Chunk-by-chunk accuracy is now within one point of clip-by-clip.
+- **D12. Collapse recovery by shifted windows.** On some windows the decoder emits only long blanks and skips seconds of speech, and the Hugging Face reference does the same on the same samples. Probing showed a start shift of 0.25 to 0.5 s restores the speech, but not one fixed shift for every case, so several offsets are tried in order. Cost on a 36-minute podcast: 6 of 155 chunks re-decoded, about 3 s extra, 16 words recovered. Doubling the overlap instead cost 7% more time and still left a gap, so the default overlap stays 0.5 s.
 
 ## 16. Open optimization items
 
@@ -391,6 +397,7 @@ These are known and deliberately not done yet. Each one needs the verification o
 - **FFmpeg fallback:** keep one persistent process per file instead of one per chunk, and stop re-decoding overlap on that path.
 - **Resampling:** anti-aliased windowed-sinc or polyphase resampling, benchmarked for accuracy against the current linear path.
 - **Budget tuning:** benchmark chunk sizes (1000 to 1750 frames), overlaps (0 to 100 frames), and batch budgets (2500 to 3500 frames) for speed and boundary accuracy.
-- **Boundary merging (known defect, highest accuracy impact):** midpoint ownership can keep a subword from one chunk and the rest of the word from the next. For example, the 29.4 s test clip yields "smile atile at one" where the unchunked reference says "smile at one". On the test clips, WER goes from 6.42% per clip to 9.17% over 4 chunks and 13.30% over 15 chunks. Two strict-xfail tests in the `full` tier track it. Candidate fixes: word-aligned ownership (move a boundary to the nearest word-initial token), or dropping tokens whose frames fall in the overlap unless both chunks agree.
+- **First-chunk collapse:** the first chunk of a file cannot shift its start, so a collapse there is reported, not recovered. Shrinking the window end instead is a possible extension.
+- **Overlap tuning:** overlap 1.0 s gave lower WER on the LibriSpeech concatenation (5.28% against 7.57% before titles were normalized), but on a real podcast it cost 7% more time and left one untranscribed gap. Decide with a larger labeled long-form set.
 - **Precision:** evaluate BF16/FP16 inference for memory headroom on 4 GB GPUs. Adopt only with measured parity or a documented, measured accuracy trade-off.
 - **Metrics:** per-file runtime metrics in folder mode, CPU RAM measurement, a machine-readable benchmark output for development.

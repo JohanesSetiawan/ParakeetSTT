@@ -26,5 +26,18 @@ max_chunk_feature_frames = 1500
 overlap_feature_frames = 50
 max_batch_feature_frames = 3000
 max_padding_fraction = 0.25
+# How far apart two neighbouring chunks may place the same word in time
+# (feature frames of 10 ms). Measured drift reaches about 0.5 s, so 100 frames
+# (1.0 s) leaves margin. 0 disables overlap alignment at chunk seams.
+merge_tolerance_feature_frames = 100
+# Decoder collapse recovery. On some windows the model skips seconds of clear
+# speech (the reference implementation does the same on the same samples).
+# A stretch of a chunk's core longer than untranscribed_gap_seconds with no
+# word, whose RMS is at least gap_silence_rms (about -60 dBFS), is re-decoded
+# with the window start moved by each offset in turn (feature frames of 10 ms,
+# at most overlap_feature_frames in size). An empty list disables recovery.
+untranscribed_gap_seconds = 4.0
+gap_silence_rms = 0.001
+recovery_start_offsets_feature_frames = [-25, 25, -50, 50]
 # Minimum wall-clock gap between two terminal progress lines.
 progress_interval_seconds = 2.0

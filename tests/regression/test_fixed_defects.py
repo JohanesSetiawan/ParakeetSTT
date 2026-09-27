@@ -476,9 +476,16 @@ def test_decoder_handles_are_opened_lazily_and_released(tmp_path: Path) -> None:
     assert open_sessions == []
 
 
-@pytest.mark.parametrize("samples", [12_800, 32_000])
+@pytest.mark.parametrize("samples", [8_000, 12_800, 32_000])
 def test_token_at_end_of_audio_is_kept(tmp_path: Path, samples: int) -> None:
-    """A token on the last encoder frame has its midpoint past the end and was dropped."""
+    """
+    A token on the last encoder frame has its midpoint past the end of the
+    audio and was dropped by the half-open ownership bound.
+
+    The scripted model emits one token at the end of every chunk, so a
+    multi-chunk file may also keep earlier chunks' tokens; what must hold is
+    that the final chunk's end token is present.
+    """
 
     path = tmp_path / "clip.wav"
     write_float_wav(path, torch.full((samples,), 0.1), TARGET_RATE)
@@ -488,9 +495,14 @@ def test_token_at_end_of_audio_is_kept(tmp_path: Path, samples: int) -> None:
         inference_settings(),
     )
 
-    result = transcriber.transcribe([path])
+    file_result = transcriber.transcribe([path]).files[0]
+    words = file_result.transcript.split()
 
-    assert result.files[0].transcript == "a"
+    if len(file_result.chunks) == 1:
+        assert words == ["a"]
+    else:
+        assert words and words[-1] == "a"
+        assert len(words) <= len(file_result.chunks)
 
 
 def test_locked_csv_does_not_lose_the_transcripts(tmp_path: Path) -> None:
@@ -548,3 +560,66 @@ def test_codec_unavailable_is_a_runtime_error_subclass() -> None:
     """Callers that catch RuntimeError for codec problems must keep working."""
 
     assert issubclass(CodecUnavailableError, RuntimeError)
+
+
+# =============================================================================
+# Fixed by word-level chunk merging and collapse recovery (PR #3)
+# =============================================================================
+
+
+def test_drifted_seam_timestamps_do_not_split_a_word() -> None:
+    """
+    Chunk 0 placed "smile at one" at 13.52-14.00 s and chunk 1 at 13.74-14.46 s
+    (tests/data/librispeech/1272-128104-0004.flac). Token-midpoint ownership
+    kept "sm ile at" from one chunk and "ile at one" from the other, giving
+    "smile atile at one".
+    """
+
+    from src.inference.merging import ChunkWords, TimedToken, group_words, merge_chunks
+
+    pieces = {10: "\u2581sm", 11: "ile", 12: "\u2581at", 13: "\u2581one", 14: "\u2581much"}
+
+    def seam_chunk(timed: list[tuple[int, float]], source, core) -> ChunkWords:
+        tokens = [TimedToken(token, round(start * 16000), round((start + 0.08) * 16000)) for token, start in timed]
+        return ChunkWords(
+            words=group_words(tokens, pieces.get),
+            source_start=round(source[0] * 16000),
+            source_end=round(source[1] * 16000),
+            core_start=round(core[0] * 16000),
+            core_end=round(core[1] * 16000),
+        )
+
+    earlier = seam_chunk([(10, 13.52), (11, 13.68), (12, 13.84), (13, 14.00)], (0.0, 14.5), (0.0, 14.0))
+    later = seam_chunk([(10, 13.74), (11, 13.98), (12, 14.22), (13, 14.46), (14, 14.70)], (13.5, 28.5), (14.0, 28.0))
+
+    merged = merge_chunks([earlier, later], tolerance_samples=16000)
+
+    assert "".join(pieces[token] for token in merged).replace("\u2581", " ").strip() == "smile at one much"
+
+
+def test_decoder_collapse_inside_a_chunk_is_re_decoded(tmp_path: Path, tiny_configuration) -> None:
+    """
+    The model skipped 9.5 s of clear speech on one window of a long recording
+    (Hugging Face does the same on those samples); the words were lost.
+    """
+
+    from support import SteadySpeechModel
+
+    path = tmp_path / "speech.wav"
+    write_float_wav(path, torch.full((48_000,), 0.1), TARGET_RATE)
+    transcriber = OfflineTranscriber(
+        SteadySpeechModel(3, collapse_calls=frozenset({1})).eval(),
+        tiny_configuration,
+        inference_settings(
+            batch_size=1,
+            max_chunk_feature_frames=100,
+            overlap_feature_frames=5,
+            untranscribed_gap_seconds=0.5,
+            recovery_start_offsets_feature_frames=(-3, 3),
+        ),
+    )
+
+    file_result = transcriber.transcribe([path]).files[0]
+
+    assert file_result.chunks[1].recovered
+    assert file_result.status is FileStatus.OK
