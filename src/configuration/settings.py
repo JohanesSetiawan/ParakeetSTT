@@ -19,6 +19,10 @@ from .config import PROJECT_ROOT
 
 
 DEFAULT_SETTINGS_PATH = PROJECT_ROOT / "config.toml"
+ENCODER_PRECISIONS = ("float32", "float16")
+# torch.set_float32_matmul_precision values: "highest" is exact float32,
+# "high" allows TF32 tensor cores on GPUs that have them.
+FLOAT32_MATMUL_PRECISIONS = ("highest", "high")
 
 
 # =============================================================================
@@ -70,6 +74,9 @@ class InferenceSettings:
     recovery_start_offsets_feature_frames: tuple[int, ...]
     progress_interval_seconds: float
     max_open_files: int
+    encoder_precision: str
+    cuda_graphs: bool
+    float32_matmul_precision: str
 
 
 @dataclass(frozen=True)
@@ -140,6 +147,13 @@ def _number(
         upper = "" if maximum is None else f" and <= {maximum}"
         raise ValueError(f"{section_name}.{key} must be >= {minimum}{upper}, got {value!r}")
     return number
+
+
+def _choice(section: dict[str, Any], section_name: str, key: str, choices: tuple[str, ...]) -> str:
+    value = section.get(key)
+    if value not in choices:
+        raise ValueError(f"{section_name}.{key} must be one of {choices}, got {value!r}")
+    return value
 
 
 def _boolean(section: dict[str, Any], section_name: str, key: str) -> bool:
@@ -286,6 +300,14 @@ def _parse_inference(document: dict[str, Any]) -> InferenceSettings:
         recovery_start_offsets_feature_frames=tuple(raw_offsets),
         progress_interval_seconds=progress_interval,
         max_open_files=_integer(section, "inference", "max_open_files", minimum=1),
+        encoder_precision=_choice(section, "inference", "encoder_precision", ENCODER_PRECISIONS),
+        cuda_graphs=_boolean(section, "inference", "cuda_graphs"),
+        float32_matmul_precision=_choice(
+            section,
+            "inference",
+            "float32_matmul_precision",
+            FLOAT32_MATMUL_PRECISIONS,
+        ),
     )
 
 

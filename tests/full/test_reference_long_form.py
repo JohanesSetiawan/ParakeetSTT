@@ -39,6 +39,11 @@ MAX_WORD_RATIO = 1.15
 # words either way.
 RATIO_MIN_REFERENCE_WORDS = 200
 
+# Share of chunks the collapse recovery may re-decode. Measured 3.8 percent
+# (12 of 316) on a 74-minute podcast; a numerical fault that empties chunks
+# wholesale (the float16 depthwise convolution bug) pushed it to 97 percent.
+MAX_RECOVERED_FRACTION = 0.10
+
 FAILURE_STATUSES = {
     FileStatus.NUMERICAL_FAILURE,
     FileStatus.DECODER_FORCED_ADVANCE,
@@ -86,6 +91,8 @@ def test_labeled_recordings_stay_within_the_wer_budget(real_settings, real_model
 
     total_errors = 0
     total_words = 0
+    total_chunks = 0
+    recovered_chunks = 0
     lines = []
     problems = []
     for name, file_result in zip(names, result.files, strict=True):
@@ -94,6 +101,8 @@ def test_labeled_recordings_stay_within_the_wer_budget(real_settings, real_model
         errors = word_errors(reference_words, hypothesis_words)
         total_errors += errors
         total_words += len(reference_words)
+        total_chunks += len(file_result.chunks)
+        recovered_chunks += sum(chunk.recovered for chunk in file_result.chunks)
         ratio = len(hypothesis_words) / max(1, len(reference_words))
         lines.append(
             f"{name}: WER {100 * errors / max(1, len(reference_words)):.2f}% "
@@ -105,7 +114,13 @@ def test_labeled_recordings_stay_within_the_wer_budget(real_settings, real_model
             problems.append(f"{name} has {ratio:.2f} times the reference word count")
 
     corpus_wer = 100 * total_errors / total_words
-    report = "\n".join(lines + [f"corpus WER {corpus_wer:.2f}% (budget {budget:.2f}%)"])
+    if recovered_chunks > MAX_RECOVERED_FRACTION * total_chunks:
+        problems.append(f"{recovered_chunks} of {total_chunks} chunks needed collapse recovery")
+    summary = [
+        f"recovered chunks {recovered_chunks} of {total_chunks}",
+        f"corpus WER {corpus_wer:.2f}% (budget {budget:.2f}%)",
+    ]
+    report = "\n".join(lines + summary)
     print(report)
 
     assert not problems, "\n".join(problems) + "\n" + report

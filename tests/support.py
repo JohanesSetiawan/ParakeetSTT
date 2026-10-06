@@ -167,6 +167,9 @@ def inference_settings(**overrides: object) -> InferenceSettings:
         "recovery_start_offsets_feature_frames": (),
         "progress_interval_seconds": 0.0,
         "max_open_files": 8,
+        "encoder_precision": "float32",
+        "cuda_graphs": False,
+        "float32_matmul_precision": "highest",
     }
     values.update(overrides)
     return InferenceSettings(**values)  # type: ignore[arg-type]

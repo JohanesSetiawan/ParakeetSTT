@@ -68,7 +68,7 @@ def test_benchmark_warms_up_measures_and_appends_one_json_line(tmp_path: Path, t
     bootstrap = BootstrapResult(action="ready", marker_path="marker", preparation=None)
 
     with patch(
-        "src.commands.benchmark.ensure_first_run_ready",
+        "src.commands.model_loading.ensure_first_run_ready",
         return_value=(bootstrap, (model.eval(), tiny_configuration, {})),
     ):
         record, output_path = run_benchmark(audio, settings, run_id="test-run")

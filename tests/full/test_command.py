@@ -12,6 +12,7 @@ import sys
 from pathlib import Path
 
 import pytest
+import torch
 
 from src.configuration.config import PROJECT_ROOT
 from support import SpeechClip
@@ -20,6 +21,11 @@ COMMAND_TIMEOUT_SECONDS = 600
 
 
 def run_command(target: Path) -> subprocess.CompletedProcess[str]:
+    # The test session keeps its own model and cached blocks on the GPU. The
+    # command caps itself to the VRAM free when it starts, so hand the cache
+    # back first or it may find too little room for even one chunk.
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     return subprocess.run(
         [sys.executable, "inference.py", "--transcribe", str(target)],
         cwd=PROJECT_ROOT,
@@ -42,7 +48,7 @@ def test_single_file_prints_the_expected_transcript(real_settings, speech_clips)
     assert completed.returncode == 0, completed.stderr
     assert "Status: ok" in completed.stdout
     assert f"Transcript: {clip.expected_transcript}" in completed.stdout
-    for label in ("Device:", "Precision: float32", "Model load seconds:", "Real-time factor:"):
+    for label in ("Device:", "Precision:", "Encoder precision:", "Model load seconds:", "Real-time factor:"):
         assert label in completed.stdout
 
 

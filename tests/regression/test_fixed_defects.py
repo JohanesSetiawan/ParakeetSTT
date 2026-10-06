@@ -543,7 +543,7 @@ def test_mistyped_input_fails_before_any_checkpoint_work(tmp_path: Path) -> None
     """The input was validated only after a possible 2.5 GB download and a model load."""
 
     with (
-        patch("src.commands.inference.ensure_first_run_ready") as bootstrap_mock,
+        patch("src.commands.model_loading.ensure_first_run_ready") as bootstrap_mock,
         redirect_stdout(io.StringIO()),
         redirect_stderr(io.StringIO()) as errors,
     ):
@@ -744,3 +744,81 @@ def test_ffmpeg_stream_start_failure_names_the_file(tmp_path: Path) -> None:
     ):
         with pytest.raises(ValueError, match="clip.m4a"):
             media._FfmpegStream(path, TARGET_RATE)
+
+
+# =============================================================================
+# Fixed in perf/throughput-and-precision
+# =============================================================================
+
+
+def test_collapse_recovery_reads_the_audio_once_per_chunk(tmp_path: Path, tiny_configuration) -> None:
+    """
+    Every shifted window was decoded on its own, one seek each. An MP3 seek in
+    libsndfile costs about 9 ms per minute of position, so recovering chunks
+    late in a 74-minute podcast cost more than the model (9 s for 12 chunks).
+    """
+
+    from src.audio.media import MediaSession
+    from support import SteadySpeechModel
+
+    path = tmp_path / "speech.wav"
+    write_float_wav(path, torch.full((48_000,), 0.1), TARGET_RATE)
+    offsets = (-3, 3, -5, 5)
+    transcriber = OfflineTranscriber(
+        # Every call after the first collapses, so no window succeeds and the
+        # old code read all four windows for every collapsed chunk.
+        SteadySpeechModel(3, collapse_calls=frozenset(range(1, 1000))).eval(),
+        tiny_configuration,
+        inference_settings(
+            batch_size=1,
+            max_chunk_feature_frames=100,
+            overlap_feature_frames=5,
+            untranscribed_gap_seconds=0.5,
+            recovery_start_offsets_feature_frames=offsets,
+        ),
+    )
+    reads_during_recovery: list[tuple[int, int]] = []
+    recovered_chunks: list[int] = []
+    recovering = [False]
+    original_read = MediaSession.read_segment
+    original_recover = OfflineTranscriber._recover_file
+
+    def counting_read(self, start: int, end: int, rate: int):
+        if recovering[0]:
+            reads_during_recovery.append((start, end))
+        return original_read(self, start, end, rate)
+
+    def flagged_recover(self, chunks, metadata, session):
+        recovered_chunks.extend(chunk.item.chunk_index for chunk in chunks if self._has_untranscribed_gap(chunk))
+        recovering[0] = True
+        try:
+            return original_recover(self, chunks, metadata, session)
+        finally:
+            recovering[0] = False
+
+    with patch.object(MediaSession, "read_segment", counting_read), patch.object(
+        OfflineTranscriber, "_recover_file", flagged_recover
+    ):
+        file_result = transcriber.transcribe([path]).files[0]
+
+    assert recovered_chunks
+    assert len(reads_during_recovery) == len(recovered_chunks)
+    assert file_result.status is FileStatus.UNTRANSCRIBED_GAP
+
+
+def test_slices_of_one_decode_equal_separate_decodes(tmp_path: Path) -> None:
+    from src.audio.media import slice_segment
+
+    path = tmp_path / "tone.wav"
+    tone = torch.sin(torch.arange(48_000, dtype=torch.float32) * 0.05) * 0.3
+    write_float_wav(path, tone, 48_000)  # resampled to 16 kHz on read
+    with open_media_session(path) as session:
+        span = session.read_segment(1_000, 9_000, TARGET_RATE)
+        separate = session.read_segment(2_500, 7_500, TARGET_RATE)
+
+    piece = slice_segment(span, 2_500, 7_500)
+
+    assert piece.source_start_frame == 2_500 and piece.source_end_frame == 7_500
+    assert torch.allclose(piece.waveform, separate.waveform, atol=1e-6)
+    with pytest.raises(ValueError, match="outside"):
+        slice_segment(span, 500, 2_000)

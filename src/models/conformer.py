@@ -119,7 +119,14 @@ class ConvolutionModule(nn.Module):
             all_masked_queries = torch.all(~attention_mask, dim=2)
             hidden_states = hidden_states.masked_fill(all_masked_queries, 0.0)
 
-        hidden_states = self.depthwise_conv(hidden_states)
+        # With a float16 encoder the depthwise convolution keeps float32
+        # weights (see ParakeetTDT.set_encoder_dtype): cuDNN 9's float16
+        # depthwise kernel returned wrong values for batches of 7 or more rows
+        # in a long-running process, which emptied whole chunks. In float32
+        # mode both casts are no-ops.
+        convolution_dtype = self.depthwise_conv.weight.dtype
+        hidden_states = self.depthwise_conv(hidden_states.to(convolution_dtype))
+        hidden_states = hidden_states.to(self.pointwise_conv1.weight.dtype)
         hidden_states = self.norm(hidden_states)
         hidden_states = torch.nn.functional.silu(hidden_states)
         hidden_states = self.pointwise_conv2(hidden_states)

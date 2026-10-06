@@ -33,7 +33,7 @@ def test_chosen_budget_runs_under_the_ceiling(real_settings, real_model, uncappe
         max_batch_feature_frames=64 * max_chunk,
         batch_size=64,
     )
-    memory = MemorySettings(cap_to_free_memory=True, auto_batch_budget=True, reserve_mib=512)
+    memory = MemorySettings(cap_to_free_memory=True, auto_batch_budget=True, reserve_mib=256)
 
     resolved, budget = resolve_memory_budget(model, configuration, oversized, memory)
 
@@ -67,7 +67,7 @@ def test_budget_never_raises_the_configured_value(real_settings, real_model, unc
     model, configuration = real_model
     max_chunk = real_settings.inference.max_chunk_feature_frames
     small = dataclasses.replace(real_settings.inference, max_batch_feature_frames=max_chunk)
-    memory = MemorySettings(cap_to_free_memory=True, auto_batch_budget=True, reserve_mib=512)
+    memory = MemorySettings(cap_to_free_memory=True, auto_batch_budget=True, reserve_mib=256)
 
     resolved, budget = resolve_memory_budget(model, configuration, small, memory)
 

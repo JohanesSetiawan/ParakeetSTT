@@ -10,7 +10,7 @@ import torch
 
 from src.configuration.config import load_config
 from src.configuration.settings import MemorySettings
-from src.inference.budget import MemoryBudget, chunks_that_fit, resolve_memory_budget
+from src.inference.budget import MemoryBudget, _rows_under_ceiling, chunks_that_fit, resolve_memory_budget
 from src.models.parakeet import ParakeetTDT
 from src.runtime import memory as memory_module
 from support import inference_settings, write_tiny_checkpoint
@@ -61,37 +61,69 @@ def test_predicted_batches_never_exceed_the_ceiling(ceiling_mib: int) -> None:
 # =============================================================================
 
 
-def test_ceiling_is_reserved_plus_free_minus_reserve() -> None:
-    fractions: list[float] = []
+def test_ceiling_keeps_the_requested_headroom_of_free_memory() -> None:
+    memory = memory_module.AcceleratorMemory(reserved=2400 * MIB, free=1000 * MIB, total=4096 * MIB)
+
+    assert memory.ceiling(256 * MIB) == (2400 + 1000 - 256) * MIB
+    assert memory.ceiling(0) == 3400 * MIB
+    # Headroom larger than the free memory leaves PyTorch what it holds.
+    assert memory.ceiling(2000 * MIB) == 2400 * MIB
+
+
+def test_measurement_releases_the_cache_first() -> None:
     device = torch.device("cuda", 0)
+    calls: list[str] = []
     with (
-        patch.object(memory_module.torch.cuda, "mem_get_info", return_value=(1000 * MIB, 4096 * MIB)),
-        patch.object(memory_module.torch.cuda, "empty_cache"),
-        patch.object(memory_module.torch.cuda, "memory_reserved", return_value=2400 * MIB),
+        patch.object(memory_module.torch.cuda, "empty_cache", side_effect=lambda: calls.append("empty_cache")),
         patch.object(
             memory_module.torch.cuda,
-            "set_per_process_memory_fraction",
-            side_effect=lambda fraction, _device: fractions.append(fraction),
+            "mem_get_info",
+            side_effect=lambda _device: calls.append("mem_get_info") or (1000 * MIB, 4096 * MIB),
         ),
-    ):
-        ceiling = memory_module.cap_allocator_to_free_memory(device, 512 * MIB)
-
-    assert ceiling == (2400 + 1000 - 512) * MIB
-    assert fractions == [pytest.approx(ceiling / (4096 * MIB))]
-
-
-def test_free_memory_below_the_reserve_is_reported() -> None:
-    device = torch.device("cuda", 0)
-    with (
-        patch.object(memory_module.torch.cuda, "mem_get_info", return_value=(300 * MIB, 4096 * MIB)),
-        patch.object(memory_module.torch.cuda, "empty_cache"),
         patch.object(memory_module.torch.cuda, "memory_reserved", return_value=2400 * MIB),
-        patch.object(memory_module.torch.cuda, "set_per_process_memory_fraction") as setter,
     ):
-        with pytest.raises(RuntimeError, match="memory.reserve_mib"):
-            memory_module.cap_allocator_to_free_memory(device, 512 * MIB)
+        memory = memory_module.measure_accelerator_memory(device)
 
-    setter.assert_not_called()
+    assert calls == ["empty_cache", "mem_get_info"]
+    assert memory == memory_module.AcceleratorMemory(2400 * MIB, 1000 * MIB, 4096 * MIB)
+
+
+def test_cap_sets_the_fraction_of_total_memory() -> None:
+    fractions: list[float] = []
+    with patch.object(
+        memory_module.torch.cuda,
+        "set_per_process_memory_fraction",
+        side_effect=lambda fraction, _device: fractions.append(fraction),
+    ):
+        memory_module.cap_allocator(torch.device("cuda", 0), 3072 * MIB, 4096 * MIB)
+
+    assert fractions == [0.75]
+
+
+def test_reserve_is_dropped_only_when_no_chunk_would_fit_with_it() -> None:
+    # 2400 MiB weights, 100 MiB per chunk. 350 MiB free: with a 256 MiB
+    # reserve not even one chunk fits, without it three do.
+    tight = memory_module.AcceleratorMemory(reserved=2400 * MIB, free=350 * MIB, total=4096 * MIB)
+    rows, _per_row, ceiling, reduced = _rows_under_ceiling(tight, 256 * MIB, 2400 * MIB, 2500 * MIB, 2700 * MIB, 3)
+
+    assert reduced is True
+    assert ceiling == 2750 * MIB
+    assert rows == 3
+
+    roomy = memory_module.AcceleratorMemory(reserved=2400 * MIB, free=1000 * MIB, total=4096 * MIB)
+    rows, _per_row, ceiling, reduced = _rows_under_ceiling(roomy, 256 * MIB, 2400 * MIB, 2500 * MIB, 2700 * MIB, 3)
+
+    assert reduced is False
+    assert ceiling == (3400 - 256) * MIB
+    assert rows == 1 + (ceiling - 2500 * MIB) // (100 * MIB)
+
+
+def test_nothing_fits_when_even_physical_memory_is_too_small() -> None:
+    full = memory_module.AcceleratorMemory(reserved=2400 * MIB, free=50 * MIB, total=4096 * MIB)
+
+    rows, _per_row, _ceiling, _reduced = _rows_under_ceiling(full, 256 * MIB, 2400 * MIB, 2500 * MIB, 2700 * MIB, 3)
+
+    assert rows == 0
 
 
 # =============================================================================

@@ -27,16 +27,13 @@ from pathlib import Path
 from typing import Iterable
 
 from ..audio.media import inspect_media
-from ..checkpoint.bootstrap import ensure_first_run_ready
 from ..configuration.settings import Settings, load_settings
-from ..inference.budget import resolve_memory_budget
 from ..inference.offline import FileStatus, OfflineRunResult, OfflineTranscriber
 from ..inference.planning import AudioMetadata
-from ..models.parakeet import load_model
-from ..runtime.device import describe_runtime
 from ..runtime.filesystem import write_text_atomic
 from ..runtime.logging_setup import configure_run_logging
 from ..runtime.memory import peak_process_memory_bytes
+from .model_loading import prepare_inference_model
 from .reporting import ProgressReporter
 
 
@@ -300,36 +297,12 @@ def transcribe_input(input_path: Path, settings: Settings, run_id: str) -> Comma
     for path, reason in discovered.unreadable:
         print(f"Skipped unreadable file: {path.name} ({reason.splitlines()[0][:160]})")
 
-    load_started = time.perf_counter()
-    bootstrap, (model, configuration, _metadata) = ensure_first_run_ready(
-        checkpoint_dir=settings.paths.weights_dir,
-        checkpoint_settings=settings.checkpoint,
-        loader=load_model,
-        progress_callback=print,
-    )
-    load_seconds = time.perf_counter() - load_started
-    print(f"Weights: {bootstrap.action}")
-    logger.info("weights action=%s marker=%s", bootstrap.action, bootstrap.marker_path)
-
-    runtime_report = describe_runtime(
-        next(model.parameters()).device,
-        next(model.parameters()).dtype,
-    )
-    for line in runtime_report.lines():
+    def report(line: str) -> None:
         print(line)
         logger.info(line)
-    print(f"Model load seconds: {load_seconds:.3f}")
-    logger.info("model load seconds=%.3f", load_seconds)
 
-    inference_settings, memory_budget = resolve_memory_budget(
-        model,
-        configuration,
-        inference_settings,
-        settings.memory,
-    )
-    for line in memory_budget.lines():
-        print(line)
-        logger.info(line)
+    prepared = prepare_inference_model(settings, report)
+    model, configuration, inference_settings = prepared.model, prepared.configuration, prepared.inference
 
     print(f"Transcribing {len(discovered.audio)} file(s)")
     transcriber = OfflineTranscriber(model, configuration, inference_settings)

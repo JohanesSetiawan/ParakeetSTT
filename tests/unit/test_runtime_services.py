@@ -45,6 +45,9 @@ gap_silence_rms = 0.001
 recovery_start_offsets_feature_frames = []
 progress_interval_seconds = 1
 max_open_files = 4
+encoder_precision = "float16"
+cuda_graphs = true
+float32_matmul_precision = "high"
 
 [memory]
 cap_to_free_memory = true
@@ -85,6 +88,7 @@ def test_valid_file_is_normalized(tmp_path: Path) -> None:
     assert settings.inference.overlap_feature_frames == 0
     assert settings.checkpoint.request_timeout_seconds == 30.0
     assert settings.inference.max_open_files == 4
+    assert settings.inference.encoder_precision == "float16"
     assert settings.memory.cap_to_free_memory is True
     assert settings.memory.auto_batch_budget is True
     assert settings.memory.reserve_mib == 256
@@ -110,6 +114,9 @@ def test_valid_file_is_normalized(tmp_path: Path) -> None:
         ("measured_rounds = 2", "measured_rounds = 0", "measured_rounds"),
         ("warmup_rounds = 0", "warmup_rounds = -1", "warmup_rounds"),
         ("max_open_files = 4", "max_open_files = 0", "max_open_files"),
+        ('encoder_precision = "float16"', 'encoder_precision = "bfloat16"', "encoder_precision"),
+        ("cuda_graphs = true", 'cuda_graphs = "on"', "cuda_graphs"),
+        ('float32_matmul_precision = "high"', 'float32_matmul_precision = "medium"', "float32_matmul_precision"),
         ("reserve_mib = 256", "reserve_mib = -1", "reserve_mib"),
         ("auto_batch_budget = true", "auto_batch_budget = 1", "auto_batch_budget"),
         ("cap_to_free_memory = true", 'cap_to_free_memory = "yes"', "cap_to_free_memory"),

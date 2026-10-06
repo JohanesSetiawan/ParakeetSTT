@@ -29,16 +29,13 @@ from typing import Any
 
 import torch
 
-from ..checkpoint.bootstrap import ensure_first_run_ready
 from ..configuration.config import PROJECT_ROOT
 from ..configuration.settings import Settings, load_settings
-from ..inference.budget import resolve_memory_budget
 from ..inference.offline import OfflineRunResult, OfflineTranscriber
-from ..models.parakeet import load_model
-from ..runtime.device import describe_runtime
 from ..runtime.logging_setup import configure_run_logging
 from ..runtime.memory import peak_process_memory_bytes
 from .inference import discover_audio_files
+from .model_loading import prepare_inference_model
 
 
 # Literal name: under `python -m` __name__ is "__main__", outside the run log.
@@ -144,31 +141,16 @@ def run_benchmark(input_path: Path, settings: Settings, run_id: str) -> tuple[di
     )
     paths = [record.path for record in discovered.audio]
 
-    cold_started = time.perf_counter()
-    bootstrap, (model, configuration, _metadata) = ensure_first_run_ready(
-        checkpoint_dir=settings.paths.weights_dir,
-        checkpoint_settings=settings.checkpoint,
-        loader=load_model,
-        progress_callback=print,
-    )
-    cold_start_seconds = time.perf_counter() - cold_started
-    parameter = next(model.parameters())
-    runtime = describe_runtime(parameter.device, parameter.dtype)
-    # Reported now, not only in the final record, so a run that fails in a
-    # later round still shows which device and versions it ran on.
-    for line in runtime.lines():
+    def report(line: str) -> None:
         print(line)
         logger.info(line)
-    inference_settings, memory_budget = resolve_memory_budget(
-        model,
-        configuration,
-        settings.inference,
-        settings.memory,
-    )
-    for line in memory_budget.lines():
-        print(line)
-        logger.info(line)
-    transcriber = OfflineTranscriber(model, configuration, inference_settings)
+
+    # Reported as it happens, not only in the final record, so a run that
+    # fails in a later round still shows which device and versions it ran on.
+    prepared = prepare_inference_model(settings, report)
+    parameter = next(prepared.model.parameters())
+    inference_settings = prepared.inference
+    transcriber = OfflineTranscriber(prepared.model, prepared.configuration, inference_settings)
 
     def timed_round() -> tuple[OfflineRunResult, float]:
         if parameter.device.type == "cuda":
@@ -198,7 +180,9 @@ def run_benchmark(input_path: Path, settings: Settings, run_id: str) -> tuple[di
         "run_id": run_id,
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "git": git_revision(),
-        "runtime": dataclasses.asdict(runtime),
+        "runtime": dataclasses.asdict(prepared.runtime),
+        "encoder_precision": prepared.precision,
+        "graph_decoding": prepared.graph_decoding,
         "settings": {
             "inference": dataclasses.asdict(inference_settings),
             "memory": dataclasses.asdict(settings.memory),
@@ -210,8 +194,11 @@ def run_benchmark(input_path: Path, settings: Settings, run_id: str) -> tuple[di
             "audio_seconds": sum(record.duration_seconds for record in discovered.audio),
             "unreadable_files": len(discovered.unreadable),
         },
-        "cold_start": {"weights_action": bootstrap.action, "bootstrap_and_load_seconds": cold_start_seconds},
-        "memory_budget": dataclasses.asdict(memory_budget),
+        "cold_start": {
+            "weights_action": prepared.weights_action,
+            "bootstrap_and_load_seconds": prepared.load_seconds,
+        },
+        "memory_budget": dataclasses.asdict(prepared.memory_budget),
         "rounds": rounds,
         "summary": {
             "wall_seconds": summarize([entry["wall_seconds"] for entry in rounds]),
