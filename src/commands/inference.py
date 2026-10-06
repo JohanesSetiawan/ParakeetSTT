@@ -29,6 +29,7 @@ from typing import Iterable
 from ..audio.media import inspect_media
 from ..checkpoint.bootstrap import ensure_first_run_ready
 from ..configuration.settings import Settings, load_settings
+from ..inference.budget import resolve_memory_budget
 from ..inference.offline import FileStatus, OfflineRunResult, OfflineTranscriber
 from ..inference.planning import AudioMetadata
 from ..models.parakeet import load_model
@@ -319,6 +320,16 @@ def transcribe_input(input_path: Path, settings: Settings, run_id: str) -> Comma
         logger.info(line)
     print(f"Model load seconds: {load_seconds:.3f}")
     logger.info("model load seconds=%.3f", load_seconds)
+
+    inference_settings, memory_budget = resolve_memory_budget(
+        model,
+        configuration,
+        inference_settings,
+        settings.memory,
+    )
+    for line in memory_budget.lines():
+        print(line)
+        logger.info(line)
 
     print(f"Transcribing {len(discovered.audio)} file(s)")
     transcriber = OfflineTranscriber(model, configuration, inference_settings)

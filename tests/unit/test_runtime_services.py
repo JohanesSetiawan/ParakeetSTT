@@ -44,6 +44,12 @@ untranscribed_gap_seconds = 4.0
 gap_silence_rms = 0.001
 recovery_start_offsets_feature_frames = []
 progress_interval_seconds = 1
+max_open_files = 4
+
+[memory]
+cap_to_free_memory = true
+auto_batch_budget = true
+reserve_mib = 256
 
 [benchmark]
 warmup_rounds = 0
@@ -78,6 +84,10 @@ def test_valid_file_is_normalized(tmp_path: Path) -> None:
     assert settings.inference.audio_extensions == (".wav", ".mp3")
     assert settings.inference.overlap_feature_frames == 0
     assert settings.checkpoint.request_timeout_seconds == 30.0
+    assert settings.inference.max_open_files == 4
+    assert settings.memory.cap_to_free_memory is True
+    assert settings.memory.auto_batch_budget is True
+    assert settings.memory.reserve_mib == 256
 
 
 @pytest.mark.parametrize(
@@ -99,6 +109,10 @@ def test_valid_file_is_normalized(tmp_path: Path) -> None:
         ("untranscribed_gap_seconds = 4.0", "untranscribed_gap_seconds = 0", "untranscribed_gap_seconds"),
         ("measured_rounds = 2", "measured_rounds = 0", "measured_rounds"),
         ("warmup_rounds = 0", "warmup_rounds = -1", "warmup_rounds"),
+        ("max_open_files = 4", "max_open_files = 0", "max_open_files"),
+        ("reserve_mib = 256", "reserve_mib = -1", "reserve_mib"),
+        ("auto_batch_budget = true", "auto_batch_budget = 1", "auto_batch_budget"),
+        ("cap_to_free_memory = true", 'cap_to_free_memory = "yes"', "cap_to_free_memory"),
     ],
 )
 def test_invalid_values_name_the_offending_key(tmp_path: Path, old: str, new: str, message: str) -> None:
@@ -106,7 +120,7 @@ def test_invalid_values_name_the_offending_key(tmp_path: Path, old: str, new: st
         load_toml(tmp_path, VALID_TOML.replace(old, new))
 
 
-@pytest.mark.parametrize("section", ["paths", "logging", "checkpoint", "inference", "benchmark"])
+@pytest.mark.parametrize("section", ["paths", "logging", "checkpoint", "inference", "memory", "benchmark"])
 def test_every_section_is_required(tmp_path: Path, section: str) -> None:
     with pytest.raises(ValueError, match=rf"\[{section}\]"):
         load_toml(tmp_path, VALID_TOML.replace(f"[{section}]", "[renamed]"))

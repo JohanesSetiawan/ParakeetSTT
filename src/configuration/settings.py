@@ -69,6 +69,16 @@ class InferenceSettings:
     gap_silence_rms: float
     recovery_start_offsets_feature_frames: tuple[int, ...]
     progress_interval_seconds: float
+    max_open_files: int
+
+
+@dataclass(frozen=True)
+class MemorySettings:
+    """Accelerator memory policy: spill protection and the automatic batch budget."""
+
+    cap_to_free_memory: bool
+    auto_batch_budget: bool
+    reserve_mib: int
 
 
 @dataclass(frozen=True)
@@ -87,6 +97,7 @@ class Settings:
     logging: LoggingSettings
     checkpoint: CheckpointSettings
     inference: InferenceSettings
+    memory: MemorySettings
     benchmark: BenchmarkSettings
 
 
@@ -274,6 +285,16 @@ def _parse_inference(document: dict[str, Any]) -> InferenceSettings:
         gap_silence_rms=_number(section, "inference", "gap_silence_rms", minimum=0.0),
         recovery_start_offsets_feature_frames=tuple(raw_offsets),
         progress_interval_seconds=progress_interval,
+        max_open_files=_integer(section, "inference", "max_open_files", minimum=1),
+    )
+
+
+def _parse_memory(document: dict[str, Any]) -> MemorySettings:
+    section = _section(document, "memory")
+    return MemorySettings(
+        cap_to_free_memory=_boolean(section, "memory", "cap_to_free_memory"),
+        auto_batch_budget=_boolean(section, "memory", "auto_batch_budget"),
+        reserve_mib=_integer(section, "memory", "reserve_mib", minimum=0),
     )
 
 
@@ -321,5 +342,6 @@ def load_settings(
         logging=_parse_logging(document),
         checkpoint=_parse_checkpoint(document),
         inference=_parse_inference(document),
+        memory=_parse_memory(document),
         benchmark=_parse_benchmark(document),
     )

@@ -216,6 +216,27 @@ def test_model_pth_round_trip_is_strict_and_fully_materialized(tmp_path: Path) -
     assert not loaded.training
 
 
+def test_checkpoint_is_memory_mapped_and_loaded_safely(tmp_path: Path) -> None:
+    """mmap keeps the 2.4 GB checkpoint out of private memory; weights_only blocks pickled code."""
+
+    source = build_tiny_model(tmp_path)
+    torch.save({"state_dict": source.state_dict(), "config": {}, "metadata": {}}, tmp_path / "model.pth")
+    calls: list[dict] = []
+    real_load = torch.load
+
+    def spying_load(*args, **kwargs):
+        calls.append(kwargs)
+        return real_load(*args, **kwargs)
+
+    with patch.object(torch, "load", spying_load):
+        load_model(tmp_path, device=CPU)
+
+    assert len(calls) == 1
+    assert calls[0]["mmap"] is True
+    assert calls[0]["weights_only"] is True
+    assert calls[0]["map_location"] == "cpu"
+
+
 def test_missing_state_dict_key_is_rejected(tmp_path: Path) -> None:
     state_dict = build_tiny_model(tmp_path).state_dict()
     state_dict.pop("joint.head.weight")

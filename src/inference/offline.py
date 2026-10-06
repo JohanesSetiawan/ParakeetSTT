@@ -303,6 +303,7 @@ class OfflineTranscriber:
             batch_size=self.settings.batch_size,
             max_batch_feature_frames=self.settings.max_batch_feature_frames,
             max_padding_fraction=self.settings.max_padding_fraction,
+            max_open_files=self.settings.max_open_files,
         )
 
     # -------------------------------------------------------------------------
@@ -373,7 +374,8 @@ class OfflineTranscriber:
             f"{[f'{item.path.name}#{item.chunk_index}' for item in items]}; "
             f"device={self.device}, feature_frames={[item.feature_frames for item in items]}, "
             f"memory={memory}. No fallback or retry was attempted; lower "
-            "inference.max_batch_feature_frames or inference.max_chunk_feature_frames."
+            "inference.max_batch_feature_frames or inference.max_chunk_feature_frames, "
+            "or raise memory.reserve_mib so the automatic budget leaves more room."
         )
         logger.error(message)
         return RuntimeError(message)

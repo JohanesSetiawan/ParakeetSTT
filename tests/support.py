@@ -22,6 +22,7 @@ import struct
 from dataclasses import dataclass
 from pathlib import Path
 
+import numpy as np
 import torch
 from torch import nn
 
@@ -165,6 +166,7 @@ def inference_settings(**overrides: object) -> InferenceSettings:
         "gap_silence_rms": 0.001,
         "recovery_start_offsets_feature_frames": (),
         "progress_interval_seconds": 0.0,
+        "max_open_files": 8,
     }
     values.update(overrides)
     return InferenceSettings(**values)  # type: ignore[arg-type]
@@ -249,18 +251,28 @@ def normalize_words(text: str) -> list[str]:
 
 
 def word_errors(reference: list[str], hypothesis: list[str]) -> int:
-    """Return substitutions + deletions + insertions (Levenshtein on words)."""
+    """
+    Return substitutions + deletions + insertions (Levenshtein on words).
 
-    previous_row = list(range(len(hypothesis) + 1))
+    One numpy row per reference word, so hour-long transcripts (tens of
+    thousands of words) score in seconds instead of minutes.
+    """
+
+    vocabulary = {word: index for index, word in enumerate(set(reference) | set(hypothesis))}
+    hypothesis_ids = np.array([vocabulary[word] for word in hypothesis], dtype=np.int64)
+    columns = np.arange(len(hypothesis) + 1, dtype=np.int64)
+    previous_row = columns.copy()
     for reference_index, reference_word in enumerate(reference, start=1):
-        current_row = [reference_index] + [0] * len(hypothesis)
-        for hypothesis_index, hypothesis_word in enumerate(hypothesis, start=1):
-            substitution = previous_row[hypothesis_index - 1] + (reference_word != hypothesis_word)
-            deletion = previous_row[hypothesis_index] + 1
-            insertion = current_row[hypothesis_index - 1] + 1
-            current_row[hypothesis_index] = min(substitution, deletion, insertion)
+        substitution = previous_row[:-1] + (hypothesis_ids != vocabulary[reference_word])
+        deletion = previous_row[1:] + 1
+        current_row = np.empty_like(previous_row)
+        current_row[0] = reference_index
+        current_row[1:] = np.minimum(substitution, deletion)
+        # Insertions chain left to right: current[j] = min(current[j],
+        # current[j - 1] + 1), which is a running minimum of current[j] - j.
+        current_row = np.minimum.accumulate(current_row - columns) + columns
         previous_row = current_row
-    return previous_row[-1]
+    return int(previous_row[-1])
 
 
 def word_error_rate(references: list[str], hypotheses: list[str]) -> float:
@@ -273,6 +285,26 @@ def word_error_rate(references: list[str], hypotheses: list[str]) -> float:
         total_errors += word_errors(reference_words, normalize_words(hypothesis))
         total_words += len(reference_words)
     return total_errors / total_words
+
+
+def load_reference_transcripts(path: Path) -> dict[str, str]:
+    """
+    Read ``<file name><tab or spaces><reference text>`` lines.
+
+    With tabs, the second column is the reference and any further columns
+    (normalized text, sample counts, speaker data) are ignored.
+    """
+
+    references: dict[str, str] = {}
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        if not line.strip():
+            continue
+        if "	" in line:
+            name, text = line.split("	")[:2]
+        else:
+            name, text = line.split(None, 1)
+        references[name.strip()] = text.strip()
+    return references
 
 
 # =============================================================================

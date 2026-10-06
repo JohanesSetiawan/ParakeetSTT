@@ -10,7 +10,7 @@ from unittest.mock import patch
 import torch
 
 from src.checkpoint.bootstrap import BootstrapResult
-from src.commands.benchmark import run_benchmark, summarize
+from src.commands.benchmark import format_optional, round_record, run_benchmark, summarize
 from src.configuration.settings import BenchmarkSettings, load_settings
 from src.runtime.memory import peak_process_memory_bytes
 from support import SteadySpeechModel, inference_settings, write_float_wav
@@ -27,6 +27,29 @@ def test_summary_statistics() -> None:
 
     assert summary == {"mean": 2.0, "min": 1.0, "max": 3.0, "stdev": 1.0}
     assert summarize([4.0])["stdev"] == 0.0
+
+
+def test_round_without_audio_reports_no_real_time_factor() -> None:
+    """A ratio over zero audio seconds is not invented, and printing it does not crash."""
+
+    from types import SimpleNamespace
+
+    empty_round = SimpleNamespace(
+        total_audio_seconds=0.0,
+        media_decode_seconds=0.0,
+        feature_seconds=0.0,
+        generation_seconds=0.0,
+        recovery_seconds=0.0,
+        plan=SimpleNamespace(items=(), batches=()),
+        peak_memory={},
+        files=(),
+    )
+
+    record = round_record(empty_round, wall_seconds=0.5)
+
+    assert record["real_time_factor"] is None
+    assert format_optional(record["real_time_factor"], 5) == "not available"
+    assert format_optional(0.0123456, 5) == "0.01235"
 
 
 def test_benchmark_warms_up_measures_and_appends_one_json_line(tmp_path: Path, tiny_configuration) -> None:

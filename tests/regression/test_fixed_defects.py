@@ -61,6 +61,7 @@ def sequential_chunks(path: Path, max_chunk: int, overlap: int):
         batch_size=4,
         max_batch_feature_frames=4 * max_chunk,
         max_padding_fraction=1.0,
+        max_open_files=8,
     )
     results = []
     with open_media_session(path) as session:
@@ -174,6 +175,7 @@ def test_chunk_at_exact_budget_boundary_is_not_one_frame_over(cores: int) -> Non
         batch_size=8,
         max_batch_feature_frames=3000,
         max_padding_fraction=0.25,
+        max_open_files=8,
     )
 
     assert max(item.feature_frames for item in plan.items) <= max_chunk
@@ -439,6 +441,7 @@ def test_batch_budget_counts_padded_frames() -> None:
         batch_size=8,
         max_batch_feature_frames=3000,
         max_padding_fraction=0.5,
+        max_open_files=8,
     )
 
     assert [item.feature_frames for item in plan.items] == [1333, 1000, 667]
@@ -649,3 +652,95 @@ def test_empty_ffmpeg_output_is_an_empty_waveform_not_a_crash() -> None:
 
     assert _float32_samples(b"").numel() == 0
     assert _float32_samples(bytes(8)).tolist() == [0.0, 0.0]
+
+
+# =============================================================================
+# Fixed after the review of PR #5 (fix/runtime-memory-safety)
+# =============================================================================
+
+
+def test_active_row_emitting_the_pad_token_keeps_its_last_step(tmp_path: Path) -> None:
+    """
+    The trailing-column trim treated a column of pad tokens as post-completion
+    padding, but pad is a valid joint output: a row that emitted it on its
+    last step lost that step's duration and frames.
+    """
+
+    model = ParakeetTDT(load_config(write_tiny_checkpoint(tmp_path))).eval()
+    extractor = ParakeetFeatureExtractor(model.configuration)
+    features, mask = extractor([torch.randn(16000) * 0.1], [TARGET_RATE], CPU)
+    pad_id = model.configuration.pad_token_id
+    duration_count = len(model.configuration.durations)
+
+    def always_pad(decoder_hidden_states: torch.Tensor, encoder_hidden_states: torch.Tensor) -> torch.Tensor:
+        logits = torch.full((decoder_hidden_states.shape[0], 1, TINY_VOCAB_SIZE + duration_count), -1e4)
+        logits[..., pad_id] = 1e4
+        logits[..., TINY_VOCAB_SIZE + 1] = 1e4  # duration class 1: one frame
+        return logits
+
+    with patch.object(model.joint, "forward", always_pad):
+        result = model.generate(features, mask)
+
+    encoder_length = int(result.encoder_lengths[0])
+    assert result.sequences.shape[1] == 1 + encoder_length
+    assert int(result.durations[0].sum()) == encoder_length
+    assert int(result.frame_ends[0, -1]) == encoder_length
+
+
+def test_long_files_never_hold_more_decoders_than_the_limit(tmp_path: Path) -> None:
+    """
+    Round-robin started every multi-chunk file before any finished, so a
+    folder of hundreds of long files held hundreds of decoders at once (file
+    handles, or one ffmpeg process each for M4A/AAC).
+    """
+
+    open_sessions: list[object] = []
+    peak = [0]
+    original_open = offline_module.open_media_session
+
+    def tracking_open(path: Path):
+        session = original_open(path)
+        original_close = session.close
+        open_sessions.append(session)
+        peak[0] = max(peak[0], len(open_sessions))
+
+        def tracking_close() -> None:
+            if session in open_sessions:
+                open_sessions.remove(session)
+            original_close()
+
+        session.close = tracking_close
+        return session
+
+    paths = []
+    for index in range(7):
+        path = tmp_path / f"long_{index}.wav"
+        # 2.5 s at max_chunk 100 frames (1 s) gives three chunks per file.
+        write_float_wav(path, torch.full((40_000,), 0.1), TARGET_RATE)
+        paths.append(path)
+    transcriber = OfflineTranscriber(
+        ScriptedModel(3).eval(),
+        load_config(write_tiny_checkpoint(tmp_path / "checkpoint")),
+        inference_settings(batch_size=4, max_batch_feature_frames=400, max_open_files=2),
+    )
+    with patch.object(offline_module, "open_media_session", tracking_open):
+        result = transcriber.transcribe(paths)
+
+    assert len(result.files) == 7
+    assert all(len(file_result.chunks) >= 3 for file_result in result.files)
+    assert peak[0] == 2
+    assert open_sessions == []
+
+
+def test_ffmpeg_stream_start_failure_names_the_file(tmp_path: Path) -> None:
+    """Popen errors escaped as a bare OSError, unlike the one-off decode's ValueError."""
+
+    from src.audio import media
+
+    path = tmp_path / "clip.m4a"
+    path.write_bytes(b"not decoded in this test")
+    with patch.object(media, "_codec_binary", return_value="ffmpeg"), patch.object(
+        media.subprocess, "Popen", side_effect=PermissionError(errno.EACCES, "denied")
+    ):
+        with pytest.raises(ValueError, match="clip.m4a"):
+            media._FfmpegStream(path, TARGET_RATE)

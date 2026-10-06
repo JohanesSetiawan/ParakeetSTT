@@ -38,6 +38,7 @@ def read_plan_sequentially_and_fresh(path: Path, max_chunk: int, overlap: int):
         batch_size=4,
         max_batch_feature_frames=4 * max_chunk,
         max_padding_fraction=1.0,
+        max_open_files=8,
     )
     pairs = []
     with open_media_session(path) as sequential, open_media_session(path) as fresh:

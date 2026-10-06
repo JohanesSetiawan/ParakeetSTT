@@ -271,6 +271,42 @@ def _build_decoded_segment(
 # =============================================================================
 
 
+def _require_ffmpeg() -> str:
+    """Resolve the FFmpeg executable or explain how to provide one."""
+
+    executable = _codec_binary("FFMPEG_BINARY", "ffmpeg")
+    if executable is None:
+        raise CodecUnavailableError(
+            "The media format is not supported by soundfile/libsndfile and "
+            "ffmpeg was not found in PATH. Set FFMPEG_BINARY externally."
+        )
+    return executable
+
+
+def _ffmpeg_decode_command(
+    executable: str,
+    path: Path,
+    target_sample_rate: int,
+    start_seconds: float | None = None,
+    duration_seconds: float | None = None,
+) -> list[str]:
+    """
+    FFmpeg arguments that decode the first audio stream to mono float32.
+
+    The one-off segment decode and the persistent stream share this command,
+    so both paths always downmix, resample, and encode the same way.
+    """
+
+    command = [executable, "-v", "error", "-nostdin"]
+    if start_seconds is not None:
+        command += ["-ss", f"{start_seconds:.9f}"]
+    command += ["-i", str(path), "-map", "0:a:0", "-vn", "-sn", "-dn"]
+    if duration_seconds is not None:
+        command += ["-t", f"{duration_seconds:.9f}"]
+    command += ["-ac", "1", "-ar", str(target_sample_rate), "-f", "f32le", "pipe:1"]
+    return command
+
+
 def _float32_samples(payload: bytes) -> torch.Tensor:
     """
     Interpret raw little-endian float32 bytes from FFmpeg as a 1-D tensor.
@@ -292,38 +328,14 @@ def _read_ffmpeg_segment(
 ) -> DecodedSegment:
     """Decode one bounded mono segment through the FFmpeg fallback gateway."""
 
-    executable = _codec_binary("FFMPEG_BINARY", "ffmpeg")
-    if executable is None:
-        raise CodecUnavailableError(
-            "The media format is not supported by soundfile/libsndfile and "
-            "ffmpeg was not found in PATH. Set FFMPEG_BINARY externally."
-        )
-
     target_frames = target_end_frame - target_start_frame
-    command = [
-        executable,
-        "-v",
-        "error",
-        "-nostdin",
-        "-ss",
-        f"{target_start_frame / target_sample_rate:.9f}",
-        "-i",
-        str(path),
-        "-map",
-        "0:a:0",
-        "-vn",
-        "-sn",
-        "-dn",
-        "-t",
-        f"{target_frames / target_sample_rate:.9f}",
-        "-ac",
-        "1",
-        "-ar",
-        str(target_sample_rate),
-        "-f",
-        "f32le",
-        "pipe:1",
-    ]
+    command = _ffmpeg_decode_command(
+        _require_ffmpeg(),
+        path,
+        target_sample_rate,
+        start_seconds=target_start_frame / target_sample_rate,
+        duration_seconds=target_frames / target_sample_rate,
+    )
     try:
         completed = subprocess.run(command, check=True, capture_output=True)
     except (OSError, subprocess.CalledProcessError) as error:
@@ -366,40 +378,20 @@ class _FfmpegStream:
     STDERR_LINES_KEPT = 20
 
     def __init__(self, path: Path, target_sample_rate: int) -> None:
-        executable = _codec_binary("FFMPEG_BINARY", "ffmpeg")
-        if executable is None:
-            raise CodecUnavailableError(
-                "The media format is not supported by soundfile/libsndfile and "
-                "ffmpeg was not found in PATH. Set FFMPEG_BINARY externally."
-            )
+        command = _ffmpeg_decode_command(_require_ffmpeg(), path, target_sample_rate)
         self.path = path
         self.position = 0
         self.exhausted = False
         self._stderr_tail: deque[str] = deque(maxlen=self.STDERR_LINES_KEPT)
-        self._process = subprocess.Popen(
-            [
-                executable,
-                "-v",
-                "error",
-                "-nostdin",
-                "-i",
-                str(path),
-                "-map",
-                "0:a:0",
-                "-vn",
-                "-sn",
-                "-dn",
-                "-ac",
-                "1",
-                "-ar",
-                str(target_sample_rate),
-                "-f",
-                "f32le",
-                "pipe:1",
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
+        try:
+            self._process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+        except OSError as error:
+            # Same contract as the one-off decode: a per-file decode failure.
+            raise ValueError(f"FFmpeg could not start decoding {path}: {error}") from error
         # Drain stderr on a thread: a full stderr pipe would block FFmpeg and,
         # through the stdout reads below, this process too.
         self._stderr_thread = threading.Thread(target=self._drain_stderr, daemon=True)
@@ -452,18 +444,27 @@ class _FfmpegStream:
 
         self.exhausted = True
         return_code = self._process.wait()
-        self._stderr_thread.join(timeout=5)
+        # The process has exited, so stderr is at EOF and the drain thread
+        # ends promptly; joining here makes the error tail below complete.
+        self._stderr_thread.join()
         if return_code != 0:
             detail = " | ".join(self._stderr_tail) or "no error output"
             raise ValueError(f"FFmpeg failed while decoding {self.path} (exit {return_code}): {detail}")
 
     def close(self) -> None:
+        """Stop FFmpeg and release its pipes and the stderr thread."""
+
         if self._process.poll() is None:
             self._process.kill()
         self._process.wait()
-        for pipe in (self._process.stdout, self._process.stderr):
-            if pipe is not None:
-                pipe.close()
+        # Closing stdout first lets a killed FFmpeg's pipes drain; the stderr
+        # thread is joined before its pipe is closed so it never reads from a
+        # closed file.
+        if self._process.stdout is not None:
+            self._process.stdout.close()
+        self._stderr_thread.join()
+        if self._process.stderr is not None:
+            self._process.stderr.close()
 
 
 # =============================================================================
@@ -707,7 +708,9 @@ class MediaSession:
         when the request lies behind the stream (never for in-order chunks).
         """
 
-        new_start_frame = source_start_frame + max(0, reusable_frames)
+        # Same clamp as the soundfile path: an overlap reaching past this
+        # chunk's end leaves nothing new to read.
+        new_start_frame = min(source_start_frame + max(0, reusable_frames), source_end_frame)
         if self._stream is None:
             self._stream = _FfmpegStream(self.path, target_sample_rate)
 

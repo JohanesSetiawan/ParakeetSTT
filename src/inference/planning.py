@@ -131,21 +131,51 @@ def _padding_fraction(items: Iterable[WorkItem]) -> float:
     return (capacity - used) / capacity
 
 
-def _schedule_round_robin(items: Iterable[WorkItem]) -> list[WorkItem]:
-    """Interleave file queues so long files cannot monopolize the scheduler."""
+def _schedule_round_robin(items: Iterable[WorkItem], max_open_files: int) -> list[WorkItem]:
+    """
+    Interleave file queues so long files cannot monopolize the scheduler.
+
+    A multi-chunk file keeps its decoder open (a file handle, or an ffmpeg
+    process) and its overlap tail from its first chunk to its last, so at most
+    ``max_open_files`` of them are in rotation at once; the next one joins when
+    one finishes. Single-chunk files open and close within their own batch and
+    are never held back, so short files still go ahead of long ones. With no
+    more than ``max_open_files`` multi-chunk files this is plain round-robin.
+    """
+
+    if max_open_files < 1:
+        raise ValueError("max_open_files must be at least 1")
 
     queues: dict[int, deque[WorkItem]] = {}
     for item in items:
         queues.setdefault(item.file_index, deque()).append(item)
 
+    # Files with more than one chunk, the only ones that hold a decoder open
+    # between batches.
+    long_files = {file_index for file_index, queue in queues.items() if len(queue) > 1}
+
+    rotation: deque[int] = deque()
+    waiting_long_files: deque[int] = deque()
+    admitted_long_files = 0
+    for file_index in sorted(queues):
+        if file_index not in long_files:
+            rotation.append(file_index)
+        elif admitted_long_files < max_open_files:
+            rotation.append(file_index)
+            admitted_long_files += 1
+        else:
+            waiting_long_files.append(file_index)
+
     scheduled: list[WorkItem] = []
-    active_queues = deque(sorted(queues))
-    while active_queues:
-        file_index = active_queues.popleft()
+    while rotation:
+        file_index = rotation.popleft()
         queue = queues[file_index]
         scheduled.append(queue.popleft())
         if queue:
-            active_queues.append(file_index)
+            rotation.append(file_index)
+        elif file_index in long_files and waiting_long_files:
+            # A long file finished and released its decoder: admit the next.
+            rotation.append(waiting_long_files.popleft())
     return scheduled
 
 
@@ -211,6 +241,7 @@ def build_execution_plan(
     batch_size: int,
     max_batch_feature_frames: int,
     max_padding_fraction: float,
+    max_open_files: int,
 ) -> ExecutionPlan:
     """
     Create an automatic cost-aware plan without a duration cutoff.
@@ -218,7 +249,8 @@ def build_execution_plan(
     Each file is cut into chunks whose STFT tensor never exceeds
     ``max_chunk_feature_frames``: a core interval the chunk owns, plus up to
     ``overlap_feature_frames`` of context on each side that it does not own.
-    Chunks from all files are interleaved round-robin and packed into
+    Chunks are interleaved round-robin across files, with at most
+    ``max_open_files`` multi-chunk files in progress at once, and packed into
     micro-batches bounded by count, total frames, and padding fraction.
     """
 
@@ -265,7 +297,7 @@ def build_execution_plan(
                 )
             )
 
-    scheduled = _schedule_round_robin(items)
+    scheduled = _schedule_round_robin(items, max_open_files)
     batches = _batch_items(
         scheduled,
         batch_size,

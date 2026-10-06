@@ -1,15 +1,17 @@
 """
-Peak process memory, measured with the standard library only.
+Process and accelerator memory: peak host memory and the GPU allocator cap.
 
-Reported next to accelerator memory so a run's host footprint (decoded audio,
-model staging, Python objects) is visible too. psutil is not a dependency, so
-each platform's own counter is read directly.
+Peak process memory is reported next to accelerator memory so a run's host
+footprint (decoded audio, model staging, Python objects) is visible too.
+psutil is not a dependency, so each platform's own counter is read directly.
 """
 
 from __future__ import annotations
 
 import ctypes
 import sys
+
+import torch
 
 
 def peak_process_memory_bytes() -> int | None:
@@ -59,3 +61,46 @@ def _windows_peak_working_set() -> int | None:
     if not get_info(get_process(), ctypes.byref(counters), counters.cb):
         return None
     return int(counters.PeakWorkingSetSize)
+
+
+# =============================================================================
+# Accelerator memory ceiling
+# =============================================================================
+
+
+def cap_allocator_to_free_memory(device: torch.device, reserve_bytes: int) -> int:
+    """
+    Limit PyTorch's CUDA allocator to the memory that is free right now.
+
+    On Windows (WDDM) the driver backs allocations that do not fit in VRAM
+    with shared system memory instead of failing, and the run silently
+    becomes several times slower. Capping the allocator at the reserved
+    memory plus the currently free VRAM, minus ``reserve_bytes`` for the CUDA
+    context, library workspaces, and other programs, turns that into an
+    out-of-memory error the runtime reports.
+
+    Args:
+        device: A CUDA device.
+        reserve_bytes: VRAM to leave outside the cap.
+
+    Returns:
+        The ceiling in bytes that PyTorch may now reserve on ``device``.
+
+    Raises:
+        RuntimeError: If the free memory does not exceed the reserve.
+    """
+
+    # Cached but unused blocks count as used in mem_get_info; return them first
+    # so "free" is what the driver can really hand out.
+    torch.cuda.empty_cache()
+    free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+    reserved_bytes = torch.cuda.memory_reserved(device)
+    ceiling_bytes = reserved_bytes + free_bytes - reserve_bytes
+    if ceiling_bytes <= reserved_bytes:
+        raise RuntimeError(
+            f"Only {free_bytes / 2**20:.0f} MiB of accelerator memory is free, which does "
+            f"not exceed memory.reserve_mib ({reserve_bytes / 2**20:.0f} MiB). Close other "
+            "programs that use the GPU or lower memory.reserve_mib."
+        )
+    torch.cuda.set_per_process_memory_fraction(ceiling_bytes / total_bytes, device)
+    return ceiling_bytes

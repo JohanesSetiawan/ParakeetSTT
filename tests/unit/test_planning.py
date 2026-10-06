@@ -27,6 +27,7 @@ def make_plan(
     batch_size: int = 4,
     max_batch: int | None = None,
     padding: float = 0.5,
+    max_open_files: int = 8,
 ) -> ExecutionPlan:
     metadata = tuple(
         AudioMetadata(Path(f"file_{index}.wav"), SAMPLE_RATE, 1, frames, "WAV")
@@ -41,6 +42,7 @@ def make_plan(
         batch_size=batch_size,
         max_batch_feature_frames=max_batch or 2 * max_chunk,
         max_padding_fraction=padding,
+        max_open_files=max_open_files,
     )
 
 
@@ -125,3 +127,70 @@ def test_overlap_must_leave_room_for_a_core() -> None:
 def test_item_larger_than_batch_budget_is_rejected() -> None:
     with pytest.raises(ValueError, match="exceeding batch limit"):
         make_plan([100_000], max_chunk=500, overlap=0, max_batch=400)
+
+
+# =============================================================================
+# Bounded round-robin (open decoder limit)
+# =============================================================================
+
+
+def open_long_files_over_time(plan: ExecutionPlan) -> list[int]:
+    """Multi-chunk files started but not finished, after each scheduled item."""
+
+    chunk_counts: dict[int, int] = {}
+    for item in plan.items:
+        chunk_counts[item.file_index] = chunk_counts.get(item.file_index, 0) + 1
+
+    seen: dict[int, int] = {}
+    in_progress: set[int] = set()
+    history = []
+    for item in plan.items:
+        seen[item.file_index] = seen.get(item.file_index, 0) + 1
+        if chunk_counts[item.file_index] > 1:
+            in_progress.add(item.file_index)
+        if seen[item.file_index] == chunk_counts[item.file_index]:
+            in_progress.discard(item.file_index)
+        history.append(len(in_progress))
+    return history
+
+
+@pytest.mark.parametrize(("seed", "limit"), [(0, 1), (1, 2), (2, 3), (3, 5)])
+def test_no_more_long_files_than_the_limit_are_open_at_once(seed: int, limit: int) -> None:
+    generator = random.Random(seed)
+    # A mix of single-chunk files (under 5 s) and long files (up to 3 minutes).
+    frames = [generator.choice([16_000 * 2, 16_000 * generator.randint(20, 180)]) for _ in range(30)]
+    plan = make_plan(frames, max_chunk=500, overlap=10, batch_size=4, max_batch=2000, max_open_files=limit)
+
+    assert max(open_long_files_over_time(plan)) <= limit
+    # Every chunk is still scheduled exactly once and each file stays in order.
+    assert len({(item.file_index, item.chunk_index) for item in plan.items}) == len(plan.items)
+    for file_index in set(item.file_index for item in plan.items):
+        chunk_order = [item.chunk_index for item in plan.items if item.file_index == file_index]
+        assert chunk_order == sorted(chunk_order)
+
+
+def test_short_files_are_not_held_back_by_waiting_long_files() -> None:
+    # Files 0-2 are long, 3-5 short; with one open long file allowed, the short
+    # files must still be scheduled before the second long file starts.
+    frames = [16_000 * 60] * 3 + [16_000 * 2] * 3
+    plan = make_plan(frames, max_chunk=500, overlap=10, batch_size=4, max_batch=2000, max_open_files=1)
+
+    order = [item.file_index for item in plan.items]
+    first_of_file_1 = order.index(1)
+    assert all(order.index(short_file) < first_of_file_1 for short_file in (3, 4, 5))
+
+
+def test_within_the_limit_the_schedule_is_plain_round_robin() -> None:
+    frames = [16_000 * 30, 16_000 * 2, 16_000 * 45]
+    bounded = make_plan(frames, max_chunk=500, overlap=10, max_open_files=2)
+    unbounded = make_plan(frames, max_chunk=500, overlap=10, max_open_files=100)
+
+    assert [(item.file_index, item.chunk_index) for item in bounded.items] == [
+        (item.file_index, item.chunk_index) for item in unbounded.items
+    ]
+    assert [item.file_index for item in bounded.items[:3]] == [0, 1, 2]
+
+
+def test_open_file_limit_must_be_positive() -> None:
+    with pytest.raises(ValueError, match="max_open_files"):
+        make_plan([16_000 * 30], max_chunk=500, overlap=10, max_open_files=0)

@@ -43,6 +43,24 @@ gap_silence_rms = 0.001
 recovery_start_offsets_feature_frames = [-25, 25, -50, 50]
 # Minimum wall-clock gap between two terminal progress lines.
 progress_interval_seconds = 2.0
+# Most multi-chunk files decoded at the same time. Each one holds an open
+# decoder (a file handle, or an ffmpeg process for formats libsndfile cannot
+# read) and its overlap tail until its last chunk, so a folder of hundreds of
+# long files must not open them all at once. Single-chunk files do not count.
+max_open_files = 8
+
+[memory]
+# GPU only (ignored on CPU and MPS). After the model loads, PyTorch is capped
+# to the VRAM that is actually free minus reserve_mib. On Windows an
+# over-allocation would otherwise spill silently into shared system memory and
+# run several times slower instead of failing.
+cap_to_free_memory = true
+# Measure the memory of one and of three full chunks after loading and lower
+# inference.max_batch_feature_frames, when needed, to what fits under that
+# cap. The configured value stays the upper limit; it is never raised.
+auto_batch_budget = true
+# VRAM kept free for the CUDA context, library workspaces, and other programs.
+reserve_mib = 512
 
 [benchmark]
 # Development benchmark: rounds run and discarded before measuring (CUDA
