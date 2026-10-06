@@ -460,19 +460,23 @@ def load_model(
     with torch.device("meta"):
         model = ParakeetTDT(configuration)
 
+    resolved_device = device or select_device()
+
     # weights_only=True refuses arbitrary pickled objects, so a replaced or
     # tampered model.pth cannot execute code during load.
     #
-    # mmap=True maps the file instead of copying 2.4 GB into private memory.
-    # Copied tensors stayed resident after the move to the GPU (3.1 GB
-    # working set, 8.2 GB commit charge measured); mapped pages belong to the
-    # file and are released with the CPU tensors (0.7 GB working set, 4.1 GB
-    # commit), at the same load time.
+    # For an accelerator, mmap=True maps the file instead of copying 2.4 GB
+    # into private memory: copied tensors stayed resident after the move to
+    # the GPU (3.1 GB working set, 8.2 GB commit charge measured), while
+    # mapped pages are released with the CPU tensors (0.7 GB, 4.1 GB), at the
+    # same load time. On the CPU the loaded tensors are the model itself, so
+    # a mapping would stay open for the life of the process and, on Windows,
+    # block replacing or repairing the checkpoint file; copy instead.
     checkpoint = torch.load(
         checkpoint_file or configuration.checkpoint_path,
         map_location="cpu",
         weights_only=True,
-        mmap=True,
+        mmap=resolved_device.type != "cpu",
     )
     if not isinstance(checkpoint, dict) or "state_dict" not in checkpoint:
         raise ValueError("model.pth must contain a dictionary with state_dict")
@@ -498,7 +502,6 @@ def load_model(
             )
         model.set_encoder_dtype(encoder_dtype)
 
-    resolved_device = device or select_device()
     model = model.to(resolved_device)
     model.eval()
 

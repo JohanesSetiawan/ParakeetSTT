@@ -11,7 +11,7 @@ worker running instead and pay the startup once.
 
 Protocol: JSON Lines over standard input and output, one object per line.
 
-Requests (stdin)::
+Requests (stdin, UTF-8)::
 
     {"path": "C:/audio/clip.wav", "id": "anything"}
 
@@ -26,11 +26,16 @@ Responses (stdout), in order:
   "duration_seconds", "processing_seconds", "id"}`` per file, including
   unreadable files with ``status`` "unreadable" and an ``error``;
 * ``{"event": "done", "id", "files", "wall_seconds"}`` after each request;
-* ``{"event": "error", "id", "error"}`` when a request cannot be served.
+* ``{"event": "error", "id", "error"}`` when a request cannot be served
+  (not UTF-8, not a JSON object with a string ``path``, a path that does not
+  exist, an out-of-memory batch).
 
-Startup messages go to standard error, so standard output carries only the
-protocol. The worker stops at end of input. Everything is also written to
-the dated run log.
+Responses are ASCII: characters outside it are written as JSON ``\\u``
+escapes, so a console code page (cp1252 on Windows pipes) can never corrupt
+or reject them. Requests are read as bytes and decoded as UTF-8 per line, so
+one bad line is reported instead of ending the worker. Startup messages go to
+standard error, so standard output carries only the protocol. The worker
+stops at end of input. Everything is also written to the dated run log.
 """
 
 from __future__ import annotations
@@ -40,16 +45,21 @@ import logging
 import sys
 import time
 from pathlib import Path
-from typing import Any, TextIO
+from typing import Any, BinaryIO, Iterable, TextIO
 
 from ..configuration.settings import Settings, load_settings
 from ..inference.offline import OfflineTranscriber
 from ..runtime.logging_setup import configure_run_logging
 from .inference import discover_audio_files
 from .model_loading import prepare_inference_model
+from .reporting import line_reporter
 
 # Literal name: under `python -m` __name__ is "__main__", outside the run log.
 logger = logging.getLogger("src.commands.worker")
+
+# Characters of an unreadable reason kept in a response; the full reason is
+# in the run log.
+UNREADABLE_REASON_CHARACTERS = 300
 
 
 class Worker:
@@ -61,19 +71,23 @@ class Worker:
         self.output = output
 
     def emit(self, payload: dict[str, Any]) -> None:
-        """Write one response line and flush, so the caller sees it immediately."""
+        """Write one ASCII response line and flush, so the caller sees it immediately."""
 
-        self.output.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        self.output.write(json.dumps(payload, ensure_ascii=True) + "\n")
         self.output.flush()
 
-    def handle(self, line: str) -> None:
+    def handle(self, line: bytes | str) -> None:
         """Serve one request line; report every failure as an error event."""
 
         try:
-            request = json.loads(line)
+            # utf-8-sig also accepts a byte order mark, which some Windows
+            # shells put at the start of piped text.
+            text = line.decode("utf-8-sig") if isinstance(line, bytes) else line
+            request = json.loads(text)
             if not isinstance(request, dict) or not isinstance(request.get("path"), str):
                 raise ValueError('a request is a JSON object with a string "path"')
         except ValueError as error:
+            # UnicodeDecodeError and json.JSONDecodeError are ValueErrors.
             self.emit({"event": "error", "id": None, "error": f"invalid request: {error}"})
             return
 
@@ -97,12 +111,16 @@ class Worker:
             inference.audio_extensions,
             inference.recursive,
             excluded_names=frozenset({inference.output_filename}),
+            require_audio=False,
         )
-        result = self.transcriber.transcribe(
-            [record.path for record in discovered.audio],
-            metadata=discovered.audio,
-        )
-        for file_result in result.files:
+        transcribed_files = ()
+        if discovered.audio:
+            result = self.transcriber.transcribe(
+                [record.path for record in discovered.audio],
+                metadata=discovered.audio,
+            )
+            transcribed_files = result.files
+        for file_result in transcribed_files:
             self.emit(
                 {
                     "event": "transcript",
@@ -122,31 +140,41 @@ class Worker:
                     "path": str(unreadable_path),
                     "status": "unreadable",
                     "transcript": "",
-                    "error": reason.splitlines()[0][:300],
+                    "error": reason.splitlines()[0][:UNREADABLE_REASON_CHARACTERS],
                 }
             )
         self.emit(
             {
                 "event": "done",
                 "id": request_id,
-                "files": len(result.files) + len(discovered.unreadable),
+                "files": len(transcribed_files) + len(discovered.unreadable),
                 "wall_seconds": round(time.perf_counter() - started, 3),
             }
         )
 
 
-def main(input_stream: TextIO | None = None, output_stream: TextIO | None = None) -> int:
+def serve(worker: Worker, requests: Iterable[bytes | str]) -> None:
+    """Handle every non-blank request line until the input ends."""
+
+    for line in requests:
+        if line.strip():
+            worker.handle(line)
+
+
+def main(input_stream: BinaryIO | None = None, output_stream: TextIO | None = None) -> int:
     """Load the model, announce readiness, and serve until end of input."""
 
-    requests = input_stream if input_stream is not None else sys.stdin
+    # Binary input: each line is decoded as UTF-8 by the worker, whatever the
+    # console code page. Startup lines on standard error may contain paths;
+    # characters it cannot encode are escaped instead of raising.
+    requests = input_stream if input_stream is not None else sys.stdin.buffer
     responses = output_stream if output_stream is not None else sys.stdout
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(errors="backslashreplace")
+
     settings = load_settings()
     run_id, log_path = configure_run_logging(settings.paths.log_dir, settings.logging.level)
-
-    def report(line: str) -> None:
-        print(line, file=sys.stderr)
-        logger.info(line)
-
+    report = line_reporter(logger, sys.stderr)
     report(f"Run id: {run_id}")
     report(f"Log file: {log_path}")
     try:
@@ -168,9 +196,7 @@ def main(input_stream: TextIO | None = None, output_stream: TextIO | None = None
             "load_seconds": round(prepared.load_seconds, 3),
         }
     )
-    for line in requests:
-        if line.strip():
-            worker.handle(line)
+    serve(worker, requests)
     logger.info("worker input ended")
     return 0
 

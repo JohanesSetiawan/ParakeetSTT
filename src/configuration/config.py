@@ -39,6 +39,11 @@ SUPPORTED_ENCODER_ACTIVATION = "silu"
 SUPPORTED_JOINT_ACTIVATION = "relu"
 
 
+# The converted PyTorch checkpoint inside a weights directory. Every module
+# that reads, validates, or derives from it uses this one name.
+CHECKPOINT_FILENAME = "model.pth"
+
+
 @dataclass(frozen=True)
 class ParakeetConfig:
     """
@@ -107,7 +112,7 @@ class ParakeetConfig:
     def checkpoint_path(self) -> Path:
         """Return the converted PyTorch checkpoint associated with the config."""
 
-        return self.weights_dir / "model.pth"
+        return self.weights_dir / CHECKPOINT_FILENAME
 
 
 # =============================================================================

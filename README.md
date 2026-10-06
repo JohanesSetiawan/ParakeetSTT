@@ -241,6 +241,7 @@ Used only by the development benchmark command, not by transcription.
 |---|---|---|
 | `warmup_rounds` | `1` | Rounds run and discarded before measuring (CUDA kernel selection, file cache). At least 0. |
 | `measured_rounds` | `3` | Rounds that are timed and compared. At least 1. |
+| `git_timeout_seconds` | `30.0` | Limit for each git query that records the commit. On timeout the commit is recorded as unknown (null) instead of blocking the run. Greater than 0. |
 
 ## Supported input
 
@@ -324,7 +325,7 @@ A program that transcribes many short files (a labeling tool, an editor plugin) 
 venv\Scripts\python.exe -m src.commands.worker
 ```
 
-It reads one JSON object per line on standard input and answers with one JSON object per line on standard output. Startup messages go to standard error.
+It reads one JSON object per line on standard input, as UTF-8, and answers with one JSON object per line on standard output. Responses are plain ASCII: other characters in paths and transcripts are written as JSON `\u` escapes, which every JSON parser decodes, so a console code page cannot corrupt them. Startup messages go to standard error.
 
 Sending one request for a test clip (the path shortened here):
 
@@ -337,8 +338,8 @@ Sending one request for a test clip (the path shortened here):
 
 - The first line the worker writes is the `ready` event, before any request is read.
 - `path` may be a file or a folder; a folder follows `inference.recursive` and `inference.audio_extensions`, and its files are batched together. `id` is optional and echoed back.
-- Unreadable files are answered with `"status": "unreadable"` and an `error`.
-- A request that fails (invalid JSON, a missing path, an out-of-memory batch) is answered with `{"event": "error", "id": ..., "error": "..."}`, and the worker keeps serving.
+- Unreadable files are answered with `"status": "unreadable"` and an `error`, followed by `done`, also when no file of the request was readable.
+- A request that cannot be served (a line that is not UTF-8 or not a JSON object with a string `path`, a path that does not exist, an out-of-memory batch) is answered with `{"event": "error", "id": ..., "error": "..."}`, and the worker keeps serving.
 - The worker stops at end of input. Everything is also written to the dated run log.
 
 ## Checkpoint preparation
@@ -359,9 +360,9 @@ It prepares `weights_dir` as follows:
 
 On every later run the fast path checks only that `.ready` exists and that `model.pth` still has the recorded size. A deleted, truncated, or replaced checkpoint triggers a full preparation again. To force one, delete `weights_dir/.ready`.
 
-With the float16 encoder, the first run also builds `model.encoder-float16.pth` from `model.pth` and records it in `model.encoder-float16.json`. Loading that file reads half the bytes and peaks at about 2.0 GB of process memory instead of 4.2 GB. It is rebuilt automatically when `model.pth` changes or the file is incomplete; delete both files to force a rebuild.
+With the float16 encoder, the first run also builds `model.encoder-float16.pth` from `model.pth` and records it in `model.encoder-float16.json`. Loading that file reads half the bytes and peaks at about 2.0 GB of process memory instead of 4.2 GB. It is current only while `model.pth` is the same file it was built from (same size and modification time), and re-converting `model.pth` deletes it, so it is rebuilt automatically after any replacement or repair, or when it is incomplete; delete both files to force a rebuild. If the weights folder cannot be written (a read-only install), the run prints a warning and casts `model.pth` to float16 in memory instead, with the same result and a higher memory peak while loading.
 
-Checkpoints are loaded with `torch.load(..., weights_only=True, mmap=True)`: arbitrary pickled objects are refused, and the file is memory-mapped instead of copied into private memory.
+Checkpoints are loaded with `torch.load(..., weights_only=True)`, which refuses arbitrary pickled objects. For a GPU or MPS run the file is memory-mapped (`mmap=True`) instead of copied into private memory; on the CPU it is copied, because the loaded tensors are the model itself and a mapping would keep the file open, and on Windows impossible to replace, for as long as the process runs.
 
 ## Logs
 

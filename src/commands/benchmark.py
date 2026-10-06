@@ -36,6 +36,7 @@ from ..runtime.logging_setup import configure_run_logging
 from ..runtime.memory import peak_process_memory_bytes
 from .inference import discover_audio_files
 from .model_loading import prepare_inference_model
+from .reporting import line_reporter
 
 
 # Literal name: under `python -m` __name__ is "__main__", outside the run log.
@@ -50,18 +51,23 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def git_revision() -> dict[str, Any]:
-    """Commit and dirty flag of the working tree, or nulls outside a git checkout."""
+def git_revision(timeout_seconds: float) -> dict[str, Any]:
+    """
+    Commit and dirty flag of the working tree, or nulls when git cannot say.
+
+    A slow network share, an fsmonitor hook, or a lock wait can stall
+    ``git status``; after ``timeout_seconds`` the value is recorded as unknown
+    instead of blocking the benchmark after all its rounds have run.
+    """
 
     def run(*args: str) -> str | None:
-        # Local read-only queries (rev-parse, status): no network, no prompt,
-        # so they need no timeout.
         try:
             completed = subprocess.run(
                 ["git", *args],
                 cwd=PROJECT_ROOT,
                 capture_output=True,
                 text=True,
+                timeout=timeout_seconds,
                 check=True,
             )
         except (OSError, subprocess.SubprocessError):
@@ -141,13 +147,9 @@ def run_benchmark(input_path: Path, settings: Settings, run_id: str) -> tuple[di
     )
     paths = [record.path for record in discovered.audio]
 
-    def report(line: str) -> None:
-        print(line)
-        logger.info(line)
-
     # Reported as it happens, not only in the final record, so a run that
     # fails in a later round still shows which device and versions it ran on.
-    prepared = prepare_inference_model(settings, report)
+    prepared = prepare_inference_model(settings, line_reporter(logger))
     parameter = next(prepared.model.parameters())
     inference_settings = prepared.inference
     transcriber = OfflineTranscriber(prepared.model, prepared.configuration, inference_settings)
@@ -179,7 +181,7 @@ def run_benchmark(input_path: Path, settings: Settings, run_id: str) -> tuple[di
     record: dict[str, Any] = {
         "run_id": run_id,
         "timestamp": datetime.now(timezone.utc).isoformat(),
-        "git": git_revision(),
+        "git": git_revision(settings.benchmark.git_timeout_seconds),
         "runtime": dataclasses.asdict(prepared.runtime),
         "encoder_precision": prepared.precision,
         "graph_decoding": prepared.graph_decoding,

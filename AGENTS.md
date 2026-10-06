@@ -130,11 +130,11 @@ A change that breaks any of these is a regression, whatever else it improves.
 
 1. **State-dict names are fixed.** The top-level attributes `encoder`, `encoder_projector`, `decoder`, `joint` and every nested attribute name mirror checkpoint keys. Renaming one breaks strict loading. File and class names may change; attribute names may not.
 2. **Loading is strict.** `load_state_dict(strict=True, assign=True)`. Missing or unexpected keys raise.
-3. **Loading is safe.** `torch.load(..., weights_only=True)` everywhere (with `mmap=True` for checkpoints). Never switch to `weights_only=False`.
+3. **Loading is safe.** `torch.load(..., weights_only=True)` everywhere. Never switch to `weights_only=False`. Checkpoints are memory-mapped only when the model moves to an accelerator; a CPU model would otherwise keep the file mapped (and, on Windows, locked against replacement) for the whole process.
 4. **Meta-device construction.** `load_model` builds the model under `torch.device("meta")` to skip random initialization. Any new non-persistent buffer must be created with an explicit `device="cpu"` in its constructor, as `inv_freq` and `duration_values` are. `_require_materialized` fails loudly otherwise.
 5. **Pinned artifacts.** URLs, sizes, SHA-256, and Git blob SHA-1 values in `checkpoint/download.py` identify the verified upstream revision. They are an integrity invariant, not configuration. Update them only together with a full parity re-verification.
 6. **Unimplemented config values are rejected.** `validate_config` requires `hidden_act == "relu"` (joint), `encoder_config.hidden_act == "silu"`, and `scale_input == false`, because the modules hard-wire that math. Add support in the modules before relaxing a check.
-6a. **Derived checkpoints follow `model.pth`.** `model.encoder-float16.pth` is valid only while its manifest (written last) records the current `model.pth` size and the schema version; otherwise it is rebuilt. A checkpoint whose encoder is already narrower than requested is refused, never widened.
+6a. **Derived checkpoints follow `model.pth`.** `model.encoder-float16.pth` is valid only while its manifest (written last) records the current `model.pth` size, modification time in nanoseconds, and the schema version; size alone is not enough, because a different checkpoint of the same architecture has the same size. Converting `model.pth` deletes every derived file (`remove_derived_checkpoints`). The derived file keeps `model.pth`'s own metadata. A checkpoint whose encoder is already narrower than requested is refused, never widened. An unwritable weights directory falls back to casting in memory with a warning; the temporary file is created before the build so that is detected before any weights are loaded. The checkpoint file name comes from `configuration.config.CHECKPOINT_FILENAME` only.
 
 ### Numerics and parity
 
@@ -173,7 +173,7 @@ A change that breaks any of these is a regression, whatever else it improves.
   - `download_attempts >= 1`
   - `untranscribed_gap_seconds > 0`
   - every `recovery_start_offsets_feature_frames` entry is non-zero and at most `overlap_feature_frames` in size
-  - `warmup_rounds >= 0`, `measured_rounds >= 1`
+  - `warmup_rounds >= 0`, `measured_rounds >= 1`, `git_timeout_seconds > 0`
   - `max_open_files >= 1`, `reserve_mib >= 0`
   - `encoder_precision` in `("float32", "float16")`, `float32_matmul_precision` in `("highest", "high")`
 - Constants that belong to the checkpoint's input contract (feature constants, pinned hashes) stay in code with a comment explaining why they are not settings.
@@ -215,7 +215,8 @@ Statuses are derived from objective facts only. Do not add heuristics that judge
 | Not even one full chunk fits in the free GPU memory | `RuntimeError` at startup, before any batch, naming the memory needed and free. |
 | Accelerator OOM | `RuntimeError` naming the batch items, frames, memory, and the keys to change. |
 | CUDA Graph decoding cannot take a batch (larger than its static buffers) | The eager loop decodes that batch; same output. |
-| A worker request fails | `{"event": "error"}` on stdout with the traceback in the log; the worker keeps serving. |
+| A worker request fails (not UTF-8, not a JSON object with a string `path`, missing path, OOM) | `{"event": "error"}` on stdout with the traceback in the log; the worker keeps serving. Requests whose files are all unreadable are not failures: each file gets an `unreadable` event, then `done`. |
+| The float16 file cannot be written (read-only weights directory) | A warning on the terminal and in the log; the encoder is cast in memory. |
 | CSV write fails | Fallback to `logs/transcriptions_<run id>.csv`; exit code 1. |
 
 Never swallow an exception without logging it. Never report success for work that did not happen.
@@ -402,6 +403,7 @@ Must not, without an explicit request from the maintainer:
 | `One full chunk needs about N MiB but only M MiB of GPU memory is free` | The weights loaded, but no chunk fits beside them. | Close other GPU programs, or lower `inference.max_chunk_feature_frames`, or set `encoder_precision = "float16"`. |
 | `Warning: less than memory.reserve_mib of GPU memory was free` | Little free VRAM at startup; the run uses all of it. | Nothing, unless other GPU programs start later; then close them or expect an out-of-memory stop. |
 | `The checkpoint stores a torch.float16 encoder and cannot be loaded as torch.float32` | A float16 file was passed for a float32 run. | Load `model.pth` for float32 (the commands do this). |
+| `Warning: cannot write model.encoder-float16.pth in ... ; casting model.pth to float16 in memory instead` | The weights directory is read-only. | Nothing; or make the directory writable once so the file can be built. |
 | `ffprobe was not found in PATH. Set FFPROBE_BINARY externally.` (in an `unreadable` reason) | FFmpeg not installed, and the file is not a libsndfile format. | Install FFmpeg or set `FFPROBE_BINARY`/`FFMPEG_BINARY`. |
 | `FFPROBE_BINARY points to a missing executable` | The environment variable is set to a wrong path. | Fix or unset the variable. |
 | `Input path does not exist` | Typo in `--transcribe`. | Check the path; nothing was loaded. |
@@ -440,8 +442,8 @@ Must not, without an explicit request from the maintainer:
 - **D19. CUDA Graph decoding with one static-buffer graph.** Per-step GPU time barely depends on the row count, so one graph sized for `batch_size` rows and the longest chunk serves every batch, with missing rows finished from the start. Bit-identical to the eager loop (checked on CPU in the unit tier and on the GPU in the full tier). The loop went from about 1.2 to 2.0 ms to about 0.4 ms per step.
 - **D20. Decode prefetch on one worker thread.** Media decoding (about 13 s for 112 minutes of MP3) ran while the GPU waited. One thread decodes the next batch; one thread keeps every file's chunks in order. libsndfile, the FFmpeg pipe, and torch resampling release the GIL.
 - **D21. Recovery by groups with one read per chunk and one session per file.** Each window had been decoded on its own in a fresh session, and libsndfile rescans an MP3 from the start on such a seek. Recovery on the 112-minute folder went from 11.6 s to about 3.5 s.
-- **D22. Derived float16 checkpoint file and memory-mapped loading.** Copying `model.pth` into private memory left a 3.1 GB working set and an 8.2 GB commit charge after loading; `mmap=True` gives 0.7 GB and 4.1 GB at the same load time. Casting the encoder on the CPU then peaked at 4.2 GB; reading a float16 file peaks at 2.0 GB and loads 0.24 s faster.
-- **D23. Worker process for many short files.** A one-off run spends about 5 s on startup for a 0.2 s transcription. The worker pays it once and answered short clips in 0.12 s each. The protocol is JSON Lines over standard input and output: no network listener, so no new attack surface.
+- **D22. Derived float16 checkpoint file and memory-mapped loading.** Copying `model.pth` into private memory left a 3.1 GB working set and an 8.2 GB commit charge after loading; `mmap=True` gives 0.7 GB and 4.1 GB at the same load time. Casting the encoder on the CPU then peaked at 4.2 GB; reading a float16 file peaks at 2.0 GB and loads 0.24 s faster. Freshness is size plus modification time, not a content hash: hashing 2.4 GB on every start costs seconds, and every replacement of `model.pth` writes a new file. CPU runs copy instead of mapping (the mapping would outlive the load).
+- **D23. Worker process for many short files.** A one-off run spends about 5 s on startup for a 0.2 s transcription. The worker pays it once and answered short clips in 0.12 s each. The protocol is JSON Lines over standard input and output: no network listener, so no new attack surface. Requests are read as bytes and decoded as UTF-8 per line, and responses are ASCII JSON: on Windows, pipes use the cp1252 code page, which rejected or garbled non-ASCII paths and killed the worker.
 - **D24. TF32 is a setting, off by default.** With a float32 encoder, `float32_matmul_precision = "high"` was 13% faster end to end with the same word error rate. With the float16 encoder only the decoder and joint use float32 products: no speed gain, and a few tokens changed.
 
 ## 16. Open optimization items

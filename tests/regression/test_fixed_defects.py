@@ -822,3 +822,26 @@ def test_slices_of_one_decode_equal_separate_decodes(tmp_path: Path) -> None:
     assert torch.allclose(piece.waveform, separate.waveform, atol=1e-6)
     with pytest.raises(ValueError, match="outside"):
         slice_segment(span, 500, 2_000)
+
+
+def test_slices_keep_the_parent_finite_flag_and_their_own_rms() -> None:
+    from src.audio.media import DecodedSegment, slice_segment
+
+    waveform = torch.cat((torch.zeros(100), torch.full((100,), 0.5)))
+    parent = DecodedSegment(
+        waveform=waveform,
+        sample_rate=TARGET_RATE,
+        source_start_frame=1_000,
+        source_end_frame=1_200,
+        source_sample_rate=TARGET_RATE,
+        source_channels=1,
+        rms=float(torch.sqrt(torch.mean(waveform.square()))),
+        finite=False,
+    )
+
+    silent = slice_segment(parent, 1_000, 1_100)
+    loud = slice_segment(parent, 1_100, 1_200)
+
+    assert silent.rms == 0.0 and loud.rms == pytest.approx(0.5)
+    assert silent.finite is False and loud.finite is False
+    assert slice_segment(parent, 1_050, 1_050).rms == 0.0

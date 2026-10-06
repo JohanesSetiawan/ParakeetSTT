@@ -57,6 +57,7 @@ reserve_mib = 256
 [benchmark]
 warmup_rounds = 0
 measured_rounds = 2
+git_timeout_seconds = 15.0
 """
 
 
@@ -113,6 +114,7 @@ def test_valid_file_is_normalized(tmp_path: Path) -> None:
         ("untranscribed_gap_seconds = 4.0", "untranscribed_gap_seconds = 0", "untranscribed_gap_seconds"),
         ("measured_rounds = 2", "measured_rounds = 0", "measured_rounds"),
         ("warmup_rounds = 0", "warmup_rounds = -1", "warmup_rounds"),
+        ("git_timeout_seconds = 15.0", "git_timeout_seconds = 0", "git_timeout_seconds"),
         ("max_open_files = 4", "max_open_files = 0", "max_open_files"),
         ('encoder_precision = "float16"', 'encoder_precision = "bfloat16"', "encoder_precision"),
         ("cuda_graphs = true", 'cuda_graphs = "on"', "cuda_graphs"),
@@ -216,3 +218,28 @@ def test_device_report_describes_the_running_process() -> None:
     assert report.precision == "float32"
     assert report.torch_version == torch.__version__
     assert all(line.isascii() for line in report.lines())
+
+
+def test_line_reporter_prints_and_logs_each_line(caplog) -> None:
+    import io
+    import logging
+
+    from src.commands.reporting import line_reporter
+
+    stream = io.StringIO()
+    report = line_reporter(logging.getLogger("src.commands.test"), stream)
+    with caplog.at_level(logging.INFO, logger="src.commands.test"):
+        report("Device: cpu")
+
+    assert stream.getvalue() == "Device: cpu\n"
+    assert [record.getMessage() for record in caplog.records] == ["Device: cpu"]
+
+
+def test_one_checkpoint_file_name_everywhere(tmp_path: Path) -> None:
+    from src.checkpoint import bootstrap
+    from src.configuration.config import CHECKPOINT_FILENAME
+
+    assert bootstrap.CHECKPOINT_FILENAME is CHECKPOINT_FILENAME
+    for module in ("src/checkpoint/derived.py", "src/checkpoint/orchestration.py", "src/checkpoint/bootstrap.py"):
+        source = (Path(__file__).resolve().parents[2] / module).read_text(encoding="utf-8")
+        assert '"model.pth"' not in source, module

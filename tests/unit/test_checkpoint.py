@@ -234,3 +234,47 @@ def test_legacy_model_pth_gains_conversion_manifest(tmp_path: Path) -> None:
     assert first.action == "bootstrapped"
     assert second.action == "reused"
     assert (tmp_path / "conversion_manifest.json").is_file()
+
+
+def test_converting_model_pth_removes_files_derived_from_the_old_one(tmp_path: Path) -> None:
+    """
+    Review finding: a replaced model.pth of the same size left the old float16
+    file current. A conversion now removes every derived file; reusing an
+    unchanged model.pth keeps them.
+    """
+
+    from src.checkpoint.derived import HALF_ENCODER_FILENAME, HALF_ENCODER_MANIFEST
+
+    config_bytes = json.dumps(MINIMAL_CONFIG).encode("utf-8")
+    (tmp_path / "config.json").write_bytes(config_bytes)
+    write_safetensors(tmp_path / "model.safetensors", REQUIRED_TENSORS)
+    safetensors_bytes = (tmp_path / "model.safetensors").read_bytes()
+    download_manifest = {
+        "schema_version": 1,
+        "files": {
+            name: {
+                "url": f"fixture://{name}",
+                "size_bytes": len(data),
+                "sha256": hashlib.sha256(data).hexdigest(),
+                "remote_content_length": len(data),
+                "remote_etag": "fixture",
+            }
+            for name, data in (("config.json", config_bytes), ("model.safetensors", safetensors_bytes))
+        },
+    }
+    (tmp_path / "download_manifest.json").write_text(json.dumps(download_manifest), encoding="utf-8")
+    for name in (HALF_ENCODER_FILENAME, HALF_ENCODER_MANIFEST):
+        (tmp_path / name).write_text("built from an older model.pth", encoding="utf-8")
+
+    converted = ensure_converted_checkpoint(tmp_path)
+
+    assert converted.action == "converted"
+    assert not (tmp_path / HALF_ENCODER_FILENAME).exists()
+    assert not (tmp_path / HALF_ENCODER_MANIFEST).exists()
+
+    for name in (HALF_ENCODER_FILENAME, HALF_ENCODER_MANIFEST):
+        (tmp_path / name).write_text("built from the current model.pth", encoding="utf-8")
+    reused = ensure_converted_checkpoint(tmp_path)
+
+    assert reused.action == "reused"
+    assert (tmp_path / HALF_ENCODER_FILENAME).exists()

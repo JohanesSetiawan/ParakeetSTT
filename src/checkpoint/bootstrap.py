@@ -23,6 +23,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, TypeVar
 
+from ..configuration.config import CHECKPOINT_FILENAME
 from ..configuration.settings import CheckpointSettings
 from ..runtime.filesystem import write_json_atomic
 from .orchestration import CheckpointPreparationResult, prepare_checkpoint
@@ -32,7 +33,6 @@ logger = logging.getLogger(__name__)
 
 READINESS_MARKER_FILENAME = ".ready"
 READINESS_SCHEMA_VERSION = 1
-CHECKPOINT_FILENAME = "model.pth"
 
 LoadedModel = TypeVar("LoadedModel")
 

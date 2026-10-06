@@ -17,7 +17,7 @@ from typing import Any, Callable
 import torch
 
 from ..checkpoint.bootstrap import ensure_first_run_ready
-from ..checkpoint.derived import ensure_half_encoder_checkpoint
+from ..checkpoint.derived import HALF_ENCODER_FILENAME, ensure_half_encoder_checkpoint
 from ..configuration.config import ParakeetConfig
 from ..configuration.settings import InferenceSettings, Settings
 from ..inference.budget import MemoryBudget, resolve_memory_budget
@@ -59,19 +59,32 @@ def inference_model_loader(
         checkpoint_file = None
         if encoder_dtype == torch.float16:
 
-            def half_encoder_state_dict() -> dict[str, torch.Tensor]:
-                model, _configuration, _metadata = load_model(
+            def half_encoder_checkpoint() -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
+                model, _configuration, metadata = load_model(
                     weights_dir,
                     torch.device("cpu"),
                     encoder_dtype=torch.float16,
                 )
-                return model.state_dict()
+                return model.state_dict(), metadata
 
-            checkpoint_file = ensure_half_encoder_checkpoint(
-                weights_dir,
-                half_encoder_state_dict,
-                progress_callback,
-            )
+            try:
+                checkpoint_file = ensure_half_encoder_checkpoint(
+                    weights_dir,
+                    half_encoder_checkpoint,
+                    progress_callback,
+                )
+            except OSError as error:
+                # A read-only weights directory (shared install, container
+                # volume) cannot hold the derived file; casting model.pth in
+                # memory gives the same model, only with a higher peak of
+                # host memory while loading.
+                message = (
+                    f"Warning: cannot write {HALF_ENCODER_FILENAME} in {weights_dir} ({error}); "
+                    "casting model.pth to float16 in memory instead"
+                )
+                logger.warning(message)
+                if progress_callback is not None:
+                    progress_callback(message)
         return load_model(
             weights_dir,
             device,

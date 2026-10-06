@@ -34,7 +34,7 @@ from ..runtime.filesystem import write_text_atomic
 from ..runtime.logging_setup import configure_run_logging
 from ..runtime.memory import peak_process_memory_bytes
 from .model_loading import prepare_inference_model
-from .reporting import ProgressReporter
+from .reporting import ProgressReporter, line_reporter
 
 
 # A literal name instead of __name__: under `python -m src.commands.inference`
@@ -84,6 +84,7 @@ def discover_audio_files(
     extensions: tuple[str, ...],
     recursive: bool,
     excluded_names: frozenset[str] = frozenset(),
+    require_audio: bool = True,
 ) -> DiscoveredInput:
     """
     Resolve one file, or probe every candidate under one directory.
@@ -93,23 +94,33 @@ def discover_audio_files(
         extensions: Optional lowercase suffix allow-list; empty means probe all.
         recursive: Whether to descend into subdirectories.
         excluded_names: File names never treated as input (the output CSV).
+        require_audio: Raise when nothing readable is found. The worker passes
+            False so it can report every file, readable or not.
 
     Returns:
         Readable audio metadata and ``(path, reason)`` for unreadable files,
         both sorted by path.
 
     Raises:
-        FileNotFoundError: If the path does not exist or no audio is found.
-        ValueError: If a single explicitly named file is not readable audio.
+        FileNotFoundError: If the path does not exist, or (with
+            ``require_audio``) no audio is found.
+        ValueError: If a single explicitly named file is not readable audio
+            (only with ``require_audio``).
         RuntimeError: If a codec path is configured but invalid; that is a
             setup error, not a property of one file.
     """
 
     resolved_input = input_path.expanduser().resolve()
     if resolved_input.is_file():
-        if extensions and resolved_input.suffix.lower() not in extensions:
-            raise ValueError(f"Unsupported media extension: {resolved_input.suffix!r}")
-        return DiscoveredInput(audio=(inspect_media(resolved_input),), unreadable=())
+        try:
+            if extensions and resolved_input.suffix.lower() not in extensions:
+                raise ValueError(f"Unsupported media extension: {resolved_input.suffix!r}")
+            return DiscoveredInput(audio=(inspect_media(resolved_input),), unreadable=())
+        except ValueError as error:
+            if require_audio:
+                raise
+            logger.warning("unreadable file %s: %s", resolved_input, error)
+            return DiscoveredInput(audio=(), unreadable=((resolved_input, str(error)),))
 
     if not resolved_input.is_dir():
         raise FileNotFoundError(f"Input path does not exist: {resolved_input}")
@@ -129,7 +140,7 @@ def discover_audio_files(
             unreadable.append((path, str(error)))
             logger.warning("unreadable file %s: %s", path, error)
 
-    if not audio:
+    if not audio and require_audio:
         raise FileNotFoundError(
             f"No readable audio files found under {resolved_input} "
             f"({len(unreadable)} unreadable); "
@@ -297,11 +308,7 @@ def transcribe_input(input_path: Path, settings: Settings, run_id: str) -> Comma
     for path, reason in discovered.unreadable:
         print(f"Skipped unreadable file: {path.name} ({reason.splitlines()[0][:160]})")
 
-    def report(line: str) -> None:
-        print(line)
-        logger.info(line)
-
-    prepared = prepare_inference_model(settings, report)
+    prepared = prepare_inference_model(settings, line_reporter(logger))
     model, configuration, inference_settings = prepared.model, prepared.configuration, prepared.inference
 
     print(f"Transcribing {len(discovered.audio)} file(s)")

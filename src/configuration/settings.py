@@ -94,6 +94,7 @@ class BenchmarkSettings:
 
     warmup_rounds: int
     measured_rounds: int
+    git_timeout_seconds: float
 
 
 @dataclass(frozen=True)
@@ -154,6 +155,13 @@ def _choice(section: dict[str, Any], section_name: str, key: str, choices: tuple
     if value not in choices:
         raise ValueError(f"{section_name}.{key} must be one of {choices}, got {value!r}")
     return value
+
+
+def _positive_number(section: dict[str, Any], section_name: str, key: str) -> float:
+    number = _number(section, section_name, key, minimum=0.0)
+    if number == 0.0:
+        raise ValueError(f"{section_name}.{key} must be greater than zero")
+    return number
 
 
 def _boolean(section: dict[str, Any], section_name: str, key: str) -> bool:
@@ -325,6 +333,7 @@ def _parse_benchmark(document: dict[str, Any]) -> BenchmarkSettings:
     return BenchmarkSettings(
         warmup_rounds=_integer(section, "benchmark", "warmup_rounds", minimum=0),
         measured_rounds=_integer(section, "benchmark", "measured_rounds", minimum=1),
+        git_timeout_seconds=_positive_number(section, "benchmark", "git_timeout_seconds"),
     )
 
 

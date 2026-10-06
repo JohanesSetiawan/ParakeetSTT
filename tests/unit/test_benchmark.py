@@ -29,6 +29,23 @@ def test_summary_statistics() -> None:
     assert summarize([4.0])["stdev"] == 0.0
 
 
+def test_git_query_that_hangs_is_recorded_as_unknown() -> None:
+    """Review finding: without a timeout a stalled git call blocked the benchmark forever."""
+
+    import subprocess
+
+    from src.commands import benchmark as benchmark_module
+
+    def stalled(*args, **kwargs):
+        raise subprocess.TimeoutExpired(cmd=args[0], timeout=kwargs["timeout"])
+
+    with patch.object(benchmark_module.subprocess, "run", side_effect=stalled) as run:
+        revision = benchmark_module.git_revision(timeout_seconds=0.5)
+
+    assert revision == {"commit": None, "dirty": None}
+    assert all(call.kwargs["timeout"] == 0.5 for call in run.call_args_list)
+
+
 def test_round_without_audio_reports_no_real_time_factor() -> None:
     """A ratio over zero audio seconds is not invented, and printing it does not crash."""
 
@@ -62,7 +79,7 @@ def test_benchmark_warms_up_measures_and_appends_one_json_line(tmp_path: Path, t
         base,
         paths=dataclasses.replace(base.paths, metrics_dir=tmp_path / "metrics"),
         inference=inference_settings(),
-        benchmark=BenchmarkSettings(warmup_rounds=1, measured_rounds=2),
+        benchmark=BenchmarkSettings(warmup_rounds=1, measured_rounds=2, git_timeout_seconds=30.0),
     )
     model = SteadySpeechModel(3)
     bootstrap = BootstrapResult(action="ready", marker_path="marker", preparation=None)
@@ -88,4 +105,8 @@ def test_benchmark_warms_up_measures_and_appends_one_json_line(tmp_path: Path, t
     assert {file["name"] for file in first["rounds"][0]["files"]} == {"clip_0.wav", "clip_1.wav"}
     assert all(file["processing_seconds"] > 0 for file in first["rounds"][0]["files"])
     assert set(first["git"]) == {"commit", "dirty"}
-    assert record["settings"]["benchmark"] == {"warmup_rounds": 1, "measured_rounds": 2}
+    assert record["settings"]["benchmark"] == {
+        "warmup_rounds": 1,
+        "measured_rounds": 2,
+        "git_timeout_seconds": 30.0,
+    }

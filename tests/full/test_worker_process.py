@@ -45,3 +45,37 @@ def test_worker_serves_several_requests_with_one_load(real_settings, speech_clip
     assert "Run id:" in completed.stderr
     if not torch.cuda.is_available():
         pytest.skip("timing is only meaningful on the GPU")
+
+
+def test_worker_handles_non_ascii_paths_through_real_pipes(real_settings, speech_clips, tmp_path) -> None:
+    """
+    Review finding: Windows pipes are cp1252, so a UTF-8 request for a path
+    with "\u00c1" (bytes C3 81; 0x81 is undefined in cp1252) killed the worker.
+    """
+
+    import shutil
+
+    clip = single_chunk_clips(speech_clips)[0]
+    folder = tmp_path / "\u00c1udio \u65e5\u672c"
+    folder.mkdir()
+    target = folder / f"\u00e9t\u00e9 {clip.path.name}"
+    shutil.copyfile(clip.path, target)
+    request = json.dumps({"path": str(target), "id": "unicode"}, ensure_ascii=False) + "\n"
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    completed = subprocess.run(
+        [sys.executable, "-m", "src.commands.worker"],
+        cwd=PROJECT_ROOT,
+        input=request.encode("utf-8"),
+        capture_output=True,
+        timeout=600,
+    )
+
+    assert completed.returncode == 0, completed.stderr.decode("utf-8", errors="replace")
+    assert b"Logging error" not in completed.stderr
+    assert completed.stdout.isascii()
+    replies = [json.loads(line) for line in completed.stdout.decode("ascii").splitlines()]
+    transcript = next(reply for reply in replies if reply["event"] == "transcript")
+    assert transcript["path"] == str(target.resolve())
+    assert transcript["transcript"] == clip.expected_transcript

@@ -12,7 +12,6 @@ before feature extraction.
 
 from __future__ import annotations
 
-import dataclasses
 import json
 import math
 import os
@@ -284,15 +283,18 @@ def slice_segment(segment: DecodedSegment, start_frame: int, end_frame: int) -> 
         )
     offset = segment.source_start_frame
     waveform = segment.waveform[start_frame - offset : end_frame - offset]
-    sliced = _build_decoded_segment(
-        waveform,
-        start_frame,
-        end_frame,
-        segment.sample_rate,
+    # The parent already replaced non-finite samples, so only the RMS is new.
+    rms = float(torch.sqrt(torch.mean(waveform.square()))) if waveform.numel() else 0.0
+    return DecodedSegment(
+        waveform=waveform.contiguous(),
+        sample_rate=segment.sample_rate,
+        source_start_frame=start_frame,
+        source_end_frame=end_frame,
         source_sample_rate=segment.source_sample_rate,
         source_channels=segment.source_channels,
+        rms=rms,
+        finite=segment.finite,
     )
-    return dataclasses.replace(sliced, finite=segment.finite)
 
 
 # =============================================================================
