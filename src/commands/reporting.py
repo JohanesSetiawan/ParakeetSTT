@@ -8,8 +8,28 @@ Lines are rate-limited so a 300-batch run does not print 300 lines.
 
 from __future__ import annotations
 
+import logging
+import sys
 import time
-from typing import Callable
+from typing import Callable, TextIO
+
+
+def line_reporter(logger: logging.Logger, stream: TextIO | None = None) -> Callable[[str], None]:
+    """
+    A reporter that prints each line and writes it to the run log at INFO.
+
+    Args:
+        logger: The command's logger (a literal name under ``src``).
+        stream: Where to print; standard output by default. The worker
+            passes standard error so standard output carries only its
+            protocol.
+    """
+
+    def report(line: str) -> None:
+        print(line, file=stream if stream is not None else sys.stdout)
+        logger.info(line)
+
+    return report
 
 
 class ProgressReporter:

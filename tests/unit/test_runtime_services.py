@@ -44,10 +44,20 @@ untranscribed_gap_seconds = 4.0
 gap_silence_rms = 0.001
 recovery_start_offsets_feature_frames = []
 progress_interval_seconds = 1
+max_open_files = 4
+encoder_precision = "float16"
+cuda_graphs = true
+float32_matmul_precision = "high"
+
+[memory]
+cap_to_free_memory = true
+auto_batch_budget = true
+reserve_mib = 256
 
 [benchmark]
 warmup_rounds = 0
 measured_rounds = 2
+git_timeout_seconds = 15.0
 """
 
 
@@ -78,6 +88,11 @@ def test_valid_file_is_normalized(tmp_path: Path) -> None:
     assert settings.inference.audio_extensions == (".wav", ".mp3")
     assert settings.inference.overlap_feature_frames == 0
     assert settings.checkpoint.request_timeout_seconds == 30.0
+    assert settings.inference.max_open_files == 4
+    assert settings.inference.encoder_precision == "float16"
+    assert settings.memory.cap_to_free_memory is True
+    assert settings.memory.auto_batch_budget is True
+    assert settings.memory.reserve_mib == 256
 
 
 @pytest.mark.parametrize(
@@ -99,6 +114,14 @@ def test_valid_file_is_normalized(tmp_path: Path) -> None:
         ("untranscribed_gap_seconds = 4.0", "untranscribed_gap_seconds = 0", "untranscribed_gap_seconds"),
         ("measured_rounds = 2", "measured_rounds = 0", "measured_rounds"),
         ("warmup_rounds = 0", "warmup_rounds = -1", "warmup_rounds"),
+        ("git_timeout_seconds = 15.0", "git_timeout_seconds = 0", "git_timeout_seconds"),
+        ("max_open_files = 4", "max_open_files = 0", "max_open_files"),
+        ('encoder_precision = "float16"', 'encoder_precision = "bfloat16"', "encoder_precision"),
+        ("cuda_graphs = true", 'cuda_graphs = "on"', "cuda_graphs"),
+        ('float32_matmul_precision = "high"', 'float32_matmul_precision = "medium"', "float32_matmul_precision"),
+        ("reserve_mib = 256", "reserve_mib = -1", "reserve_mib"),
+        ("auto_batch_budget = true", "auto_batch_budget = 1", "auto_batch_budget"),
+        ("cap_to_free_memory = true", 'cap_to_free_memory = "yes"', "cap_to_free_memory"),
     ],
 )
 def test_invalid_values_name_the_offending_key(tmp_path: Path, old: str, new: str, message: str) -> None:
@@ -106,7 +129,7 @@ def test_invalid_values_name_the_offending_key(tmp_path: Path, old: str, new: st
         load_toml(tmp_path, VALID_TOML.replace(old, new))
 
 
-@pytest.mark.parametrize("section", ["paths", "logging", "checkpoint", "inference", "benchmark"])
+@pytest.mark.parametrize("section", ["paths", "logging", "checkpoint", "inference", "memory", "benchmark"])
 def test_every_section_is_required(tmp_path: Path, section: str) -> None:
     with pytest.raises(ValueError, match=rf"\[{section}\]"):
         load_toml(tmp_path, VALID_TOML.replace(f"[{section}]", "[renamed]"))
@@ -195,3 +218,28 @@ def test_device_report_describes_the_running_process() -> None:
     assert report.precision == "float32"
     assert report.torch_version == torch.__version__
     assert all(line.isascii() for line in report.lines())
+
+
+def test_line_reporter_prints_and_logs_each_line(caplog) -> None:
+    import io
+    import logging
+
+    from src.commands.reporting import line_reporter
+
+    stream = io.StringIO()
+    report = line_reporter(logging.getLogger("src.commands.test"), stream)
+    with caplog.at_level(logging.INFO, logger="src.commands.test"):
+        report("Device: cpu")
+
+    assert stream.getvalue() == "Device: cpu\n"
+    assert [record.getMessage() for record in caplog.records] == ["Device: cpu"]
+
+
+def test_one_checkpoint_file_name_everywhere(tmp_path: Path) -> None:
+    from src.checkpoint import bootstrap
+    from src.configuration.config import CHECKPOINT_FILENAME
+
+    assert bootstrap.CHECKPOINT_FILENAME is CHECKPOINT_FILENAME
+    for module in ("src/checkpoint/derived.py", "src/checkpoint/orchestration.py", "src/checkpoint/bootstrap.py"):
+        source = (Path(__file__).resolve().parents[2] / module).read_text(encoding="utf-8")
+        assert '"model.pth"' not in source, module

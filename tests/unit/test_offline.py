@@ -38,6 +38,7 @@ def read_plan_sequentially_and_fresh(path: Path, max_chunk: int, overlap: int):
         batch_size=4,
         max_batch_feature_frames=4 * max_chunk,
         max_padding_fraction=1.0,
+        max_open_files=8,
     )
     pairs = []
     with open_media_session(path) as sequential, open_media_session(path) as fresh:
@@ -271,3 +272,71 @@ def chunk(**overrides: object) -> ChunkResult:
 )
 def test_file_status_is_most_severe_objective_fact(transcript, chunks, expected) -> None:
     assert classify_file(transcript, chunks) is expected
+
+
+# =============================================================================
+# Decoding one batch ahead
+# =============================================================================
+
+
+def test_next_batch_is_decoded_while_the_model_runs(tmp_path, tiny_configuration) -> None:
+    """The second batch's audio must be read before the first batch's inference ends."""
+
+    import threading
+
+    paths = []
+    for index in range(3):
+        path = tmp_path / f"clip_{index}.wav"
+        write_float_wav(path, torch.full((8000,), 0.1), 16000)
+        paths.append(path)
+
+    second_batch_decoding = threading.Event()
+    original_decode = OfflineTranscriber._decode_batch
+    decode_calls = []
+
+    def recording_decode(self, items, *args):
+        decode_calls.append(items[0].path.name)
+        if len(decode_calls) == 2:
+            second_batch_decoding.set()
+        return original_decode(self, items, *args)
+
+    class WaitingModel(ScriptedModel):
+        def __init__(self) -> None:
+            super().__init__(3)
+            self.saw_prefetch: list[bool] = []
+
+        def generate(self, features, mask):
+            if not self.saw_prefetch:
+                # Without prefetching, the second decode cannot start until
+                # this call returns, and the wait times out.
+                self.saw_prefetch.append(second_batch_decoding.wait(timeout=5.0))
+            return super().generate(features, mask)
+
+    model = WaitingModel().eval()
+    transcriber = OfflineTranscriber(model, tiny_configuration, inference_settings(batch_size=1))
+    with patch.object(OfflineTranscriber, "_decode_batch", recording_decode):
+        result = transcriber.transcribe(paths)
+
+    assert model.saw_prefetch == [True]
+    assert [file.path.name for file in result.files] == [path.name for path in paths]
+
+
+def test_decode_failure_in_the_worker_reaches_the_caller(tmp_path, tiny_configuration) -> None:
+    paths = []
+    for index in range(3):
+        path = tmp_path / f"clip_{index}.wav"
+        write_float_wav(path, torch.full((8000,), 0.1), 16000)
+        paths.append(path)
+    original_decode = OfflineTranscriber._decode_batch_audio
+    calls = [0]
+
+    def failing_on_second(self, items, *args):
+        calls[0] += 1
+        if calls[0] == 2:
+            raise ValueError("decoder broke on the second batch")
+        return original_decode(self, items, *args)
+
+    transcriber = OfflineTranscriber(ScriptedModel(3).eval(), tiny_configuration, inference_settings(batch_size=1))
+    with patch.object(OfflineTranscriber, "_decode_batch_audio", failing_on_second):
+        with pytest.raises(ValueError, match="second batch"):
+            transcriber.transcribe(paths)

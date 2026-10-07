@@ -1,15 +1,18 @@
 """
-Peak process memory, measured with the standard library only.
+Process and accelerator memory: peak host memory and the GPU allocator cap.
 
-Reported next to accelerator memory so a run's host footprint (decoded audio,
-model staging, Python objects) is visible too. psutil is not a dependency, so
-each platform's own counter is read directly.
+Peak process memory is reported next to accelerator memory so a run's host
+footprint (decoded audio, model staging, Python objects) is visible too.
+psutil is not a dependency, so each platform's own counter is read directly.
 """
 
 from __future__ import annotations
 
 import ctypes
 import sys
+from dataclasses import dataclass
+
+import torch
 
 
 def peak_process_memory_bytes() -> int | None:
@@ -59,3 +62,53 @@ def _windows_peak_working_set() -> int | None:
     if not get_info(get_process(), ctypes.byref(counters), counters.cb):
         return None
     return int(counters.PeakWorkingSetSize)
+
+
+# =============================================================================
+# Accelerator memory ceiling
+# =============================================================================
+
+
+@dataclass(frozen=True)
+class AcceleratorMemory:
+    """CUDA memory as PyTorch and the driver see it, in bytes."""
+
+    reserved: int
+    free: int
+    total: int
+
+    def ceiling(self, headroom: int) -> int:
+        """What PyTorch may hold while leaving ``headroom`` of today's free memory unused."""
+
+        return self.reserved + max(0, self.free - headroom)
+
+
+def measure_accelerator_memory(device: torch.device) -> AcceleratorMemory:
+    """
+    Reserved and free memory on a CUDA device, after releasing PyTorch's cache.
+
+    Cached but unused blocks count as used in ``mem_get_info``, so they are
+    returned first and "free" is what the driver can really hand out.
+    """
+
+    torch.cuda.empty_cache()
+    free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+    return AcceleratorMemory(
+        reserved=torch.cuda.memory_reserved(device),
+        free=free_bytes,
+        total=total_bytes,
+    )
+
+
+def cap_allocator(device: torch.device, ceiling_bytes: int, total_bytes: int) -> None:
+    """
+    Limit PyTorch's CUDA allocator to ``ceiling_bytes``.
+
+    On Windows (WDDM) the driver backs allocations that do not fit in VRAM
+    with shared system memory instead of failing, and the run silently
+    becomes several times slower. With the allocator capped at memory that is
+    physically free, an over-allocation becomes an out-of-memory error the
+    runtime reports instead.
+    """
+
+    torch.cuda.set_per_process_memory_fraction(ceiling_bytes / total_bytes, device)

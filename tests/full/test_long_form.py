@@ -17,6 +17,7 @@ import pytest
 import soundfile
 import torch
 
+from src.audio.media import inspect_media
 from src.inference.offline import FileStatus, OfflineTranscriber
 from support import SpeechClip, word_error_rate
 
@@ -82,12 +83,57 @@ def test_chunking_costs_almost_no_accuracy(transcriber, speech_clips, tmp_path: 
     )
 
 
+def test_no_speech_chunk_comes_back_empty_in_full_batches(transcriber, speech_clips, tmp_path: Path) -> None:
+    """
+    Every chunk of real speech decoded in full-size batches has tokens.
+
+    cuDNN's float16 depthwise convolution returned garbage for some inputs in
+    batches of 7 or more rows, and whole chunks came back without a single
+    token (305 of 316 on a podcast). That input is not in the repository, so
+    this checks the general property; the structural fix (depthwise
+    convolutions stay float32) is checked in test_derived_checkpoint, and
+    the labeled long-form test limits how many chunks may need recovery.
+    """
+
+    path = tmp_path / "long.wav"
+    write_concatenation(path, speech_clips, repeats=8)
+    special_tokens = {transcriber.configuration.blank_token_id, transcriber.configuration.pad_token_id}
+
+    result = transcriber.transcribe([path])
+
+    rows = max(len(batch) for batch in result.plan.batches)
+    empty = [
+        chunk.item.chunk_index
+        for chunk in result.files[0].chunks
+        if not any(token not in special_tokens for token in chunk.token_ids)
+    ]
+    assert rows >= min(8, transcriber.settings.batch_size), f"batches only reached {rows} rows"
+    assert empty == [], f"chunks without tokens: {empty}"
+
+
 @pytest.mark.cuda
 def test_peak_memory_does_not_grow_with_duration(transcriber, speech_clips, tmp_path: Path) -> None:
-    peaks = []
-    for repeats in (1, 4):
+    # Both recordings must fill at least one whole batch; below that, memory
+    # rightly grows with the rows in use. Past it, the batch budget alone sets
+    # the peak, whatever the duration.
+    settings = transcriber.settings
+    rows_per_batch = max(1, settings.max_batch_feature_frames // settings.max_chunk_feature_frames)
+
+    def written_with_chunks(repeats: int) -> tuple[Path, int]:
         path = tmp_path / f"long_{repeats}.wav"
         write_concatenation(path, speech_clips, repeats=repeats)
+        chunks = len(transcriber._plan((inspect_media(path),)).items)
+        return path, chunks
+
+    repeats = 1
+    shorter, chunks = written_with_chunks(repeats)
+    while chunks < rows_per_batch:
+        repeats *= 2
+        shorter, chunks = written_with_chunks(repeats)
+    longer, _ = written_with_chunks(3 * repeats)
+
+    peaks = []
+    for path in (shorter, longer):
         torch.cuda.synchronize()
         torch.cuda.reset_peak_memory_stats()
 
@@ -96,7 +142,7 @@ def test_peak_memory_does_not_grow_with_duration(transcriber, speech_clips, tmp_
         peaks.append(torch.cuda.max_memory_allocated())
 
     growth_mib = (peaks[1] - peaks[0]) / 2**20
-    assert growth_mib <= 16, f"peak grew by {growth_mib:.1f} MiB for 4x the audio"
+    assert growth_mib <= 16, f"peak grew by {growth_mib:.1f} MiB for 3x the audio"
 
 
 def extra_long_recordings() -> list[Path]:

@@ -5,19 +5,22 @@ from .conformer import ConvolutionModule, EncoderBlock, FeedForward
 from .decoder import Decoder, DecoderCache
 from .encoder import Encoder
 from .joint import JointNetwork
-from .parakeet import GenerationResult, ParakeetTDT, load_model
+from .graphed_decoding import GraphedGreedyDecoder
+from .parakeet import DecodedSteps, GenerationResult, ParakeetTDT, load_model
 from .subsampling import Subsampling
 
 
 __all__ = [
     "Attention",
     "ConvolutionModule",
+    "DecodedSteps",
     "Decoder",
     "DecoderCache",
     "Encoder",
     "EncoderBlock",
     "FeedForward",
     "GenerationResult",
+    "GraphedGreedyDecoder",
     "JointNetwork",
     "ParakeetTDT",
     "RelativePositionalEncoding",

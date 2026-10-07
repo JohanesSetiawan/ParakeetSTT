@@ -19,6 +19,10 @@ from .config import PROJECT_ROOT
 
 
 DEFAULT_SETTINGS_PATH = PROJECT_ROOT / "config.toml"
+ENCODER_PRECISIONS = ("float32", "float16")
+# torch.set_float32_matmul_precision values: "highest" is exact float32,
+# "high" allows TF32 tensor cores on GPUs that have them.
+FLOAT32_MATMUL_PRECISIONS = ("highest", "high")
 
 
 # =============================================================================
@@ -69,6 +73,19 @@ class InferenceSettings:
     gap_silence_rms: float
     recovery_start_offsets_feature_frames: tuple[int, ...]
     progress_interval_seconds: float
+    max_open_files: int
+    encoder_precision: str
+    cuda_graphs: bool
+    float32_matmul_precision: str
+
+
+@dataclass(frozen=True)
+class MemorySettings:
+    """Accelerator memory policy: spill protection and the automatic batch budget."""
+
+    cap_to_free_memory: bool
+    auto_batch_budget: bool
+    reserve_mib: int
 
 
 @dataclass(frozen=True)
@@ -77,6 +94,7 @@ class BenchmarkSettings:
 
     warmup_rounds: int
     measured_rounds: int
+    git_timeout_seconds: float
 
 
 @dataclass(frozen=True)
@@ -87,6 +105,7 @@ class Settings:
     logging: LoggingSettings
     checkpoint: CheckpointSettings
     inference: InferenceSettings
+    memory: MemorySettings
     benchmark: BenchmarkSettings
 
 
@@ -128,6 +147,20 @@ def _number(
     if number < minimum or (maximum is not None and number > maximum):
         upper = "" if maximum is None else f" and <= {maximum}"
         raise ValueError(f"{section_name}.{key} must be >= {minimum}{upper}, got {value!r}")
+    return number
+
+
+def _choice(section: dict[str, Any], section_name: str, key: str, choices: tuple[str, ...]) -> str:
+    value = section.get(key)
+    if value not in choices:
+        raise ValueError(f"{section_name}.{key} must be one of {choices}, got {value!r}")
+    return value
+
+
+def _positive_number(section: dict[str, Any], section_name: str, key: str) -> float:
+    number = _number(section, section_name, key, minimum=0.0)
+    if number == 0.0:
+        raise ValueError(f"{section_name}.{key} must be greater than zero")
     return number
 
 
@@ -274,6 +307,24 @@ def _parse_inference(document: dict[str, Any]) -> InferenceSettings:
         gap_silence_rms=_number(section, "inference", "gap_silence_rms", minimum=0.0),
         recovery_start_offsets_feature_frames=tuple(raw_offsets),
         progress_interval_seconds=progress_interval,
+        max_open_files=_integer(section, "inference", "max_open_files", minimum=1),
+        encoder_precision=_choice(section, "inference", "encoder_precision", ENCODER_PRECISIONS),
+        cuda_graphs=_boolean(section, "inference", "cuda_graphs"),
+        float32_matmul_precision=_choice(
+            section,
+            "inference",
+            "float32_matmul_precision",
+            FLOAT32_MATMUL_PRECISIONS,
+        ),
+    )
+
+
+def _parse_memory(document: dict[str, Any]) -> MemorySettings:
+    section = _section(document, "memory")
+    return MemorySettings(
+        cap_to_free_memory=_boolean(section, "memory", "cap_to_free_memory"),
+        auto_batch_budget=_boolean(section, "memory", "auto_batch_budget"),
+        reserve_mib=_integer(section, "memory", "reserve_mib", minimum=0),
     )
 
 
@@ -282,6 +333,7 @@ def _parse_benchmark(document: dict[str, Any]) -> BenchmarkSettings:
     return BenchmarkSettings(
         warmup_rounds=_integer(section, "benchmark", "warmup_rounds", minimum=0),
         measured_rounds=_integer(section, "benchmark", "measured_rounds", minimum=1),
+        git_timeout_seconds=_positive_number(section, "benchmark", "git_timeout_seconds"),
     )
 
 
@@ -321,5 +373,6 @@ def load_settings(
         logging=_parse_logging(document),
         checkpoint=_parse_checkpoint(document),
         inference=_parse_inference(document),
+        memory=_parse_memory(document),
         benchmark=_parse_benchmark(document),
     )

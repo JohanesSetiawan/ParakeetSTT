@@ -34,7 +34,7 @@ from ..configuration.config import ParakeetConfig
 
 
 class RelativePositionalEncoding(nn.Module):
-    """Generate sinusoidal relative positions with shape ``(B, 2T-1, H)``."""
+    """Generate sinusoidal relative positions with shape ``(1, 2T-1, H)``."""
 
     def __init__(self, configuration: ParakeetConfig) -> None:
         """Precompute inverse frequencies from the configured hidden size."""
@@ -59,7 +59,10 @@ class RelativePositionalEncoding(nn.Module):
                 dtype define the returned positional tensor.
 
         Returns:
-            Relative embeddings with shape ``(B, 2T-1, H)``.
+            Relative embeddings with shape ``(1, 2T-1, H)``. They are the same
+            for every row of a batch, so one copy is returned and broadcast;
+            each attention layer then projects them once per batch instead of
+            once per row.
         """
 
         sequence_length = hidden_states.shape[1]
@@ -69,11 +72,7 @@ class RelativePositionalEncoding(nn.Module):
             -1,
             device=hidden_states.device,
         )
-        inverse_frequency = self.inv_freq[None, :, None].float().expand(
-            hidden_states.shape[0],
-            -1,
-            1,
-        )
+        inverse_frequency = self.inv_freq[None, :, None].float()
         position_ids = position_ids[None, None, :].float()
 
         frequencies = (inverse_frequency @ position_ids).transpose(1, 2)
@@ -208,7 +207,8 @@ class Attention(nn.Module):
 
         Args:
             hidden_states: Encoder hidden states ``(B, T, H)``.
-            position_embeddings: Relative position tensor ``(B, 2T-1, H)``.
+            position_embeddings: Relative position tensor ``(1, 2T-1, H)``,
+                shared by every row.
             attention_mask: Boolean query-key mask ``(B, 1, T, T)``.
 
         Returns:
@@ -236,13 +236,15 @@ class Attention(nn.Module):
             self.head_dim,
         )
 
+        # One projection for the whole batch: (1, 2T-1, H) -> (1, 2T-1, A, D).
         relative_key = self.relative_k_proj(position_embeddings)
         relative_key = relative_key.view(
-            batch_size,
+            position_embeddings.shape[0],
             -1,
             self.num_heads,
             self.head_dim,
         )
+        # (B, A, T, D) @ (1, A, D, 2T-1) broadcasts to (B, A, T, 2T-1).
         relative_scores = query_with_position_bias @ relative_key.permute(0, 2, 3, 1)
         relative_scores = self._relative_shift(relative_scores)
         relative_scores = relative_scores[..., :sequence_length] * self.scaling

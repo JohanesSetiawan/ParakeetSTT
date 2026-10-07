@@ -29,15 +29,14 @@ from typing import Any
 
 import torch
 
-from ..checkpoint.bootstrap import ensure_first_run_ready
 from ..configuration.config import PROJECT_ROOT
 from ..configuration.settings import Settings, load_settings
 from ..inference.offline import OfflineRunResult, OfflineTranscriber
-from ..models.parakeet import load_model
-from ..runtime.device import describe_runtime
 from ..runtime.logging_setup import configure_run_logging
 from ..runtime.memory import peak_process_memory_bytes
 from .inference import discover_audio_files
+from .model_loading import prepare_inference_model
+from .reporting import line_reporter
 
 
 # Literal name: under `python -m` __name__ is "__main__", outside the run log.
@@ -52,8 +51,14 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def git_revision() -> dict[str, Any]:
-    """Commit and dirty flag of the working tree, or nulls outside a git checkout."""
+def git_revision(timeout_seconds: float) -> dict[str, Any]:
+    """
+    Commit and dirty flag of the working tree, or nulls when git cannot say.
+
+    A slow network share, an fsmonitor hook, or a lock wait can stall
+    ``git status``; after ``timeout_seconds`` the value is recorded as unknown
+    instead of blocking the benchmark after all its rounds have run.
+    """
 
     def run(*args: str) -> str | None:
         try:
@@ -62,7 +67,7 @@ def git_revision() -> dict[str, Any]:
                 cwd=PROJECT_ROOT,
                 capture_output=True,
                 text=True,
-                timeout=30,
+                timeout=timeout_seconds,
                 check=True,
             )
         except (OSError, subprocess.SubprocessError):
@@ -77,13 +82,19 @@ def git_revision() -> dict[str, Any]:
 def round_record(result: OfflineRunResult, wall_seconds: float) -> dict[str, Any]:
     """Everything measured in one timed round."""
 
+    # Wall time measured here, around the whole transcribe call; None when the
+    # input has no audio, so a ratio is never invented.
+    real_time_factor = None
+    if result.total_audio_seconds > 0:
+        real_time_factor = wall_seconds / result.total_audio_seconds
+
     return {
         "wall_seconds": wall_seconds,
         "media_decode_seconds": result.media_decode_seconds,
         "feature_seconds": result.feature_seconds,
         "generation_seconds": result.generation_seconds,
         "recovery_seconds": result.recovery_seconds,
-        "real_time_factor": wall_seconds / result.total_audio_seconds if result.total_audio_seconds else None,
+        "real_time_factor": real_time_factor,
         "work_items": len(result.plan.items),
         "batches": len(result.plan.batches),
         "peak_accelerator_allocated_bytes": result.peak_memory.get("peak_allocated_bytes"),
@@ -101,6 +112,14 @@ def round_record(result: OfflineRunResult, wall_seconds: float) -> dict[str, Any
             for file_result in result.files
         ],
     }
+
+
+def format_optional(value: float | None, digits: int) -> str:
+    """Fixed-point text for a measurement, or "not available" for None."""
+
+    if value is None:
+        return "not available"
+    return f"{value:.{digits}f}"
 
 
 def summarize(values: list[float]) -> dict[str, float]:
@@ -128,17 +147,12 @@ def run_benchmark(input_path: Path, settings: Settings, run_id: str) -> tuple[di
     )
     paths = [record.path for record in discovered.audio]
 
-    cold_started = time.perf_counter()
-    bootstrap, (model, configuration, _metadata) = ensure_first_run_ready(
-        checkpoint_dir=settings.paths.weights_dir,
-        checkpoint_settings=settings.checkpoint,
-        loader=load_model,
-        progress_callback=print,
-    )
-    cold_start_seconds = time.perf_counter() - cold_started
-    parameter = next(model.parameters())
-    runtime = describe_runtime(parameter.device, parameter.dtype)
-    transcriber = OfflineTranscriber(model, configuration, settings.inference)
+    # Reported as it happens, not only in the final record, so a run that
+    # fails in a later round still shows which device and versions it ran on.
+    prepared = prepare_inference_model(settings, line_reporter(logger))
+    parameter = next(prepared.model.parameters())
+    inference_settings = prepared.inference
+    transcriber = OfflineTranscriber(prepared.model, prepared.configuration, inference_settings)
 
     def timed_round() -> tuple[OfflineRunResult, float]:
         if parameter.device.type == "cuda":
@@ -157,25 +171,36 @@ def run_benchmark(input_path: Path, settings: Settings, run_id: str) -> tuple[di
         result, seconds = timed_round()
         rounds.append(round_record(result, seconds))
         transcripts.append(tuple(file_result.transcript for file_result in result.files))
+        real_time_factor = format_optional(rounds[-1]["real_time_factor"], 5)
         print(
             f"Round {round_index + 1}: wall {seconds:.3f} s, "
             f"generation {result.generation_seconds:.3f} s, "
-            f"real-time factor {rounds[-1]['real_time_factor']:.5f}"
+            f"real-time factor {real_time_factor}"
         )
 
     record: dict[str, Any] = {
         "run_id": run_id,
         "timestamp": datetime.now(timezone.utc).isoformat(),
-        "git": git_revision(),
-        "runtime": dataclasses.asdict(runtime),
-        "settings": {"inference": dataclasses.asdict(settings.inference), "benchmark": dataclasses.asdict(settings.benchmark)},
+        "git": git_revision(settings.benchmark.git_timeout_seconds),
+        "runtime": dataclasses.asdict(prepared.runtime),
+        "encoder_precision": prepared.precision,
+        "graph_decoding": prepared.graph_decoding,
+        "settings": {
+            "inference": dataclasses.asdict(inference_settings),
+            "memory": dataclasses.asdict(settings.memory),
+            "benchmark": dataclasses.asdict(settings.benchmark),
+        },
         "input": {
             "path": str(input_path.expanduser().resolve()),
             "files": len(paths),
             "audio_seconds": sum(record.duration_seconds for record in discovered.audio),
             "unreadable_files": len(discovered.unreadable),
         },
-        "cold_start": {"weights_action": bootstrap.action, "bootstrap_and_load_seconds": cold_start_seconds},
+        "cold_start": {
+            "weights_action": prepared.weights_action,
+            "bootstrap_and_load_seconds": prepared.load_seconds,
+        },
+        "memory_budget": dataclasses.asdict(prepared.memory_budget),
         "rounds": rounds,
         "summary": {
             "wall_seconds": summarize([entry["wall_seconds"] for entry in rounds]),

@@ -4,7 +4,7 @@ A standalone PyTorch runtime for NVIDIA's [Parakeet TDT 0.6B v3](https://hugging
 
 The model is reimplemented module by module in plain PyTorch. At runtime it does not use NeMo, Hugging Face Transformers, torchaudio, or torchcodec. You give it one audio file or a folder of files, of any length. It downloads and verifies the checkpoint on first use, splits long recordings into memory-bounded chunks, batches work across files, and writes a transcript per file with an explicit status.
 
-Output parity with the reference implementation was verified: token-for-token and text-for-text against Hugging Face `ParakeetForTDT` on 15 test clips, and byte-identical long-form transcripts across every change to this runtime.
+Output parity with the reference implementation was verified token-for-token and text-for-text against Hugging Face `ParakeetForTDT` on 15 test clips (float32 encoder). The default float16 encoder gives the same word error rate on labeled long recordings; see [Measured performance](#measured-performance).
 
 ## Contents
 
@@ -18,6 +18,7 @@ Output parity with the reference implementation was verified: token-for-token an
 - [How long audio is processed](#how-long-audio-is-processed)
 - [Measured performance](#measured-performance)
 - [Benchmarking](#benchmarking)
+- [Worker for many short files](#worker-for-many-short-files)
 - [Checkpoint preparation](#checkpoint-preparation)
 - [Logs](#logs)
 - [Running the tests](#running-the-tests)
@@ -47,8 +48,8 @@ Decoding is greedy. Beam search and language-model rescoring are not implemented
 - **PyTorch.** Any build for your platform: CUDA, Apple MPS, or CPU. The device is chosen automatically. Development used PyTorch 2.14 with CUDA 13.2.
 - **soundfile** (libsndfile) for decoding WAV, FLAC, OGG, MP3 and the other formats libsndfile supports. It installs NumPy with it.
 - **FFmpeg (optional).** Only needed for formats libsndfile cannot read, such as M4A/AAC, Opus in MP4/WebM, or audio inside video files. `ffmpeg` and `ffprobe` are found through `PATH`, or through the `FFMPEG_BINARY` and `FFPROBE_BINARY` environment variables.
-- **Disk:** about 5 GB for the checkpoint directory: the 2.5 GB `model.safetensors` download plus the 2.5 GB converted `model.pth`.
-- **GPU memory:** the float32 weights take about 2.4 GB on the device. Transcription peaked at about 2.6 GB with the default settings on a 4 GB laptop GPU; see [Measured performance](#measured-performance).
+- **Disk:** about 6.2 GB for the checkpoint directory: the 2.5 GB `model.safetensors` download, the 2.5 GB converted `model.pth`, and the 1.2 GB `model.encoder-float16.pth` built from it on the first float16 run.
+- **GPU memory:** with the default float16 encoder the weights take about 1.2 GB on the device (2.4 GB in float32). Transcription peaked at about 2.0 GB with the default settings on a 4 GB laptop GPU; the batch size adapts to the free memory. See [Measured performance](#measured-performance).
 
 ## Installation
 
@@ -89,42 +90,50 @@ venv\Scripts\python.exe inference.py --transcribe path\to\folder
 
 `--transcribe` is the only argument. Everything else is set in `config.toml`.
 
-The first run downloads the checkpoint from Hugging Face, verifies every file against pinned hashes, converts it to `model.pth`, and writes a readiness marker. Later runs skip all of that.
+The first run downloads the checkpoint from Hugging Face, verifies every file against pinned hashes, converts it to `model.pth`, builds the float16 encoder file, and writes a readiness marker. Later runs skip all of that.
+
+For many short files sent one at a time, keep a [worker](#worker-for-many-short-files) running instead: each `inference.py` run spends about 5 s on startup.
 
 A folder run prints plain-text progress. This example is the five test clips in `tests/data/librispeech/` on an RTX 3050 Ti Laptop GPU:
 
 ```text
-Run id: 07d4afc4f690
-Log file: ...\logs\log_2026-09-27.txt
+Run id: 44ddd8e4ed21
+Log file: ...\logs\log_2026-10-06.txt
 Weights: ready
 Device: cuda:0
 Accelerator: CUDA
 Device count: 1
 Device name: NVIDIA GeForce RTX 3050 Ti Laptop GPU
-Precision: float32
+Precision: float16
 PyTorch: 2.14.0+cu132
 CUDA runtime: 13.2
 Python: 3.13.13
-Model load seconds: 3.481
+Encoder precision: float16 encoder, float32 decoder and joint
+Model load seconds: 2.115
+CUDA Graph decoding: on
+Accelerator memory ceiling: 2990 MiB
+Memory per full chunk: 55 MiB, full chunks that fit: 30
+Batch feature frames: 24000 (configured 24000)
 Transcribing 5 file(s)
-Batch: 1 / 6, Progress: 16.67 percent, Elapsed: 0.9 s, ETA: 4.7 s
-Batch: 6 / 6, Progress: 100.00 percent, Elapsed: 1.8 s, ETA: 0.0 s
+Batch: 1 / 6, Progress: 16.67 percent, Elapsed: 0.1 s, ETA: 0.6 s
+Batch: 6 / 6, Progress: 100.00 percent, Elapsed: 0.6 s, ETA: 0.0 s
 CSV: ...\transcriptions.csv
 Files: 5
 File statuses: ok=5
 Total audio seconds: 46.630
-Wall-clock seconds: 1.801
-Media decode seconds: 0.018
-Feature extraction seconds: 0.535
-Model generation seconds: 1.239
-Real-time factor: 0.038623
-Throughput audio seconds per second: 25.892
+Wall-clock seconds: 0.591
+Media decode seconds: 0.022
+Feature extraction seconds: 0.026
+Model generation seconds: 0.549
+Real-time factor: 0.012674
+Throughput audio seconds per second: 78.902
 Work items: 7, batches: 6
-Peak accelerator memory allocated: 2496.2 MiB
-Peak process memory: 3856.9 MiB
+Peak accelerator memory allocated: 1313.0 MiB
+Peak process memory: 1958.2 MiB
 ```
 
-`Peak process memory` is the largest resident memory of the whole process so far (peak working set on Windows, peak RSS elsewhere). Most of it is the checkpoint, which is read into CPU memory before it moves to the GPU.
+- `Accelerator memory ceiling` is the most PyTorch may hold on the GPU (see [`[memory]`](#memory)); `Memory per full chunk` and `full chunks that fit` are measured at startup and set the batch size.
+- `Peak process memory` is the largest resident memory of the whole process so far (peak working set on Windows, peak RSS elsewhere). Most of it is the memory-mapped checkpoint while it is copied to the GPU.
 
 ## Output
 
@@ -194,23 +203,35 @@ All settings live in `config.toml` at the repository root. Every key is required
 
 | Key | Default | Meaning |
 |---|---|---|
-| `batch_size` | `8` | Maximum chunks per micro-batch. |
+| `batch_size` | `16` | Maximum chunks per micro-batch. |
 | `recursive` | `true` | Include subfolders in folder mode. |
 | `output_filename` | `"transcriptions.csv"` | CSV name inside the input folder. Must be a plain file name. |
 | `audio_extensions` | `[]` | Optional suffix allow-list such as `[".wav", ".mp3"]`. Empty means every file is probed by content. |
 | `max_chunk_feature_frames` | `1500` | Hard limit on one chunk's feature frames, including overlap. At a 10 ms hop that is 15 s of audio. |
 | `overlap_feature_frames` | `50` | Context added on each side of a chunk (0.5 s). May be 0. `max_chunk_feature_frames` must be greater than twice this value. |
-| `max_batch_feature_frames` | `3000` | Limit on a batch's padded size: rows times the longest row. Must be at least `max_chunk_feature_frames`. |
+| `max_batch_feature_frames` | `24000` | Upper limit on a batch's padded size: rows times the longest row. Must be at least `max_chunk_feature_frames`. With `memory.auto_batch_budget` it is lowered at startup to what fits in the free GPU memory, never raised. |
 | `max_padding_fraction` | `0.25` | The largest share of a batch that may be padding, between 0 and 1. |
 | `merge_tolerance_feature_frames` | `100` | How far apart (1.0 s) two neighboring chunks may place the same word and still be recognized as one word at the seam. `0` disables seam alignment. |
 | `untranscribed_gap_seconds` | `4.0` | A stretch of a chunk this long with no word, and not silent, is treated as a possible decoder collapse and re-decoded. |
 | `gap_silence_rms` | `0.001` | RMS below which such a stretch counts as silence (about -60 dBFS) and is left alone. |
 | `recovery_start_offsets_feature_frames` | `[-25, 25, -50, 50]` | Window-start shifts tried, in order, when re-decoding a collapsed chunk. Each must be at most `overlap_feature_frames` in size. An empty list disables recovery. |
 | `progress_interval_seconds` | `2.0` | Minimum time between two progress lines. The final line is always printed. |
+| `max_open_files` | `8` | Most multi-chunk files decoded at the same time. Each holds an open decoder (a file handle, or an `ffmpeg` process) and its overlap tail until its last chunk. Single-chunk files do not count. At least 1. |
+| `encoder_precision` | `"float16"` | `"float16"` or `"float32"`. Float16 runs the encoder about 2.8 times faster and halves its weights; the decoder and joint stay float32. Used on CUDA only; CPU and MPS run float32. |
+| `cuda_graphs` | `true` | Replay each greedy decoding step as one captured CUDA Graph instead of about 46 kernel launches. Same output; CUDA only. |
+| `float32_matmul_precision` | `"highest"` | `"highest"` (exact float32) or `"high"` (TF32 tensor cores on NVIDIA Ampere and newer). With `encoder_precision = "float32"`, `"high"` was 13% faster end to end with the same word error rate. |
 
-`max_batch_feature_frames` and `max_chunk_feature_frames` are the memory controls. If a run stops with an out-of-memory error, lower them. The error message names both keys.
+### `[memory]`
 
-On Windows, the NVIDIA driver can place allocations that do not fit in VRAM into shared system memory instead of raising an out-of-memory error. The run then continues, but several times slower. If a run is suddenly much slower than usual and `Peak accelerator memory allocated` is close to the card's size, lower the same two keys.
+GPU only; CPU and MPS ignore it.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `cap_to_free_memory` | `true` | After loading, cap PyTorch's GPU allocator at the memory that is actually free. On Windows the NVIDIA driver otherwise moves allocations that do not fit in VRAM into shared system memory, and the run continues several times slower instead of failing. |
+| `auto_batch_budget` | `true` | Measure one and three full chunks at startup and lower `inference.max_batch_feature_frames` to what fits under the cap. |
+| `reserve_mib` | `256` | GPU memory to leave free under the cap, for kernels loaded later and other programs. When less than this is free, the run uses the physically free memory and prints a warning instead of refusing. At least 0. |
+
+If not even one full chunk fits in the free GPU memory, the run stops before the first batch and says so. Close other programs that use the GPU, or lower `inference.max_chunk_feature_frames`. If a run still stops with an out-of-memory error, raise `reserve_mib` or lower `inference.max_batch_feature_frames`; the error message names these keys.
 
 ### `[benchmark]`
 
@@ -220,6 +241,7 @@ Used only by the development benchmark command, not by transcription.
 |---|---|---|
 | `warmup_rounds` | `1` | Rounds run and discarded before measuring (CUDA kernel selection, file cache). At least 0. |
 | `measured_rounds` | `3` | Rounds that are timed and compared. At least 1. |
+| `git_timeout_seconds` | `30.0` | Limit for each git query that records the commit. On timeout the commit is recorded as unknown (null) instead of blocking the run. Greater than 0. |
 
 ## Supported input
 
@@ -237,29 +259,40 @@ libsndfile handles WAV (PCM and float), FLAC, OGG/Vorbis, MP3 and the other form
 There is no duration limit, and memory use does not grow with the length of the recording.
 
 1. **Planning.** Each file is cut into chunks. A chunk has a core that it owns, plus up to `overlap_feature_frames` of context on each side. The planner sizes chunks by the exact STFT frame count, `samples // 160 + 1`, so no chunk exceeds `max_chunk_feature_frames`.
-2. **Scheduling.** Chunks from all files are interleaved round-robin, so one long file cannot delay every short file behind it. They are then packed into micro-batches bounded by `batch_size`, by the padded size `max_batch_feature_frames`, and by `max_padding_fraction`.
-3. **Decoding.** Each file keeps one decoder handle open from its first chunk to its last. The overlap samples a chunk shares with the previous one are reused rather than decoded twice. Only the current chunk and one overlap tail per in-progress file are held in memory.
-4. **Inference.** Each batch goes through feature extraction, the encoder, and greedy TDT decoding on the selected device.
-5. **Collapse recovery.** On rare windows the model skips seconds of clear speech and emits nothing. The Hugging Face reference does the same on the same samples, so it is a property of the model. Moving the window start by a few hundred milliseconds usually fixes it. A chunk with a long non-silent stretch and no words is re-decoded with the shifted windows from `recovery_start_offsets_feature_frames`, and the first result without the gap is used. If none works, the file gets the status `untranscribed_gap`.
+2. **Scheduling.** Chunks from all files are interleaved round-robin, so one long file cannot delay every short file behind it. At most `max_open_files` multi-chunk files are in progress at once; the next starts when one finishes, and single-chunk files are never held back. Chunks are then packed into micro-batches bounded by `batch_size`, by the padded size `max_batch_feature_frames` (after the memory budget), and by `max_padding_fraction`.
+3. **Decoding.** Each file keeps one decoder handle open from its first chunk to its last. The overlap samples a chunk shares with the previous one are reused rather than decoded twice. Audio for the next batch is decoded on a background thread while the GPU processes the current one. Only the current and next batch and one overlap tail per in-progress file are held in memory.
+4. **Inference.** Each batch goes through feature extraction, the encoder (float16 by default), and greedy TDT decoding on the selected device. On CUDA each decoding step is one replayed CUDA Graph.
+5. **Collapse recovery.** On rare windows the model skips seconds of clear speech and emits nothing. The Hugging Face reference does the same on the same samples, so it is a property of the model. Moving the window start by a few hundred milliseconds usually fixes it. A chunk with a long non-silent stretch and no words is re-decoded with the shifted windows from `recovery_start_offsets_feature_frames`, and the first result without the gap is used. If none works, the file gets the status `untranscribed_gap`. The windows of each chunk are cut from one read of the audio, and the candidates of several chunks share batches.
 6. **Merging.** Tokens are grouped into words and a word is never split between chunks. In the overlap, the words both chunks agree on are taken once, from the chunk with more context at that point. Neighboring chunks can place the same word up to about half a second apart, so agreement is checked within `merge_tolerance_feature_frames`. Without agreement, each whole word goes to the chunk whose core holds its start. Repeated words are kept as spoken; nothing is corrected against a word list.
 
-If the accelerator runs out of memory, the run stops with a diagnostic. It does not retry, shrink the batch, fall back to CPU, or write a partial CSV.
+The batch budget is fitted to the free GPU memory before the first batch (see [`[memory]`](#memory)). If the accelerator still runs out of memory, the run stops with a diagnostic. It does not retry, shrink the batch, fall back to CPU, or write a partial CSV.
 
 ## Measured performance
 
-These numbers come from one machine: an NVIDIA GeForce RTX 3050 Ti Laptop GPU with 4 GB, PyTorch 2.14 + CUDA 13.2, Windows 11, default settings, and float32. They show what this hardware achieved, not a guarantee for other hardware. A laptop GPU's clock also varies with temperature by several percent between runs.
+These numbers come from one machine: an NVIDIA GeForce RTX 3050 Ti Laptop GPU with 4 GB, PyTorch 2.14 + CUDA 13.2, Windows 11, and default settings (float16 encoder, CUDA Graph decoding, automatic batch budget). They show what this hardware achieved, not a guarantee for other hardware. A laptop GPU's clock also varies with temperature by several percent between runs.
 
 | Workload | Audio | Wall-clock | Real-time factor | Peak VRAM allocated |
 |---|---|---|---|---|
-| One MP3, 48 kHz stereo | 36 min (2163 s) | 27 to 31 s | about 0.013 | 2591 MiB |
-| One MP3, 48 kHz stereo | 74 min (4420 s) | 57 to 62 s | about 0.013 | 2591 MiB |
-| Folder: 15 short WAV + both MP3s | 112 min | about 88 s | about 0.013 | 2591 MiB |
-| The 36-minute recording as M4A (AAC, through FFmpeg) | 36 min (2163 s) | 30.5 s (one run) | about 0.014 | not recorded |
+| One MP3, 48 kHz stereo | 36 min (2163 s) | 5.9 s | 0.0027 | 2034 MiB |
+| One MP3, 48 kHz stereo | 74 min (4420 s) | 12.6 s | 0.0028 | 2034 MiB |
+| The 36-minute recording as M4A (AAC, through FFmpeg) | 36 min (2163 s) | 5.8 s | 0.0027 | 2034 MiB |
+| Folder: 15 short WAV + both MP3s, benchmark command, 3 rounds | 112.6 min | 19.06 s (spread 0.12 s) | 0.0028 | 2034 MiB |
 
-- **Where the time goes:** in the 36-minute MP3 run, about 85% of the time is greedy decoding, about 12% is media decoding, and about 2% is feature extraction. For the M4A, media decoding takes 1.7 s of the total.
-- **Model load:** 2 to 4 seconds once the checkpoint is prepared and the file is in the OS cache.
-- **Memory does not grow with length:** peak VRAM and RAM growth were the same for the 36- and 74-minute files.
-- **Process memory:** about 3.9 GB peak, most of it the checkpoint staged on CPU during loading.
+The same 112.6-minute folder took 97.4 s with the earlier float32 settings (2 chunks per batch, no CUDA Graph, no decode prefetch). Word error rate against the labeled transcripts in that folder:
+
+| Settings | Corpus WER | 36-min podcast | 74-min podcast |
+|---|---|---|---|
+| Default (float16 encoder) | 6.67% | 7.42% | 6.29% |
+| `encoder_precision = "float32"` | 6.63% | 7.43% | 6.22% |
+| Hugging Face `ParakeetForTDT` pipeline, 15 s chunks without overlap | | 9.94% | 8.45% |
+
+The Hugging Face pipeline's default chunking (with overlap) repeats the overlapped speech in its transcript (52% WER) and cannot run either podcast in one piece on a 4 GB card (it ran out of memory above 3 minutes).
+
+- **Where the time goes** (112.6-minute folder): generation 13.2 s, mostly the encoder (per 16-chunk batch about 0.38 s of encoder against about 0.05 s of graph-replayed decoding loop); media decoding about 13 s, almost all hidden behind the GPU work; collapse recovery about 3.5 s (15 of 486 chunks re-decoded).
+- **Short files:** one `inference.py` run on a 9-second clip takes about 6 s, almost all of it startup. The [worker](#worker-for-many-short-files) answered such clips in 0.12 s each after a 5.2 s start.
+- **Model load:** about 2.1 s once the checkpoint and its float16 file are prepared and in the OS cache.
+- **Memory does not grow with length:** peak VRAM was the same for the 36- and 74-minute files.
+- **Process memory:** about 2.0 GB peak, most of it the memory-mapped checkpoint while it is copied to the GPU.
 
 CPU and Apple MPS execution is supported by the code but has not been benchmarked.
 
@@ -274,7 +307,7 @@ venv\Scripts\python.exe -m src.commands.benchmark --input path\to\audio_or_folde
 It loads the model once and reports that cold start on its own. It then runs `[benchmark] warmup_rounds` transcriptions that are discarded, and `measured_rounds` that are timed. Nothing is written next to the audio. Each run appends one JSON line to `<metrics_dir>/benchmark_<YYYY-MM-DD>.jsonl` with:
 
 - the git commit and whether the working tree had uncommitted changes;
-- the device report and the `[inference]` and `[benchmark]` settings;
+- the device report, encoder precision, whether CUDA Graph decoding was on, the memory budget, and the `[inference]` (after the budget), `[memory]`, and `[benchmark]` settings;
 - the input (files, audio seconds, unreadable files);
 - the cold start (weights action, bootstrap and load seconds);
 - every measured round: wall, media decode, feature, generation, and recovery seconds, real-time factor, work items, batches, peak accelerator memory, and per-file status, chunks, recovered chunks, processing seconds, and real-time factor;
@@ -283,6 +316,31 @@ It loads the model once and reports that cold start on its own. It then runs `[b
 - the peak process memory.
 
 To compare two commits, run both on the same input and compare the summaries. A laptop GPU's clock varies with temperature, so a difference smaller than the spread between rounds is noise.
+
+## Worker for many short files
+
+A program that transcribes many short files (a labeling tool, an editor plugin) can keep one worker process running and pay the model startup once:
+
+```powershell
+venv\Scripts\python.exe -m src.commands.worker
+```
+
+It reads one JSON object per line on standard input, as UTF-8, and answers with one JSON object per line on standard output. Responses are plain ASCII: other characters in paths and transcripts are written as JSON `\u` escapes, which every JSON parser decodes, so a console code page cannot corrupt them. Startup messages go to standard error.
+
+Sending one request for a test clip (the path shortened here):
+
+```text
+-> {"path": "tests/data/librispeech/1272-128104-0000.flac", "id": 1}
+<- {"event": "ready", "run_id": "87a8888c4cf0", "device": "cuda:0", "precision": "float16 encoder, float32 decoder and joint", "graph_decoding": true, "load_seconds": 2.056}
+<- {"event": "transcript", "id": 1, "path": "...\\tests\\data\\librispeech\\1272-128104-0000.flac", "status": "ok", "transcript": "mister Quilter is the apostle of the middle classes, and we are glad to welcome his gospel.", "duration_seconds": 5.855, "processing_seconds": 0.098}
+<- {"event": "done", "id": 1, "files": 1, "wall_seconds": 0.103}
+```
+
+- The first line the worker writes is the `ready` event, before any request is read.
+- `path` may be a file or a folder; a folder follows `inference.recursive` and `inference.audio_extensions`, and its files are batched together. `id` is optional and echoed back.
+- Unreadable files are answered with `"status": "unreadable"` and an `error`, followed by `done`, also when no file of the request was readable.
+- A request that cannot be served (a line that is not UTF-8 or not a JSON object with a string `path`, a path that does not exist, an out-of-memory batch) is answered with `{"event": "error", "id": ..., "error": "..."}`, and the worker keeps serving.
+- The worker stops at end of input. Everything is also written to the dated run log.
 
 ## Checkpoint preparation
 
@@ -302,7 +360,9 @@ It prepares `weights_dir` as follows:
 
 On every later run the fast path checks only that `.ready` exists and that `model.pth` still has the recorded size. A deleted, truncated, or replaced checkpoint triggers a full preparation again. To force one, delete `weights_dir/.ready`.
 
-`model.pth` is loaded with `torch.load(..., weights_only=True)`, which refuses arbitrary pickled objects.
+With the float16 encoder, the first run also builds `model.encoder-float16.pth` from `model.pth` and records it in `model.encoder-float16.json`. Loading that file reads half the bytes and peaks at about 2.0 GB of process memory instead of 4.2 GB. It is current only while `model.pth` is the same file it was built from (same size and modification time), and re-converting `model.pth` deletes it, so it is rebuilt automatically after any replacement or repair, or when it is incomplete; delete both files to force a rebuild. If the weights folder cannot be written (a read-only install), the run prints a warning and casts `model.pth` to float16 in memory instead, with the same result and a higher memory peak while loading.
+
+Checkpoints are loaded with `torch.load(..., weights_only=True)`, which refuses arbitrary pickled objects. For a GPU or MPS run the file is memory-mapped (`mmap=True`) instead of copied into private memory; on the CPU it is copied, because the loaded tensors are the model itself and a mapping would keep the file open, and on Windows impossible to replace, for as long as the process runs.
 
 ## Logs
 
@@ -316,8 +376,9 @@ A run logs:
 
 - the input and mode
 - the checkpoint action
-- the device report
+- the device report, encoder precision, and CUDA Graph decoding
 - the model load time
+- the memory ceiling and batch budget
 - the plan (files, work items, batches)
 - one line per file (status, duration, chunks, word count, processing seconds, real-time factor)
 - unreadable files
@@ -333,9 +394,9 @@ The suite uses pytest (`requirements-dev.txt`) and has three tiers, selected by 
 
 | Tier | Directory | What it needs | What it checks |
 |---|---|---|---|
-| `unit` | `tests/unit/` | nothing (tiny fixture checkpoint, CPU) | planner, features, TDT loop, media decoding, merge, statuses, settings, checkpoint download and conversion against a local HTTP server, CLI |
+| `unit` | `tests/unit/` | nothing (tiny fixture checkpoint, CPU) | planner, features, TDT loop and its static-buffer (CUDA Graph) form, media decoding, merge, statuses, settings, memory budget, float16 checkpoint file, worker protocol, checkpoint download and conversion against a local HTTP server, CLI |
 | `regression` | `tests/regression/` | nothing | one test per defect that was found and fixed, each naming the fixing commit |
-| `full` | `tests/full/` | the prepared checkpoint | real speech end to end: exact transcripts, word error rate, batching and determinism, long-form memory bound, anomalies, the real `inference.py` command, and parity with Hugging Face `ParakeetForTDT` (when `transformers` is installed) |
+| `full` | `tests/full/` | the prepared checkpoint | real speech end to end with the configured precision: exact transcripts, word error rate, batching and determinism, long-form memory bound, no empty chunks in full batches, captured CUDA Graph against the eager loop, the memory budget on the GPU, the real `inference.py` command and worker process, and parity with Hugging Face `ParakeetForTDT` (when `transformers` is installed) |
 
 ```powershell
 venv\Scripts\python.exe -m pytest                     # everything
@@ -343,9 +404,19 @@ venv\Scripts\python.exe -m pytest -m "not full"       # fast suite, no checkpoin
 venv\Scripts\python.exe -m pytest -m full             # real checkpoint and speech only
 ```
 
-The `full` tier uses five LibriSpeech clips committed under `tests/data/librispeech/` (CC BY 4.0; see `SOURCE.md` there). If the checkpoint has not been prepared, the whole tier is skipped with a message rather than downloading it. To also run your own long recordings through the long-form checks, list them in `PARAKEET_TEST_LONG_AUDIO`, separated by `;` on Windows or `:` elsewhere.
+The `full` tier uses five LibriSpeech clips committed under `tests/data/librispeech/` (CC BY 4.0; see `SOURCE.md` there). If the checkpoint has not been prepared, the whole tier is skipped with a message rather than downloading it.
 
-On the development machine the full suite takes about 70 seconds.
+Two optional checks use your own recordings, which stay outside the repository:
+
+- `PARAKEET_TEST_LONG_AUDIO`: long recordings to run through the long-form checks, separated by `;` on Windows or `:` elsewhere.
+- `PARAKEET_TEST_REFERENCE_DIR` and `PARAKEET_TEST_REFERENCE_MAX_WER`: a folder with audio files and a `transcript.txt` of `<file name><tab or spaces><reference text>` lines, and a corpus word error rate budget in percent. The test also fails when a long transcript's length is far from its reference (text repeated at seams) or when more than 10% of chunks needed collapse recovery.
+
+```powershell
+$env:PARAKEET_TEST_REFERENCE_DIR = "D:\labeled"; $env:PARAKEET_TEST_REFERENCE_MAX_WER = "7.0"
+venv\Scripts\python.exe -m pytest tests\full\test_reference_long_form.py -s
+```
+
+On the development machine the full suite takes about 55 seconds.
 
 ## Project layout
 
@@ -354,12 +425,12 @@ inference.py                  Command launcher (python inference.py --transcribe
 config.toml                   All runtime settings
 src/
   audio/                      Media probing and decoding (media.py), resampling (resampling.py), log-mel features (features.py)
-  checkpoint/                 Download and verification, safetensors -> model.pth, readiness marker
-  commands/                   CLI entry points (inference.py, prepare_checkpoint.py, benchmark.py) and progress reporting
+  checkpoint/                 Download and verification, safetensors -> model.pth, readiness marker, float16 encoder file (derived.py)
+  commands/                   Entry points (inference.py, prepare_checkpoint.py, benchmark.py, worker.py), shared model startup (model_loading.py), progress reporting
   configuration/              Checkpoint JSON validation (config.py), config.toml settings (settings.py)
-  inference/                  Chunk planning (planning.py), orchestration (offline.py), seam merging (merging.py), collapse recovery (recovery.py)
-  models/                     Subsampling, attention, Conformer blocks, encoder, LSTM decoder, joint, TDT loop
-  runtime/                    Device selection and report, dated logging, atomic file writes, process memory
+  inference/                  Chunk planning (planning.py), orchestration (offline.py), seam merging (merging.py), collapse recovery (recovery.py), memory budget (budget.py)
+  models/                     Subsampling, attention, Conformer blocks, encoder, LSTM decoder, joint, TDT loop, CUDA Graph decoding (graphed_decoding.py)
+  runtime/                    Device selection and report, dated logging, atomic file writes, process and GPU memory
   text/                       Tokenizer decoding from tokenizer.json
 tests/
   unit/                       Fast isolated tests (tiny fixture checkpoint)
@@ -374,8 +445,10 @@ tests/
 
 - **Chunking still costs a little accuracy.** On the test clips, word error rate is 3.7% when each clip is transcribed alone and 4.6% when the same speech is one 196-second recording cut into 15 chunks. Each chunk sees less context than the whole recording.
 - **Decoder collapse cannot always be recovered.** The first chunk of a file has no earlier audio to shift into, and some windows stay collapsed at every tried shift. Such files are marked `untranscribed_gap` rather than passed off as complete.
-- **The greedy decoding loop** is the dominant cost of a run. Each step launches dozens of small GPU kernels, so on a small GPU the loop is limited by launch overhead rather than arithmetic.
-- **Precision:** only float32 inference is implemented.
+- **Float16 is not token-identical across batch shapes.** The transcript text of each test clip is the same alone and in a mixed batch, but a blank or a duration can move by one frame. With `encoder_precision = "float32"` every token and duration is identical.
+- **cuDNN float16 depthwise convolution:** in cuDNN 9.24 it returned wrong values for some inputs in batches of 7 or more rows, emptying whole chunks. The depthwise convolutions therefore always run in float32; the cost is included in the numbers above.
+- **Recovery reads seek.** Collapse recovery reads each chunk's audio again: an MP3 seek costs time that grows with the position in the file, and an FFmpeg re-read starts at the requested time, which can be offset from the stream by a few samples (a few milliseconds).
+- **Without CUDA** there is no CUDA Graph decoding and the encoder runs in float32, so CPU and MPS are much slower; neither has been benchmarked.
 - **Scope:** the runtime does offline transcription only. There is no streaming, speaker diarization, word-level timestamps in the output, beam search, or language-model rescoring.
 - **Language:** the model has no language selection. It transcribes whatever it recognizes among its 25 languages.
 

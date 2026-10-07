@@ -59,6 +59,7 @@ def plan_items(path: Path, overlap: int):
         batch_size=4,
         max_batch_feature_frames=480,
         max_padding_fraction=1.0,
+        max_open_files=8,
     )
     return sorted(plan.items, key=lambda item: item.chunk_index)
 
@@ -142,3 +143,24 @@ def test_closing_the_session_stops_the_process(m4a: Path) -> None:
     session.close()
 
     assert process.poll() is not None
+
+
+def test_closing_mid_file_joins_the_stderr_thread_cleanly(m4a: Path) -> None:
+    """The drain thread must finish before its pipe is closed, without an exception."""
+
+    import threading
+
+    thread_errors: list[BaseException] = []
+    previous_hook = threading.excepthook
+    threading.excepthook = lambda arguments: thread_errors.append(arguments.exc_value)
+    try:
+        session = open_media_session(m4a)
+        session.read_sequential_segment(0, 8000, TARGET_RATE)
+        stream = session._stream
+        session.close()
+    finally:
+        threading.excepthook = previous_hook
+
+    assert not stream._stderr_thread.is_alive()
+    assert stream._process.stderr.closed
+    assert thread_errors == []

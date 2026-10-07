@@ -61,6 +61,7 @@ def sequential_chunks(path: Path, max_chunk: int, overlap: int):
         batch_size=4,
         max_batch_feature_frames=4 * max_chunk,
         max_padding_fraction=1.0,
+        max_open_files=8,
     )
     results = []
     with open_media_session(path) as session:
@@ -174,6 +175,7 @@ def test_chunk_at_exact_budget_boundary_is_not_one_frame_over(cores: int) -> Non
         batch_size=8,
         max_batch_feature_frames=3000,
         max_padding_fraction=0.25,
+        max_open_files=8,
     )
 
     assert max(item.feature_frames for item in plan.items) <= max_chunk
@@ -439,6 +441,7 @@ def test_batch_budget_counts_padded_frames() -> None:
         batch_size=8,
         max_batch_feature_frames=3000,
         max_padding_fraction=0.5,
+        max_open_files=8,
     )
 
     assert [item.feature_frames for item in plan.items] == [1333, 1000, 667]
@@ -540,7 +543,7 @@ def test_mistyped_input_fails_before_any_checkpoint_work(tmp_path: Path) -> None
     """The input was validated only after a possible 2.5 GB download and a model load."""
 
     with (
-        patch("src.commands.inference.ensure_first_run_ready") as bootstrap_mock,
+        patch("src.commands.model_loading.ensure_first_run_ready") as bootstrap_mock,
         redirect_stdout(io.StringIO()),
         redirect_stderr(io.StringIO()) as errors,
     ):
@@ -649,3 +652,196 @@ def test_empty_ffmpeg_output_is_an_empty_waveform_not_a_crash() -> None:
 
     assert _float32_samples(b"").numel() == 0
     assert _float32_samples(bytes(8)).tolist() == [0.0, 0.0]
+
+
+# =============================================================================
+# Fixed after the review of PR #5 (fix/runtime-memory-safety)
+# =============================================================================
+
+
+def test_active_row_emitting_the_pad_token_keeps_its_last_step(tmp_path: Path) -> None:
+    """
+    The trailing-column trim treated a column of pad tokens as post-completion
+    padding, but pad is a valid joint output: a row that emitted it on its
+    last step lost that step's duration and frames.
+    """
+
+    model = ParakeetTDT(load_config(write_tiny_checkpoint(tmp_path))).eval()
+    extractor = ParakeetFeatureExtractor(model.configuration)
+    features, mask = extractor([torch.randn(16000) * 0.1], [TARGET_RATE], CPU)
+    pad_id = model.configuration.pad_token_id
+    duration_count = len(model.configuration.durations)
+
+    def always_pad(decoder_hidden_states: torch.Tensor, encoder_hidden_states: torch.Tensor) -> torch.Tensor:
+        logits = torch.full((decoder_hidden_states.shape[0], 1, TINY_VOCAB_SIZE + duration_count), -1e4)
+        logits[..., pad_id] = 1e4
+        logits[..., TINY_VOCAB_SIZE + 1] = 1e4  # duration class 1: one frame
+        return logits
+
+    with patch.object(model.joint, "forward", always_pad):
+        result = model.generate(features, mask)
+
+    encoder_length = int(result.encoder_lengths[0])
+    assert result.sequences.shape[1] == 1 + encoder_length
+    assert int(result.durations[0].sum()) == encoder_length
+    assert int(result.frame_ends[0, -1]) == encoder_length
+
+
+def test_long_files_never_hold_more_decoders_than_the_limit(tmp_path: Path) -> None:
+    """
+    Round-robin started every multi-chunk file before any finished, so a
+    folder of hundreds of long files held hundreds of decoders at once (file
+    handles, or one ffmpeg process each for M4A/AAC).
+    """
+
+    open_sessions: list[object] = []
+    peak = [0]
+    original_open = offline_module.open_media_session
+
+    def tracking_open(path: Path):
+        session = original_open(path)
+        original_close = session.close
+        open_sessions.append(session)
+        peak[0] = max(peak[0], len(open_sessions))
+
+        def tracking_close() -> None:
+            if session in open_sessions:
+                open_sessions.remove(session)
+            original_close()
+
+        session.close = tracking_close
+        return session
+
+    paths = []
+    for index in range(7):
+        path = tmp_path / f"long_{index}.wav"
+        # 2.5 s at max_chunk 100 frames (1 s) gives three chunks per file.
+        write_float_wav(path, torch.full((40_000,), 0.1), TARGET_RATE)
+        paths.append(path)
+    transcriber = OfflineTranscriber(
+        ScriptedModel(3).eval(),
+        load_config(write_tiny_checkpoint(tmp_path / "checkpoint")),
+        inference_settings(batch_size=4, max_batch_feature_frames=400, max_open_files=2),
+    )
+    with patch.object(offline_module, "open_media_session", tracking_open):
+        result = transcriber.transcribe(paths)
+
+    assert len(result.files) == 7
+    assert all(len(file_result.chunks) >= 3 for file_result in result.files)
+    assert peak[0] == 2
+    assert open_sessions == []
+
+
+def test_ffmpeg_stream_start_failure_names_the_file(tmp_path: Path) -> None:
+    """Popen errors escaped as a bare OSError, unlike the one-off decode's ValueError."""
+
+    from src.audio import media
+
+    path = tmp_path / "clip.m4a"
+    path.write_bytes(b"not decoded in this test")
+    with patch.object(media, "_codec_binary", return_value="ffmpeg"), patch.object(
+        media.subprocess, "Popen", side_effect=PermissionError(errno.EACCES, "denied")
+    ):
+        with pytest.raises(ValueError, match="clip.m4a"):
+            media._FfmpegStream(path, TARGET_RATE)
+
+
+# =============================================================================
+# Fixed in perf/throughput-and-precision
+# =============================================================================
+
+
+def test_collapse_recovery_reads_the_audio_once_per_chunk(tmp_path: Path, tiny_configuration) -> None:
+    """
+    Every shifted window was decoded on its own, one seek each. An MP3 seek in
+    libsndfile costs about 9 ms per minute of position, so recovering chunks
+    late in a 74-minute podcast cost more than the model (9 s for 12 chunks).
+    """
+
+    from src.audio.media import MediaSession
+    from support import SteadySpeechModel
+
+    path = tmp_path / "speech.wav"
+    write_float_wav(path, torch.full((48_000,), 0.1), TARGET_RATE)
+    offsets = (-3, 3, -5, 5)
+    transcriber = OfflineTranscriber(
+        # Every call after the first collapses, so no window succeeds and the
+        # old code read all four windows for every collapsed chunk.
+        SteadySpeechModel(3, collapse_calls=frozenset(range(1, 1000))).eval(),
+        tiny_configuration,
+        inference_settings(
+            batch_size=1,
+            max_chunk_feature_frames=100,
+            overlap_feature_frames=5,
+            untranscribed_gap_seconds=0.5,
+            recovery_start_offsets_feature_frames=offsets,
+        ),
+    )
+    reads_during_recovery: list[tuple[int, int]] = []
+    recovered_chunks: list[int] = []
+    recovering = [False]
+    original_read = MediaSession.read_segment
+    original_recover = OfflineTranscriber._recover_file
+
+    def counting_read(self, start: int, end: int, rate: int):
+        if recovering[0]:
+            reads_during_recovery.append((start, end))
+        return original_read(self, start, end, rate)
+
+    def flagged_recover(self, chunks, metadata, session):
+        recovered_chunks.extend(chunk.item.chunk_index for chunk in chunks if self._has_untranscribed_gap(chunk))
+        recovering[0] = True
+        try:
+            return original_recover(self, chunks, metadata, session)
+        finally:
+            recovering[0] = False
+
+    with patch.object(MediaSession, "read_segment", counting_read), patch.object(
+        OfflineTranscriber, "_recover_file", flagged_recover
+    ):
+        file_result = transcriber.transcribe([path]).files[0]
+
+    assert recovered_chunks
+    assert len(reads_during_recovery) == len(recovered_chunks)
+    assert file_result.status is FileStatus.UNTRANSCRIBED_GAP
+
+
+def test_slices_of_one_decode_equal_separate_decodes(tmp_path: Path) -> None:
+    from src.audio.media import slice_segment
+
+    path = tmp_path / "tone.wav"
+    tone = torch.sin(torch.arange(48_000, dtype=torch.float32) * 0.05) * 0.3
+    write_float_wav(path, tone, 48_000)  # resampled to 16 kHz on read
+    with open_media_session(path) as session:
+        span = session.read_segment(1_000, 9_000, TARGET_RATE)
+        separate = session.read_segment(2_500, 7_500, TARGET_RATE)
+
+    piece = slice_segment(span, 2_500, 7_500)
+
+    assert piece.source_start_frame == 2_500 and piece.source_end_frame == 7_500
+    assert torch.allclose(piece.waveform, separate.waveform, atol=1e-6)
+    with pytest.raises(ValueError, match="outside"):
+        slice_segment(span, 500, 2_000)
+
+
+def test_slices_keep_the_parent_finite_flag_and_their_own_rms() -> None:
+    from src.audio.media import DecodedSegment, slice_segment
+
+    waveform = torch.cat((torch.zeros(100), torch.full((100,), 0.5)))
+    parent = DecodedSegment(
+        waveform=waveform,
+        sample_rate=TARGET_RATE,
+        source_start_frame=1_000,
+        source_end_frame=1_200,
+        source_sample_rate=TARGET_RATE,
+        source_channels=1,
+        rms=float(torch.sqrt(torch.mean(waveform.square()))),
+        finite=False,
+    )
+
+    silent = slice_segment(parent, 1_000, 1_100)
+    loud = slice_segment(parent, 1_100, 1_200)
+
+    assert silent.rms == 0.0 and loud.rms == pytest.approx(0.5)
+    assert silent.finite is False and loud.finite is False
+    assert slice_segment(parent, 1_050, 1_050).rms == 0.0

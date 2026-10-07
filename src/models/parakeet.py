@@ -18,6 +18,7 @@ from torch import nn
 
 from ..configuration.config import ParakeetConfig, load_config
 from ..runtime.device import select_device
+from .conformer import ConvolutionModule
 from .decoder import Decoder, DecoderCache
 from .encoder import Encoder
 from .joint import JointNetwork
@@ -59,6 +60,26 @@ class GenerationResult:
     encoder_finite: torch.BoolTensor
 
 
+@dataclass(frozen=True)
+class DecodedSteps:
+    """
+    Raw per-step buffers of one greedy decoding run, before trimming.
+
+    Attributes:
+        sequences: ``(B, capacity)`` emitted tokens; column 0 is the start token.
+        durations: ``(B, capacity)`` frames advanced per step.
+        frame_starts: ``(B, capacity)`` frame of each step, -1 once a row finished.
+        written_columns: Columns written, including steps run after completion.
+        forced_advances: ``(B,)`` per-frame guard activations.
+    """
+
+    sequences: torch.Tensor
+    durations: torch.Tensor
+    frame_starts: torch.Tensor
+    written_columns: int
+    forced_advances: torch.Tensor
+
+
 # =============================================================================
 # Parakeet TDT composition
 # =============================================================================
@@ -85,6 +106,8 @@ class ParakeetTDT(nn.Module):
         self.decoder = Decoder(configuration)
         self.joint = JointNetwork(configuration)
         self.max_symbols_per_step = configuration.model["max_symbols_per_step"]
+        # Set by enable_graph_decoding(); None means the eager loop.
+        self.graph_decoder = None
 
         # Duration classes map a joint-output index to a frame count. The
         # buffer is not persistent, so the checkpoint key set is unchanged, and
@@ -94,6 +117,36 @@ class ParakeetTDT(nn.Module):
             torch.tensor(configuration.durations, dtype=torch.long, device="cpu"),
             persistent=False,
         )
+
+    @property
+    def encoder_dtype(self) -> torch.dtype:
+        """Floating-point type the encoder runs in."""
+
+        return self.encoder_projector.weight.dtype
+
+    def set_encoder_dtype(self, dtype: torch.dtype) -> None:
+        """
+        Run the acoustic encoder in ``dtype``; the decoder and joint stay float32.
+
+        Float16 makes the encoder about 2.8 times faster on tensor-core GPUs
+        and halves its weights (2393 to 1231 MiB in total). Measured word error
+        rate on two labeled podcasts (110 minutes) was unchanged: 7.42 and
+        6.22 percent against 7.43 and 6.22 in float32. Kept in float32:
+
+        * the decoder and joint, whose per-step argmax decides tokens and
+          whose cost is kernel launches, not arithmetic;
+        * the relative positional frequencies, whose smallest values lose
+          most of their precision in float16;
+        * every depthwise convolution (see ConvolutionModule.forward).
+        """
+
+        frequencies = self.encoder.encode_positions.inv_freq.clone()
+        self.encoder.to(dtype)
+        self.encoder_projector.to(dtype)
+        self.encoder.encode_positions.inv_freq = frequencies
+        for module in self.encoder.modules():
+            if isinstance(module, ConvolutionModule):
+                module.depthwise_conv.float()
 
     def encode(
         self,
@@ -108,18 +161,19 @@ class ParakeetTDT(nn.Module):
             attention_mask: Valid input frames ``(B, T_in)``.
 
         Returns:
-            Projected encoder states ``(B, T_out, H_decoder)`` and valid encoder
-            mask ``(B, T_out)``.
+            Projected encoder states ``(B, T_out, H_decoder)`` in float32 for
+            the decoding loop, and the valid encoder mask ``(B, T_out)``.
         """
 
         hidden_states, output_mask = self.encoder(
-            input_features,
+            input_features.to(self.encoder_dtype),
             attention_mask,
         )
         if output_mask is None:
             raise RuntimeError("TDT generation requires an attention mask")
 
-        return self.encoder_projector(hidden_states), output_mask
+        projected = self.encoder_projector(hidden_states)
+        return projected.float(), output_mask
 
     @torch.inference_mode()
     def generate(
@@ -150,8 +204,6 @@ class ParakeetTDT(nn.Module):
         """
 
         encoder_states, encoder_mask = self.encode(input_features, attention_mask)
-        batch_size, encoder_length, _ = encoder_states.shape
-        device = encoder_states.device
         valid_lengths = encoder_mask.sum(dim=-1)
 
         # One reduction per batch (not per step): padded frames are excluded
@@ -159,6 +211,53 @@ class ParakeetTDT(nn.Module):
         finite_or_padding = torch.isfinite(encoder_states) | ~encoder_mask[:, :, None]
         encoder_finite = finite_or_padding.all(dim=2).all(dim=1)
 
+        graph_decoder = self.graph_decoder
+        if graph_decoder is not None and graph_decoder.accepts(encoder_states):
+            decoded = graph_decoder.decode(encoder_states, valid_lengths, encoder_finite)
+        else:
+            decoded = self._decode_eager(encoder_states, valid_lengths, encoder_finite)
+        return self._finish_generation(decoded, valid_lengths, encoder_finite)
+
+    def enable_graph_decoding(self, max_batch_rows: int, max_encoder_frames: int) -> None:
+        """
+        Decode on CUDA through one captured CUDA Graph per step.
+
+        The eager loop launches about 46 small kernels per emitted symbol, so
+        on a small GPU it is bound by launch overhead (1.2 to 2.0 ms per step
+        against 0.4 ms of GPU work, measured). Replaying a captured step costs
+        one launch; output is bit-identical. One graph sized for the largest
+        batch serves every smaller one (see GraphedGreedyDecoder). Batches
+        beyond the given bounds, and non-CUDA devices, use the eager loop.
+
+        Args:
+            max_batch_rows: Most rows a batch may have.
+            max_encoder_frames: Most encoder frames a row may have.
+        """
+
+        from .graphed_decoding import GraphedGreedyDecoder
+
+        device = next(self.parameters()).device
+        if device.type != "cuda":
+            self.graph_decoder = None
+            return
+        self.graph_decoder = GraphedGreedyDecoder(self, max_batch_rows, max_encoder_frames)
+
+    @staticmethod
+    def initial_finished(valid_lengths: torch.Tensor, encoder_finite: torch.Tensor) -> torch.Tensor:
+        """Rows with nothing to decode: empty input or non-finite encoder states."""
+
+        return (valid_lengths <= 0) | ~encoder_finite
+
+    def _decode_eager(
+        self,
+        encoder_states: torch.Tensor,
+        valid_lengths: torch.Tensor,
+        encoder_finite: torch.Tensor,
+    ) -> DecodedSteps:
+        """The greedy TDT loop, one kernel launch per operation per step."""
+
+        batch_size, encoder_length, _ = encoder_states.shape
+        device = encoder_states.device
         blank_token_id = self.configuration.blank_token_id
         pad_token_id = self.configuration.pad_token_id
         vocab_size = self.configuration.vocab_size
@@ -166,7 +265,7 @@ class ParakeetTDT(nn.Module):
         frame_indices = torch.zeros(batch_size, dtype=torch.long, device=device)
         symbols_on_frame = torch.zeros_like(frame_indices)
         forced_advances = torch.zeros_like(frame_indices)
-        finished = (valid_lengths <= 0) | ~encoder_finite
+        finished = self.initial_finished(valid_lengths, encoder_finite)
 
         decoder_input_ids = torch.full(
             (batch_size, 1),
@@ -195,19 +294,21 @@ class ParakeetTDT(nn.Module):
         batch_indices = torch.arange(batch_size, device=device)
         blank_ids = torch.full((batch_size,), blank_token_id, dtype=torch.long, device=device)
         pad_ids = torch.full_like(blank_ids, pad_token_id)
+        # Frame-start marker of a row that no longer decodes. Real frame
+        # indices are never negative, so the marker identifies the steps that
+        # ran only after every row had finished.
+        inactive_frame = torch.full_like(blank_ids, -1)
         max_symbols = self.max_symbols_per_step
 
         # This loop runs once per emitted symbol, so each elementwise op below
         # is a kernel launch paid thousands of times per batch. An identity
         # duration table (Parakeet's 0..4) therefore skips the lookup.
-        duration_classes_are_frames = self.configuration.durations == tuple(
-            range(len(self.configuration.durations))
-        )
+        duration_classes_are_frames = self.durations_are_frame_counts
 
         for step in range(maximum_steps):
             # Checking for completion copies a flag to the host and stalls the
             # GPU queue, so it runs only every few steps. Steps taken after
-            # every row finished emit padding only and are trimmed below.
+            # every row finished emit padding only and are trimmed later.
             if step % FINISHED_CHECK_INTERVAL == 0 and bool(finished.all()):
                 break
 
@@ -253,7 +354,7 @@ class ParakeetTDT(nn.Module):
             emitted_durations = frame_advance * active
             sequence_buffer[:, output_length] = emitted_token_ids
             duration_buffer[:, output_length] = emitted_durations
-            frame_start_buffer[:, output_length] = frame_indices * active
+            frame_start_buffer[:, output_length] = torch.where(active, frame_indices, inactive_frame)
             output_length += 1
 
             frame_indices = frame_indices + emitted_durations
@@ -269,22 +370,47 @@ class ParakeetTDT(nn.Module):
                     "exhaustion despite the per-frame symbol guard"
                 )
 
-        # Drop trailing columns in which every row only padded (the steps run
-        # between completion and the next check), so the result is the same
-        # as stopping at the exact step. Column 0 is the start token, never
-        # padding, so at least one column remains.
-        written = sequence_buffer[:, :output_length] != pad_token_id  # (B, U)
-        output_length = int(written.any(dim=0).nonzero().max()) + 1
+        return DecodedSteps(
+            sequences=sequence_buffer,
+            durations=duration_buffer,
+            frame_starts=frame_start_buffer,
+            written_columns=output_length,
+            forced_advances=forced_advances,
+        )
 
-        durations = duration_buffer[:, :output_length]
-        frame_starts = frame_start_buffer[:, :output_length]
+    @property
+    def durations_are_frame_counts(self) -> bool:
+        """Whether duration class i means i frames (Parakeet's table 0..4)."""
+
+        return self.configuration.durations == tuple(range(len(self.configuration.durations)))
+
+    @staticmethod
+    def _finish_generation(
+        decoded: DecodedSteps,
+        valid_lengths: torch.Tensor,
+        encoder_finite: torch.Tensor,
+    ) -> GenerationResult:
+        """Trim the step buffers to the steps that decoded something."""
+
+        # Keep exactly the steps in which some row was still decoding. Rows only
+        # finish, never restart, so those steps are a prefix; the steps run
+        # between completion and the next check come after it and are
+        # dropped, giving the same result as stopping at the exact step. The
+        # pad token itself is a valid joint output, so it cannot mark them.
+        step_frame_starts = decoded.frame_starts[:, 1 : decoded.written_columns]  # (B, steps)
+        step_was_active = (step_frame_starts >= 0).any(dim=0)  # (steps,)
+        output_length = 1 + int(step_was_active.sum())
+
+        durations = decoded.durations[:, :output_length]
+        # Rows that had finished report frame 0, as before the marker existed.
+        frame_starts = decoded.frame_starts[:, :output_length].clamp(min=0)
         return GenerationResult(
-            sequences=sequence_buffer[:, :output_length],
+            sequences=decoded.sequences[:, :output_length],
             durations=durations,
             frame_starts=frame_starts,
             frame_ends=frame_starts + durations,
             encoder_lengths=valid_lengths,
-            forced_advances=forced_advances,
+            forced_advances=decoded.forced_advances,
             encoder_finite=encoder_finite,
         )
 
@@ -301,6 +427,8 @@ class ParakeetTDT(nn.Module):
 def load_model(
     weights_dir: Path,
     device: torch.device | None = None,
+    encoder_dtype: torch.dtype = torch.float32,
+    checkpoint_file: Path | None = None,
 ) -> tuple[ParakeetTDT, ParakeetConfig, dict[str, Any]]:
     """
     Strict-load ``model.pth`` into the standalone architecture.
@@ -309,6 +437,12 @@ def load_model(
         weights_dir: Directory containing JSON artifacts and ``model.pth``.
         device: Optional target device. When omitted, centralized automatic
             selection chooses CUDA, MPS, or CPU.
+        encoder_dtype: Encoder precision (see ``ParakeetTDT.set_encoder_dtype``).
+            A float32 checkpoint is cast on the CPU, so a float16 encoder also
+            halves the bytes copied to the accelerator.
+        checkpoint_file: Checkpoint to read instead of ``model.pth``, such as
+            the float16-encoder file from ``checkpoint.derived``. Its encoder
+            may already be in ``encoder_dtype``.
 
     Returns:
         Loaded eval-mode model, validated configuration, and checkpoint metadata.
@@ -326,12 +460,23 @@ def load_model(
     with torch.device("meta"):
         model = ParakeetTDT(configuration)
 
+    resolved_device = device or select_device()
+
     # weights_only=True refuses arbitrary pickled objects, so a replaced or
     # tampered model.pth cannot execute code during load.
+    #
+    # For an accelerator, mmap=True maps the file instead of copying 2.4 GB
+    # into private memory: copied tensors stayed resident after the move to
+    # the GPU (3.1 GB working set, 8.2 GB commit charge measured), while
+    # mapped pages are released with the CPU tensors (0.7 GB, 4.1 GB), at the
+    # same load time. On the CPU the loaded tensors are the model itself, so
+    # a mapping would stay open for the life of the process and, on Windows,
+    # block replacing or repairing the checkpoint file; copy instead.
     checkpoint = torch.load(
-        configuration.checkpoint_path,
+        checkpoint_file or configuration.checkpoint_path,
         map_location="cpu",
         weights_only=True,
+        mmap=resolved_device.type != "cpu",
     )
     if not isinstance(checkpoint, dict) or "state_dict" not in checkpoint:
         raise ValueError("model.pth must contain a dictionary with state_dict")
@@ -347,8 +492,16 @@ def load_model(
         )
 
     _require_materialized(model)
+    stored_dtype = model.encoder_dtype
+    if stored_dtype != encoder_dtype:
+        # Only a float32 checkpoint can be narrowed; widening a float16 one
+        # would look like float32 but carry float16's rounding.
+        if stored_dtype != torch.float32:
+            raise ValueError(
+                f"The checkpoint stores a {stored_dtype} encoder and cannot be loaded as {encoder_dtype}"
+            )
+        model.set_encoder_dtype(encoder_dtype)
 
-    resolved_device = device or select_device()
     model = model.to(resolved_device)
     model.eval()
 

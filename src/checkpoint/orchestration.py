@@ -22,10 +22,12 @@ from typing import Any, Callable
 
 import torch
 
+from ..configuration.config import CHECKPOINT_FILENAME
 from ..configuration.settings import CheckpointSettings
 from ..runtime.filesystem import write_json_atomic
 from .artifacts import sha256_file
 from .conversion import convert_checkpoint
+from .derived import remove_derived_checkpoints
 from .download import DownloadResult, ensure_checkpoint_files, load_manifest
 
 
@@ -143,7 +145,7 @@ def ensure_converted_checkpoint(
     """
 
     checkpoint_dir = checkpoint_dir.resolve()
-    output_path = checkpoint_dir / "model.pth"
+    output_path = checkpoint_dir / CHECKPOINT_FILENAME
     download_manifest = load_manifest(checkpoint_dir)
     files = download_manifest["files"]
 
@@ -206,7 +208,7 @@ def ensure_converted_checkpoint(
 
     # Convert to a same-directory temporary path so a failed conversion cannot
     # corrupt the last valid model.pth. The converter creates the parent directory.
-    temporary_output = checkpoint_dir / "model.pth.converting"
+    temporary_output = checkpoint_dir / f"{CHECKPOINT_FILENAME}.converting"
     temporary_output.unlink(missing_ok=True)
     try:
         convert_checkpoint(
@@ -218,6 +220,7 @@ def ensure_converted_checkpoint(
     except Exception:
         temporary_output.unlink(missing_ok=True)
         raise
+    remove_derived_checkpoints(checkpoint_dir)
 
     output_sha256 = sha256_file(output_path)
     result = ConversionResult(

@@ -86,9 +86,18 @@ def real_settings() -> Settings:
 def real_model(real_settings: Settings):
     """Load the full-weight model once per test session on the auto-selected device."""
 
-    from src.models.parakeet import load_model
+    from src.commands.model_loading import inference_model_loader
+    from src.runtime.device import apply_float32_matmul_precision, encoder_dtype_for, select_device
 
-    model, configuration, _metadata = load_model(real_settings.paths.weights_dir)
+    # The configured precision, so the full tier checks what a run would use.
+    device = select_device()
+    apply_float32_matmul_precision(real_settings.inference.float32_matmul_precision)
+    encoder_dtype, _description = encoder_dtype_for(real_settings.inference.encoder_precision, device)
+    loader = inference_model_loader(device, encoder_dtype)
+    model, configuration, _metadata = loader(real_settings.paths.weights_dir)
+    from src.inference.offline import enable_graph_decoding
+
+    enable_graph_decoding(model, real_settings.inference)
     return model, configuration
 
 

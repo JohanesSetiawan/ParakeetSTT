@@ -6,6 +6,7 @@ from .media import (
     MediaSession,
     inspect_media,
     open_media_session,
+    slice_segment,
 )
 
 __all__ = [
@@ -15,4 +16,5 @@ __all__ = [
     "build_mel_filter_bank",
     "inspect_media",
     "open_media_session",
+    "slice_segment",
 ]

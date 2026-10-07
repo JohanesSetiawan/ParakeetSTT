@@ -19,14 +19,20 @@ retry_backoff_seconds = 2.0
 stream_block_bytes = 1048576
 
 [inference]
-batch_size = 8
+# Most rows (chunks) in one batch. Short clips need many rows to fill the
+# GPU; long audio is limited by max_batch_feature_frames below.
+batch_size = 16
 recursive = true
 output_filename = "transcriptions.csv"
 # Empty list means every file is content-probed instead of filtered by extension.
 audio_extensions = []
 max_chunk_feature_frames = 1500
 overlap_feature_frames = 50
-max_batch_feature_frames = 3000
+# Upper limit on a batch's padded size (rows x longest row). With
+# memory.auto_batch_budget it is lowered at startup to what fits in the free
+# VRAM, so it can be set for the largest card in use. Per chunk, 8 rows ran
+# 1.6 times faster than 2 with the same transcripts (RTX 3050 Ti, float32).
+max_batch_feature_frames = 24000
 max_padding_fraction = 0.25
 # How far apart two neighbouring chunks may place the same word in time
 # (feature frames of 10 ms). Measured drift reaches about 0.5 s, so 100 frames
@@ -43,9 +49,45 @@ gap_silence_rms = 0.001
 recovery_start_offsets_feature_frames = [-25, 25, -50, 50]
 # Minimum wall-clock gap between two terminal progress lines.
 progress_interval_seconds = 2.0
+# Most multi-chunk files decoded at the same time. Each one holds an open
+# decoder (a file handle, or an ffmpeg process for formats libsndfile cannot
+# read) and its overlap tail until its last chunk, so a folder of hundreds of
+# long files must not open them all at once. Single-chunk files do not count.
+max_open_files = 8
+# Precision of the acoustic encoder on CUDA: "float16" or "float32". Float16
+# is about 2.8 times faster in the encoder and halves its weights; on two
+# labeled podcasts (110 minutes) the word error rate was the same as float32.
+# The decoder and joint always run in float32. CPU and MPS always use float32.
+encoder_precision = "float16"
+# CUDA only: replay each greedy decoding step as one captured CUDA Graph
+# instead of about 46 separate kernel launches. Same output, 3 to 5 times
+# faster decoding loop on the RTX 3050 Ti. Other devices ignore it.
+cuda_graphs = true
+# Float32 matrix products: "highest" (exact) or "high" (TF32 tensor cores on
+# NVIDIA Ampere and newer). Matters when encoder_precision is "float32": the
+# encoder then ran 28 percent faster with the same tokens on sampled batches.
+# With the float16 encoder only the decoder and joint use float32 products.
+float32_matmul_precision = "highest"
+
+[memory]
+# GPU only (ignored on CPU and MPS). After the model loads, PyTorch is capped
+# to the VRAM that is actually free minus reserve_mib. On Windows an
+# over-allocation would otherwise spill silently into shared system memory and
+# run several times slower instead of failing.
+cap_to_free_memory = true
+# Measure the memory of one and of three full chunks after loading and lower
+# inference.max_batch_feature_frames, when needed, to what fits under that
+# cap. The configured value stays the upper limit; it is never raised.
+auto_batch_budget = true
+# VRAM left outside the cap, measured after calibration has already loaded
+# the libraries: room for kernels loaded later and for other programs.
+reserve_mib = 256
 
 [benchmark]
 # Development benchmark: rounds run and discarded before measuring (CUDA
 # kernel selection, file cache), then rounds that are measured and compared.
 warmup_rounds = 1
 measured_rounds = 3
+# Limit for each git query that records the commit in a benchmark record; on
+# timeout the commit is recorded as unknown instead of blocking the run.
+git_timeout_seconds = 30.0

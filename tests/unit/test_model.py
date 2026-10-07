@@ -216,6 +216,38 @@ def test_model_pth_round_trip_is_strict_and_fully_materialized(tmp_path: Path) -
     assert not loaded.training
 
 
+@pytest.mark.parametrize(("device", "mapped"), [(torch.device("cpu"), False), (torch.device("meta"), True)])
+def test_checkpoint_is_mapped_only_for_accelerators_and_always_loaded_safely(
+    tmp_path: Path,
+    device: torch.device,
+    mapped: bool,
+) -> None:
+    """
+    For an accelerator, mmap keeps the 2.4 GB checkpoint out of private memory.
+    On the CPU the loaded tensors are the model, so a mapping would hold the
+    file open for the whole process (on Windows it could then not be replaced
+    or repaired). weights_only blocks pickled code either way. The meta device
+    stands in for an accelerator: anything that is not the CPU.
+    """
+
+    source = build_tiny_model(tmp_path)
+    torch.save({"state_dict": source.state_dict(), "config": {}, "metadata": {}}, tmp_path / "model.pth")
+    calls: list[dict] = []
+    real_load = torch.load
+
+    def spying_load(*args, **kwargs):
+        calls.append(kwargs)
+        return real_load(*args, **kwargs)
+
+    with patch.object(torch, "load", spying_load):
+        load_model(tmp_path, device=device)
+
+    assert len(calls) == 1
+    assert calls[0]["mmap"] is mapped
+    assert calls[0]["weights_only"] is True
+    assert calls[0]["map_location"] == "cpu"
+
+
 def test_missing_state_dict_key_is_rejected(tmp_path: Path) -> None:
     state_dict = build_tiny_model(tmp_path).state_dict()
     state_dict.pop("joint.head.weight")
