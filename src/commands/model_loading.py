@@ -25,6 +25,7 @@ from ..inference.offline import enable_graph_decoding
 from ..models.parakeet import ParakeetTDT, load_model
 from ..runtime.device import (
     RuntimeReport,
+    apply_float16_accumulation,
     apply_float32_matmul_precision,
     describe_runtime,
     encoder_dtype_for,
@@ -60,10 +61,12 @@ def inference_model_loader(
         if encoder_dtype == torch.float16:
 
             def half_encoder_checkpoint() -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
+                # Unfolded: the derived file must keep the checkpoint layout.
                 model, _configuration, metadata = load_model(
                     weights_dir,
                     torch.device("cpu"),
                     encoder_dtype=torch.float16,
+                    fold_batch_norm=False,
                 )
                 return model.state_dict(), metadata
 
@@ -108,6 +111,7 @@ class PreparedModel:
         load_seconds: Bootstrap and strict load time.
         runtime: Device and library versions.
         precision: Human-readable precision of encoder and decoder.
+        float16_accumulation: State of float16 accumulation ("on", "off ...").
         graph_decoding: Whether CUDA Graph decoding is on.
         memory_budget: The memory ceiling and batch budget decision.
     """
@@ -119,6 +123,7 @@ class PreparedModel:
     load_seconds: float
     runtime: RuntimeReport
     precision: str
+    float16_accumulation: str
     graph_decoding: bool
     memory_budget: MemoryBudget
 
@@ -158,6 +163,11 @@ def prepare_inference_model(settings: Settings, report: Callable[[str], None]) -
     for line in runtime.lines():
         report(line)
     report(f"Encoder precision: {precision}")
+    float16_accumulation = apply_float16_accumulation(
+        settings.inference.float16_accumulation,
+        encoder_dtype,
+    )
+    report(f"Float16 accumulation: {float16_accumulation}")
     report(f"Model load seconds: {load_seconds:.3f}")
 
     graph_decoding = enable_graph_decoding(model, settings.inference)
@@ -180,6 +190,7 @@ def prepare_inference_model(settings: Settings, report: Callable[[str], None]) -
         load_seconds=load_seconds,
         runtime=runtime,
         precision=precision,
+        float16_accumulation=float16_accumulation,
         graph_decoding=graph_decoding,
         memory_budget=memory_budget,
     )

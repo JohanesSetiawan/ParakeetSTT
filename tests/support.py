@@ -170,6 +170,8 @@ def inference_settings(**overrides: object) -> InferenceSettings:
         "encoder_precision": "float32",
         "cuda_graphs": False,
         "float32_matmul_precision": "highest",
+        "float16_accumulation": False,
+        "decode_workers": 1,
     }
     values.update(overrides)
     return InferenceSettings(**values)  # type: ignore[arg-type]

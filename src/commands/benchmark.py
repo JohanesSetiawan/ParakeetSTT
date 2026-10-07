@@ -184,6 +184,7 @@ def run_benchmark(input_path: Path, settings: Settings, run_id: str) -> tuple[di
         "git": git_revision(settings.benchmark.git_timeout_seconds),
         "runtime": dataclasses.asdict(prepared.runtime),
         "encoder_precision": prepared.precision,
+        "float16_accumulation": prepared.float16_accumulation,
         "graph_decoding": prepared.graph_decoding,
         "settings": {
             "inference": dataclasses.asdict(inference_settings),

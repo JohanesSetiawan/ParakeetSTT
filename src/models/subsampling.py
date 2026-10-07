@@ -66,6 +66,34 @@ class Subsampling(nn.Module):
             encoder["hidden_size"],
         )
 
+    def leaves_padding(self, shortest_length: int, padded_length: int) -> bool:
+        """
+        Whether the time masks change anything for this batch.
+
+        The feature extractor always pads one frame (``samples // hop + 1``
+        frames, ``samples // hop`` valid), but the first strided convolution
+        maps both lengths to the same count. Masks matter only if, after some
+        convolution, the shortest row is still shorter than the padded one.
+
+        Args:
+            shortest_length: Valid input frames of the shortest row.
+            padded_length: Input frames of the padded batch.
+        """
+
+        for layer in self.layers:
+            if isinstance(layer, nn.Conv2d):
+                shortest_length = self._convolved_length(layer, shortest_length)
+                padded_length = self._convolved_length(layer, padded_length)
+                if shortest_length < padded_length:
+                    return True
+        return False
+
+    @staticmethod
+    def _convolved_length(layer: nn.Conv2d, length: int) -> int:
+        """Time length after one Conv2d, by the standard convolution formula."""
+
+        return (length + layer.padding[0] + layer.padding[1] - layer.kernel_size[0]) // layer.stride[0] + 1
+
     def output_length(self, input_lengths: torch.Tensor) -> torch.Tensor:
         """
         Propagate valid frame lengths through every strided convolution.

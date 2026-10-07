@@ -194,3 +194,96 @@ def test_within_the_limit_the_schedule_is_plain_round_robin() -> None:
 def test_open_file_limit_must_be_positive() -> None:
     with pytest.raises(ValueError, match="max_open_files"):
         make_plan([16_000 * 30], max_chunk=500, overlap=10, max_open_files=0)
+
+
+# =============================================================================
+# Decode streams
+# =============================================================================
+
+
+# One chunk core: 100 frames without overlap, minus the planner's one-sample reserve.
+CHUNK_SAMPLES = 100 * HOP_LENGTH - 1
+
+
+def stream_plan(chunk_counts: list[int], decode_workers: int, max_open_files: int = 8) -> ExecutionPlan:
+    """Files of exactly ``chunk_counts`` chunks, in batches of 8 rows."""
+
+    metadata = tuple(
+        AudioMetadata(Path(f"file_{index}.wav"), SAMPLE_RATE, 1, chunks * CHUNK_SAMPLES, "WAV")
+        for index, chunks in enumerate(chunk_counts)
+    )
+    return build_execution_plan(
+        metadata,
+        target_sample_rate=SAMPLE_RATE,
+        hop_length=HOP_LENGTH,
+        max_chunk_feature_frames=100,
+        overlap_feature_frames=0,
+        batch_size=8,
+        max_batch_feature_frames=800,
+        max_padding_fraction=1.0,
+        max_open_files=max_open_files,
+        decode_workers=decode_workers,
+    )
+
+
+def streams_by_chunk(plan: ExecutionPlan, file_index: int = 0) -> list[int]:
+    items = sorted(
+        (item for item in plan.items if item.file_index == file_index),
+        key=lambda item: item.chunk_index,
+    )
+    return [item.stream_index for item in items]
+
+
+def test_a_long_file_is_dealt_to_the_workers_in_blocks() -> None:
+    # 20 chunks, 8 rows per batch, 4 workers: blocks of 2 chunks.
+    plan = stream_plan([20], decode_workers=4)
+
+    streams = streams_by_chunk(plan)
+
+    assert streams == [0, 0, 1, 1, 2, 2, 3, 3] * 2 + [0, 0, 1, 1]
+    # Every full batch is read by all four streams, two chunks each.
+    for batch in plan.batches[:2]:
+        counts = sorted(
+            sum(1 for item in batch if item.stream_index == stream)
+            for stream in {item.stream_index for item in batch}
+        )
+        assert counts == [2, 2, 2, 2]
+
+
+def test_one_worker_reads_each_file_as_one_stream() -> None:
+    plan = stream_plan([20, 5, 1], decode_workers=1)
+
+    assert set(streams_by_chunk(plan, 0)) == {0}
+    assert set(streams_by_chunk(plan, 1)) == {1}
+    assert streams_by_chunk(plan, 2) == [2]
+
+
+def test_workers_are_shared_by_the_long_files_in_progress() -> None:
+    two_files = stream_plan([20, 20], decode_workers=4)
+    many_files = stream_plan([20] * 5, decode_workers=4)
+    limited = stream_plan([20] * 5, decode_workers=4, max_open_files=2)
+
+    assert [len(set(streams_by_chunk(two_files, index))) for index in range(2)] == [2, 2]
+    assert all(len(set(streams_by_chunk(many_files, index))) == 1 for index in range(5))
+    # Only two files are in rotation at once, so each gets two streams.
+    assert all(len(set(streams_by_chunk(limited, index))) == 2 for index in range(5))
+
+
+def test_short_files_never_get_more_streams_than_blocks() -> None:
+    plan = stream_plan([3, 1], decode_workers=4)
+
+    assert streams_by_chunk(plan, 0) == [0, 0, 1]
+    assert streams_by_chunk(plan, 1) == [2]
+
+
+def test_stream_indices_are_unique_across_files() -> None:
+    plan = stream_plan([20, 20, 1], decode_workers=4)
+
+    owners: dict[int, int] = {}
+    for item in plan.items:
+        assert owners.setdefault(item.stream_index, item.file_index) == item.file_index
+
+
+def test_decode_workers_must_be_positive() -> None:
+    with pytest.raises(ValueError, match="decode_workers"):
+        stream_plan([1], decode_workers=0)

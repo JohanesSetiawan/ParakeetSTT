@@ -7,10 +7,13 @@ its own, so the model, feature extractor, and reporting always agree.
 
 from __future__ import annotations
 
+import logging
 import platform
 from dataclasses import dataclass
 
 import torch
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -80,6 +83,37 @@ def apply_float32_matmul_precision(precision: str) -> None:
     """
 
     torch.set_float32_matmul_precision(precision)
+
+
+def apply_float16_accumulation(enabled: bool, encoder_dtype: torch.dtype) -> str:
+    """
+    Let cuBLAS accumulate float16 matrix products in float16, for the whole process.
+
+    Tensor cores of consumer GPUs run float16 products about twice as fast
+    when they also add in float16. Only the float16 encoder is affected (the
+    decoder and joint are float32). On the RTX 3050 Ti the encoder ran 1.17
+    times faster, and the word error rate on the docs corpus was 6.66 percent
+    against 6.67 with float32 accumulation. The flag is set explicitly either
+    way, so a process never inherits it from earlier code.
+
+    Returns:
+        A one-line state for the terminal and log.
+    """
+
+    matmul_backend = torch.backends.cuda.matmul
+    supported = hasattr(matmul_backend, "allow_fp16_accumulation")
+    active = enabled and encoder_dtype == torch.float16 and supported
+    if supported:
+        matmul_backend.allow_fp16_accumulation = active
+
+    if active:
+        return "on"
+    if not enabled:
+        return "off"
+    if encoder_dtype != torch.float16:
+        return "off (the encoder runs in float32)"
+    logger.warning("float16 accumulation requested but this PyTorch build does not support it")
+    return "off (not supported by this PyTorch build)"
 
 
 def describe_runtime(device: torch.device, dtype: torch.dtype) -> RuntimeReport:

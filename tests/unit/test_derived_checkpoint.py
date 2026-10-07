@@ -44,7 +44,13 @@ def weights_dir(tmp_path: Path) -> Path:
 def counting_builder(weights_dir: Path, calls: list[int]):
     def build():
         calls.append(1)
-        model, _configuration, metadata = load_model(weights_dir, CPU, encoder_dtype=torch.float16)
+        # Like the command loader: the derived file keeps the checkpoint layout.
+        model, _configuration, metadata = load_model(
+            weights_dir,
+            CPU,
+            encoder_dtype=torch.float16,
+            fold_batch_norm=False,
+        )
         return model.state_dict(), metadata
 
     return build
@@ -105,7 +111,7 @@ def test_rebuilt_when_model_pth_is_replaced_by_a_file_of_the_same_size(weights_d
 
     assert calls == [1, 1]
     rebuilt = torch.load(path, weights_only=True)["state_dict"]
-    expected = load_model(weights_dir, CPU, encoder_dtype=torch.float16)[0].state_dict()
+    expected = load_model(weights_dir, CPU, encoder_dtype=torch.float16, fold_batch_norm=False)[0].state_dict()
     assert all(torch.equal(rebuilt[name], tensor) for name, tensor in expected.items())
 
 
@@ -158,6 +164,10 @@ def test_derived_file_loads_with_the_same_weights_and_metadata_as_casting(weight
         for module in from_derived.encoder.modules()
         if isinstance(module, ConvolutionModule)
     )
+    stored = torch.load(derived, weights_only=True)["state_dict"]
+    # Schema 3: the BatchNorm stays float32 so that folding it is exact.
+    assert stored["encoder.layers.0.conv.norm.running_var"].dtype == torch.float32
+    assert stored["encoder.layers.0.conv.pointwise_conv1.weight"].dtype == torch.float16
     assert from_derived.encoder.encode_positions.inv_freq.dtype == torch.float32
 
 

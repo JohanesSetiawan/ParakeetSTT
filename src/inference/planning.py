@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -29,7 +30,13 @@ class AudioMetadata:
 
 @dataclass(frozen=True)
 class WorkItem:
-    """One bounded source interval scheduled for model inference."""
+    """
+    One bounded source interval scheduled for model inference.
+
+    ``stream_index`` names the decoder that reads the item (see
+    ``_decode_streams``): items of one stream are read in plan order by one
+    decoder session, and different streams can be read in parallel.
+    """
 
     file_index: int
     path: Path
@@ -39,6 +46,7 @@ class WorkItem:
     core_start_frame: int
     core_end_frame: int
     feature_frames: int
+    stream_index: int
 
     @property
     def source_frame_count(self) -> int:
@@ -63,6 +71,12 @@ class ExecutionPlan:
     target_sample_rate: int
     max_feature_frames: int
     max_batch_feature_frames: int
+
+
+def target_frame_count(record: AudioMetadata, target_sample_rate: int) -> int:
+    """Length of a file in samples at the checkpoint rate, as the planner cuts it."""
+
+    return round(record.frame_count * target_sample_rate / record.sample_rate)
 
 
 def estimate_feature_frames(
@@ -129,6 +143,58 @@ def _padding_fraction(items: Iterable[WorkItem]) -> float:
         return 0.0
     used = sum(item.feature_frames for item in item_list)
     return (capacity - used) / capacity
+
+
+def _decode_streams(
+    chunk_counts: list[int],
+    rows_per_batch: int,
+    decode_workers: int,
+    max_open_files: int,
+) -> list[list[int]]:
+    """
+    Assign every chunk to a decode stream so a batch can be read in parallel.
+
+    A long file's chunks are dealt to a few streams in blocks of consecutive
+    chunks: with 4 workers and 16-row batches, chunks 0-3 go to stream A, 4-7
+    to B, 8-11 to C, 12-15 to D, 16-19 to A again, and so on. Each batch then
+    holds one block per stream, decoded side by side, and every stream starts
+    near the beginning of the file. Splitting the file into four regions
+    instead made the first batch wait for a seek three quarters into the
+    file (0.9 s for a 74-minute MP3, longer for longer files). Within a block
+    each overlap is decoded once; between blocks a stream seeks forward.
+
+    The workers are shared by the long files in progress, so with several of
+    them each file gets fewer streams, and with at least as many files as
+    workers every file is read by one stream, as before.
+
+    Args:
+        chunk_counts: Chunks of each file, in file order.
+        rows_per_batch: Most rows a planned batch can hold.
+        decode_workers: Threads available for decoding.
+        max_open_files: Most multi-chunk files in progress at once.
+
+    Returns:
+        For each file, the stream index of each of its chunks. Indices are
+        unique across files.
+    """
+
+    if decode_workers < 1:
+        raise ValueError("decode_workers must be at least 1")
+    long_files = sum(1 for count in chunk_counts if count > 1)
+    files_in_progress = max(1, min(max_open_files, long_files))
+    streams_per_file = max(1, decode_workers // files_in_progress)
+    block_chunks = max(1, math.ceil(rows_per_batch / decode_workers))
+
+    streams: list[list[int]] = []
+    next_stream_index = 0
+    for count in chunk_counts:
+        blocks = math.ceil(count / block_chunks)
+        stream_count = max(1, min(streams_per_file, blocks))
+        streams.append(
+            [next_stream_index + (chunk_index // block_chunks) % stream_count for chunk_index in range(count)]
+        )
+        next_stream_index += stream_count
+    return streams
 
 
 def _schedule_round_robin(items: Iterable[WorkItem], max_open_files: int) -> list[WorkItem]:
@@ -242,6 +308,7 @@ def build_execution_plan(
     max_batch_feature_frames: int,
     max_padding_fraction: float,
     max_open_files: int,
+    decode_workers: int = 1,
 ) -> ExecutionPlan:
     """
     Create an automatic cost-aware plan without a duration cutoff.
@@ -251,7 +318,8 @@ def build_execution_plan(
     ``overlap_feature_frames`` of context on each side that it does not own.
     Chunks are interleaved round-robin across files, with at most
     ``max_open_files`` multi-chunk files in progress at once, and packed into
-    micro-batches bounded by count, total frames, and padding fraction.
+    micro-batches bounded by count, total frames, and padding fraction. Each
+    chunk is assigned a decode stream for ``decode_workers`` threads.
     """
 
     metadata_list = tuple(metadata)
@@ -269,14 +337,24 @@ def build_execution_plan(
     maximum_core_frames = maximum_core_feature_frames * hop_length - 1
     overlap_source_frames = overlap_feature_frames * hop_length
 
-    items: list[WorkItem] = []
-    for file_index, record in enumerate(metadata_list):
-        target_frames = round(record.frame_count * target_sample_rate / record.sample_rate)
-        ranges = _chunk_ranges(
-            target_frames,
+    file_ranges = [
+        _chunk_ranges(
+            target_frame_count(record, target_sample_rate),
             maximum_core_frames,
             overlap_source_frames,
         )
+        for record in metadata_list
+    ]
+    rows_per_batch = max(1, min(batch_size, max_batch_feature_frames // max_chunk_feature_frames))
+    file_streams = _decode_streams(
+        [len(ranges) for ranges in file_ranges],
+        rows_per_batch,
+        decode_workers,
+        max_open_files,
+    )
+
+    items: list[WorkItem] = []
+    for file_index, (record, ranges) in enumerate(zip(metadata_list, file_ranges, strict=True)):
         for chunk_index, (source_start, source_end, core_start, core_end) in enumerate(ranges):
             feature_frames = estimate_feature_frames(
                 source_end - source_start,
@@ -294,6 +372,7 @@ def build_execution_plan(
                     core_start_frame=core_start,
                     core_end_frame=core_end,
                     feature_frames=feature_frames,
+                    stream_index=file_streams[file_index][chunk_index],
                 )
             )
 

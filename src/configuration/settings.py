@@ -77,6 +77,8 @@ class InferenceSettings:
     encoder_precision: str
     cuda_graphs: bool
     float32_matmul_precision: str
+    float16_accumulation: bool
+    decode_workers: int
 
 
 @dataclass(frozen=True)
@@ -316,6 +318,8 @@ def _parse_inference(document: dict[str, Any]) -> InferenceSettings:
             "float32_matmul_precision",
             FLOAT32_MATMUL_PRECISIONS,
         ),
+        float16_accumulation=_boolean(section, "inference", "float16_accumulation"),
+        decode_workers=_integer(section, "inference", "decode_workers", minimum=1),
     )
 
 

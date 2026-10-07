@@ -36,8 +36,9 @@ logger = logging.getLogger(__name__)
 HALF_ENCODER_FILENAME = "model.encoder-float16.pth"
 HALF_ENCODER_MANIFEST = "model.encoder-float16.json"
 # Bump when the stored layout or the freshness rule changes, so older derived
-# files are rebuilt. Version 2 added the source modification time.
-DERIVED_SCHEMA_VERSION = 2
+# files are rebuilt. Version 2 added the source modification time; version 3
+# keeps the convolution BatchNorm in float32.
+DERIVED_SCHEMA_VERSION = 3
 
 StateAndMetadata = tuple[dict[str, torch.Tensor], dict[str, Any]]
 

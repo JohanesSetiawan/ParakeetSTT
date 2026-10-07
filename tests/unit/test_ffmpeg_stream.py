@@ -164,3 +164,33 @@ def test_closing_mid_file_joins_the_stderr_thread_cleanly(m4a: Path) -> None:
     assert not stream._stderr_thread.is_alive()
     assert stream._process.stderr.closed
     assert thread_errors == []
+
+
+def test_a_long_jump_ahead_restarts_ffmpeg_at_the_new_position(m4a: Path) -> None:
+    """A decode stream moving to its next block must not decode the audio in between."""
+
+    reference = full_decode(m4a)
+    spawned: list[list[str]] = []
+    real_popen = subprocess.Popen
+
+    def counting_popen(command, *args, **kwargs):
+        spawned.append(list(command))
+        return real_popen(command, *args, **kwargs)
+
+    with patch.object(media_module.subprocess, "Popen", counting_popen), open_media_session(m4a) as session:
+        session.read_sequential_segment(0, 8000, TARGET_RATE)
+        # Short jump (less than the piece read): the stream skips ahead.
+        session.read_sequential_segment(12_000, 20_000, TARGET_RATE)
+        # Long jump: a new process starts at the requested position.
+        jumped, _waveform = session.read_sequential_segment(56_000, 64_000, TARGET_RATE)
+
+    assert len(spawned) == 2
+    assert "-ss" not in spawned[0]
+    assert spawned[1][spawned[1].index("-ss") + 1] == f"{56_000 / TARGET_RATE:.9f}"
+    assert jumped.waveform.numel() == 8000
+    # FFmpeg seeks accurately; only the AAC decoder's start-up at the seek
+    # point differs (measured: the first 32 ms). A decoder's first chunk of a
+    # block begins with the recovery reach and the overlap before the core,
+    # so that stretch never reaches a transcribed core.
+    settle = 512
+    assert torch.allclose(jumped.waveform[settle:], reference[56_000 + settle : 64_000], atol=1e-4)

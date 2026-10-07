@@ -241,7 +241,7 @@ def test_duplicate_input_paths_are_rejected(tmp_path, tiny_configuration) -> Non
 
 def chunk(**overrides: object) -> ChunkResult:
     values: dict[str, object] = {
-        "item": WorkItem(0, Path("a.wav"), 0, 0, 1, 0, 1, 1),
+        "item": WorkItem(0, Path("a.wav"), 0, 0, 1, 0, 1, 1, 0),
         "token_ids": (),
         "durations": (),
         "frame_starts": (),
