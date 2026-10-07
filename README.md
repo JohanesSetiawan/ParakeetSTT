@@ -216,10 +216,12 @@ All settings live in `config.toml` at the repository root. Every key is required
 | `gap_silence_rms` | `0.001` | RMS below which such a stretch counts as silence (about -60 dBFS) and is left alone. |
 | `recovery_start_offsets_feature_frames` | `[-25, 25, -50, 50]` | Window-start shifts tried, in order, when re-decoding a collapsed chunk. Each must be at most `overlap_feature_frames` in size. An empty list disables recovery. |
 | `progress_interval_seconds` | `2.0` | Minimum time between two progress lines. The final line is always printed. |
-| `max_open_files` | `8` | Most multi-chunk files decoded at the same time. Each holds an open decoder (a file handle, or an `ffmpeg` process) and its overlap tail until its last chunk. Single-chunk files do not count. At least 1. |
+| `max_open_files` | `8` | Most multi-chunk files decoded at the same time. Each holds up to `decode_workers` open decoders (file handles, or `ffmpeg` processes) and their overlap tails until its last chunk; the more files are in progress, the fewer decoders each gets. Single-chunk files do not count. At least 1. |
 | `encoder_precision` | `"float16"` | `"float16"` or `"float32"`. Float16 runs the encoder about 2.8 times faster and halves its weights; the decoder and joint stay float32. Used on CUDA only; CPU and MPS run float32. |
 | `cuda_graphs` | `true` | Replay each greedy decoding step as one captured CUDA Graph instead of about 46 kernel launches. Same output; CUDA only. |
 | `float32_matmul_precision` | `"highest"` | `"highest"` (exact float32) or `"high"` (TF32 tensor cores on NVIDIA Ampere and newer). With `encoder_precision = "float32"`, `"high"` was 13% faster end to end with the same word error rate. |
+| `float16_accumulation` | `true` | With the float16 encoder on CUDA, matrix products also add in float16. The encoder ran 1.17 times faster, and corpus word error rate was 6.66% against 6.67% without it. Ignored for a float32 encoder. |
+| `decode_workers` | `4` | Threads that decode and resample audio while the GPU runs. A long file's chunks are dealt to several decoders in blocks, so each batch is decoded in parallel; chunks of different files are decoded in parallel too. At least 1. |
 
 ### `[memory]`
 
@@ -250,7 +252,7 @@ libsndfile handles WAV (PCM and float), FLAC, OGG/Vorbis, MP3 and the other form
 - **Channels:** multi-channel audio is averaged to mono.
 - **Sample rate:** any rate is resampled to 16 kHz with an anti-aliased windowed-sinc filter, so content above 8 kHz is removed instead of folding into the speech band. With 9 to 15 kHz hiss mixed into 48 kHz speech, word error rate stayed at 3.7% (the clean value); the old linear interpolation reached 15.6%.
 - **Non-finite samples:** NaN/Inf samples are replaced with zero and reported as `input_nonfinite`.
-- **FFmpeg decoding:** one `ffmpeg` process per file decodes the whole stream to 16 kHz mono in order, and each chunk continues exactly where the previous one stopped. Overlap regions are reused, not decoded again. A non-zero `ffmpeg` exit stops that file with the last lines of its error output.
+- **FFmpeg decoding:** each decoder of a file runs one `ffmpeg` process that decodes to 16 kHz mono in order, and each chunk continues exactly where the previous one stopped. Overlap regions are reused, not decoded again. When the decoder moves on to its next block of chunks, `ffmpeg` is started again at that position instead of decoding the audio in between. A non-zero `ffmpeg` exit stops that file with the last lines of its error output.
 - **Missing FFmpeg:** if `ffprobe` is not installed, formats libsndfile cannot read are reported as `unreadable` and the rest of the folder is still processed.
 - **Misconfigured FFmpeg path:** if `FFMPEG_BINARY` or `FFPROBE_BINARY` is set but points to a missing file, the run stops. That is treated as a setup error, not a property of one file.
 
@@ -260,9 +262,9 @@ There is no duration limit, and memory use does not grow with the length of the 
 
 1. **Planning.** Each file is cut into chunks. A chunk has a core that it owns, plus up to `overlap_feature_frames` of context on each side. The planner sizes chunks by the exact STFT frame count, `samples // 160 + 1`, so no chunk exceeds `max_chunk_feature_frames`.
 2. **Scheduling.** Chunks from all files are interleaved round-robin, so one long file cannot delay every short file behind it. At most `max_open_files` multi-chunk files are in progress at once; the next starts when one finishes, and single-chunk files are never held back. Chunks are then packed into micro-batches bounded by `batch_size`, by the padded size `max_batch_feature_frames` (after the memory budget), and by `max_padding_fraction`.
-3. **Decoding.** Each file keeps one decoder handle open from its first chunk to its last. The overlap samples a chunk shares with the previous one are reused rather than decoded twice. Audio for the next batch is decoded on a background thread while the GPU processes the current one. Only the current and next batch and one overlap tail per in-progress file are held in memory.
+3. **Decoding.** Audio for the next batch is decoded while the GPU processes the current one, by `decode_workers` threads. A long file's chunks are dealt to several decoders in blocks (with 16-row batches and 4 workers: chunks 0-3, 4-7, 8-11 and 12-15 to four decoders, then 16-19 to the first again), so every batch is read by four threads that all start near the beginning of the file. Each decoder keeps its handle open from its first chunk to its last, reuses the overlap a chunk shares with the previous one, and seeks forward between blocks. Every chunk is read with half a second of extra audio on each side, the reach of the recovery windows. Only the current and next batch and one overlap tail per decoder are held in memory.
 4. **Inference.** Each batch goes through feature extraction, the encoder (float16 by default), and greedy TDT decoding on the selected device. On CUDA each decoding step is one replayed CUDA Graph.
-5. **Collapse recovery.** On rare windows the model skips seconds of clear speech and emits nothing. The Hugging Face reference does the same on the same samples, so it is a property of the model. Moving the window start by a few hundred milliseconds usually fixes it. A chunk with a long non-silent stretch and no words is re-decoded with the shifted windows from `recovery_start_offsets_feature_frames`, and the first result without the gap is used. If none works, the file gets the status `untranscribed_gap`. The windows of each chunk are cut from one read of the audio, and the candidates of several chunks share batches.
+5. **Collapse recovery.** On rare windows the model skips seconds of clear speech and emits nothing. The Hugging Face reference does the same on the same samples, so it is a property of the model. Moving the window start by a few hundred milliseconds usually fixes it. A chunk with a long non-silent stretch and no words is re-decoded with the shifted windows from `recovery_start_offsets_feature_frames`, and the first result without the gap is used. If none works, the file gets the status `untranscribed_gap`. The windows are cut from the audio read with the chunk, so recovery never reads the file again. They are tried in order, one per chunk per batch (most chunks recover with the first), and run between planned batches as soon as a full batch of them is waiting; the rest run after the last planned batch.
 6. **Merging.** Tokens are grouped into words and a word is never split between chunks. In the overlap, the words both chunks agree on are taken once, from the chunk with more context at that point. Neighboring chunks can place the same word up to about half a second apart, so agreement is checked within `merge_tolerance_feature_frames`. Without agreement, each whole word goes to the chunk whose core holds its start. Repeated words are kept as spoken; nothing is corrected against a word list.
 
 The batch budget is fitted to the free GPU memory before the first batch (see [`[memory]`](#memory)). If the accelerator still runs out of memory, the run stops with a diagnostic. It does not retry, shrink the batch, fall back to CPU, or write a partial CSV.
@@ -273,22 +275,23 @@ These numbers come from one machine: an NVIDIA GeForce RTX 3050 Ti Laptop GPU wi
 
 | Workload | Audio | Wall-clock | Real-time factor | Peak VRAM allocated |
 |---|---|---|---|---|
-| One MP3, 48 kHz stereo | 36 min (2163 s) | 5.9 s | 0.0027 | 2034 MiB |
-| One MP3, 48 kHz stereo | 74 min (4420 s) | 12.6 s | 0.0028 | 2034 MiB |
-| The 36-minute recording as M4A (AAC, through FFmpeg) | 36 min (2163 s) | 5.8 s | 0.0027 | 2034 MiB |
-| Folder: 15 short WAV + both MP3s, benchmark command, 3 rounds | 112.6 min | 19.06 s (spread 0.12 s) | 0.0028 | 2034 MiB |
+| One MP3, 48 kHz stereo | 36 min (2163 s) | 4.0 s | 0.0019 | 2033 MiB |
+| One MP3, 48 kHz stereo | 74 min (4420 s) | 7.9 s | 0.0018 | 2033 MiB |
+| The 36-minute recording as M4A (AAC, through FFmpeg) | 36 min (2163 s) | 4.1 s | 0.0019 | 2033 MiB |
+| Folder: 15 short WAV + both MP3s, benchmark command, 3 rounds | 112.6 min | 11.92 s (spread 0.23 s) | 0.0018 | 2033 MiB |
 
-The same 112.6-minute folder took 97.4 s with the earlier float32 settings (2 chunks per batch, no CUDA Graph, no decode prefetch). Word error rate against the labeled transcripts in that folder:
+The same 112.6-minute folder took 97.4 s with the earlier float32 settings (2 chunks per batch, no CUDA Graph, no decode prefetch), and 19.06 s before parallel decoding, float16 accumulation, the leaner encoder, and in-memory collapse recovery. Word error rate against the labeled transcripts in that folder:
 
 | Settings | Corpus WER | 36-min podcast | 74-min podcast |
 |---|---|---|---|
-| Default (float16 encoder) | 6.67% | 7.42% | 6.29% |
+| Default (float16 encoder, float16 accumulation) | 6.66% | 7.39% | 6.29% |
+| Before this release's speed changes (float16 encoder) | 6.67% | 7.42% | 6.29% |
 | `encoder_precision = "float32"` | 6.63% | 7.43% | 6.22% |
 | Hugging Face `ParakeetForTDT` pipeline, 15 s chunks without overlap | | 9.94% | 8.45% |
 
 The Hugging Face pipeline's default chunking (with overlap) repeats the overlapped speech in its transcript (52% WER) and cannot run either podcast in one piece on a 4 GB card (it ran out of memory above 3 minutes).
 
-- **Where the time goes** (112.6-minute folder): generation 13.2 s, mostly the encoder (per 16-chunk batch about 0.38 s of encoder against about 0.05 s of graph-replayed decoding loop); media decoding about 13 s, almost all hidden behind the GPU work; collapse recovery about 3.5 s (15 of 486 chunks re-decoded).
+- **Where the time goes** (112.6-minute folder): generation 10.1 s, mostly the encoder (per 16-chunk batch about 0.27 s of encoder against about 0.05 s of graph-replayed decoding loop); media decoding about 6.5 s of batch time on four threads, hidden behind the GPU work; collapse recovery about 0.7 s (14 of 486 chunks re-decoded). The GPU is the limit: the 74-minute file spends 6.5 s of its 7.9 s in the model.
 - **Short files:** one `inference.py` run on a 9-second clip takes about 6 s, almost all of it startup. The [worker](#worker-for-many-short-files) answered such clips in 0.12 s each after a 5.2 s start.
 - **Model load:** about 2.1 s once the checkpoint and its float16 file are prepared and in the OS cache.
 - **Memory does not grow with length:** peak VRAM was the same for the 36- and 74-minute files.
@@ -447,7 +450,7 @@ tests/
 - **Decoder collapse cannot always be recovered.** The first chunk of a file has no earlier audio to shift into, and some windows stay collapsed at every tried shift. Such files are marked `untranscribed_gap` rather than passed off as complete.
 - **Float16 is not token-identical across batch shapes.** The transcript text of each test clip is the same alone and in a mixed batch, but a blank or a duration can move by one frame. With `encoder_precision = "float32"` every token and duration is identical.
 - **cuDNN float16 depthwise convolution:** in cuDNN 9.24 it returned wrong values for some inputs in batches of 7 or more rows, emptying whole chunks. The depthwise convolutions therefore always run in float32; the cost is included in the numbers above.
-- **Recovery reads seek.** Collapse recovery reads each chunk's audio again: an MP3 seek costs time that grows with the position in the file, and an FFmpeg re-read starts at the requested time, which can be offset from the stream by a few samples (a few milliseconds).
+- **Decoder blocks seek.** Each decoder seeks forward to its next block of chunks. An MP3 seek costs about 25 ms per 3 minutes skipped, which the parallel threads hide, and an `ffmpeg` restart starts at the requested time, which can be offset from a continuous stream by a few samples (a few milliseconds). Set `decode_workers = 1` to read every file as one continuous stream.
 - **Without CUDA** there is no CUDA Graph decoding and the encoder runs in float32, so CPU and MPS are much slower; neither has been benchmarked.
 - **Scope:** the runtime does offline transcription only. There is no streaming, speaker diarization, word-level timestamps in the output, beam search, or language-model rescoring.
 - **Language:** the model has no language selection. It transcribes whatever it recognizes among its 25 languages.
