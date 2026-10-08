@@ -287,8 +287,9 @@ class Attention(nn.Module):
 
         # One projection for the whole batch: (1, 2T-1, H) -> (1, 2T-1, A, D).
         # The score scaling is applied here, on 2T-1 rows, instead of on the
-        # (B, A, T, T) scores; with D = 64 it is 1/8, a power of two, so the
-        # products are bit-identical either way.
+        # (B, A, T, T) scores. With D = 128 the scale 1/sqrt(128) is not a
+        # power of two, so this moves one rounding step: the scores can differ
+        # in the last bit, which the labeled long-form WER did not register.
         relative_key = self.relative_k_proj(position_embeddings) * self.scaling
         relative_key = relative_key.view(
             position_embeddings.shape[0],

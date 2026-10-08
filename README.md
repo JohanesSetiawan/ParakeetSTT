@@ -9,6 +9,7 @@ Output parity with the reference implementation was verified token-for-token and
 ## Contents
 
 - [What the model is](#what-the-model-is)
+- [Architecture](#architecture)
 - [Requirements](#requirements)
 - [Installation](#installation)
 - [Quick start](#quick-start)
@@ -41,6 +42,266 @@ Output parity with the reference implementation was verified token-for-token and
 | Weights license | CC-BY-4.0 (NVIDIA) |
 
 Decoding is greedy. Beam search and language-model rescoring are not implemented.
+
+## Architecture
+
+The diagrams below are drawn from the code. [AGENTS.md](AGENTS.md#2-architecture) has the same model diagrams with precision, checkpoint names, and threading details.
+
+### Codebase
+
+Every command reads `config.toml` and opens the dated log first. The transcribing commands (CLI, benchmark, worker) then share one model startup (`commands/model_loading.py`), plan the work, and run it batch by batch; `prepare_checkpoint` only prepares the weights.
+
+```mermaid
+flowchart TB
+    subgraph entry["Entry points"]
+        cli["inference.py<br/>commands/inference.py"]
+        bench["commands/benchmark.py"]
+        worker["commands/worker.py<br/>JSON Lines on stdin and stdout"]
+        prepare["commands/prepare_checkpoint.py"]
+    end
+
+    subgraph setup["Every command"]
+        settings["configuration/settings.py<br/>config.toml, validated"]
+        logs["runtime/logging_setup.py<br/>logs/log_DATE.txt, run id"]
+    end
+
+    subgraph startup["Model startup: commands/model_loading.py prepare_inference_model"]
+        device["runtime/device.py<br/>device, encoder precision,<br/>float16 accumulation"]
+        bootstrap["checkpoint/bootstrap.py<br/>readiness gate"]
+        orchestration["checkpoint/orchestration.py<br/>download, verify, convert"]
+        derived["checkpoint/derived.py<br/>model.encoder-float16.pth"]
+        loader["models/parakeet.py load_model<br/>strict, memory-mapped,<br/>BatchNorm folded"]
+        graphs["enable_graph_decoding<br/>CUDA Graph buffers"]
+        budget["inference/budget.py<br/>VRAM cap and batch budget"]
+    end
+
+    subgraph run["Transcription: inference/offline.py OfflineTranscriber"]
+        planner["inference/planning.py<br/>chunks, decode streams,<br/>round-robin, micro-batches"]
+        media["audio/media.py, audio/resampling.py<br/>decode, downmix, 16 kHz<br/>decode_workers threads"]
+        features["audio/features.py<br/>log-mel features"]
+        model["models/<br/>ParakeetTDT.generate"]
+        recovery["inference/recovery.py<br/>re-decode collapsed chunks"]
+        merging["inference/merging.py<br/>word-level seam merge"]
+        tokenizer["text/tokenization.py<br/>BPE decode"]
+    end
+
+    output["CSV, terminal, JSON line,<br/>metrics/benchmark_DATE.jsonl"]
+
+    cli --> settings
+    bench --> settings
+    worker --> settings
+    prepare --> settings
+    settings --> logs
+    logs -- "prepare_checkpoint" --> orchestration
+    logs -- "transcribing commands" --> device --> bootstrap
+    bootstrap -- "not ready" --> orchestration
+    orchestration --> derived
+    bootstrap -- "ready" --> derived --> loader --> graphs --> budget
+    budget --> planner --> media --> features --> model
+    model --> recovery
+    recovery -- "shifted windows" --> features
+    model --> merging
+    recovery --> merging
+    merging --> tokenizer --> output
+```
+
+### Model
+
+Parakeet TDT 0.6B v3 has 627 million parameters: a FastConformer encoder, a projection, an LSTM prediction network, and a joint network that predicts a token and a duration at every step.
+
+```mermaid
+flowchart TB
+    wave["Waveform<br/>16 kHz mono, B x samples"]
+    frontend["ParakeetFeatureExtractor<br/>pre-emphasis 0.97, STFT n_fft 512, window 400, hop 160<br/>128 mel bins, log, per-recording normalization"]
+    feats["Features B x T x 128<br/>mask B x T, one frame = 10 ms"]
+
+    subgraph encoder["Encoder: FastConformer, 608.9 M parameters"]
+        subsampling["Subsampling 8x<br/>4.3 M"]
+        positions["RelativePositionalEncoding<br/>1 x 2T'-1 x 1024, no parameters"]
+        blocks["EncoderBlock x 24<br/>25.2 M each"]
+        subsampling --> positions --> blocks
+        subsampling --> blocks
+    end
+
+    projector["encoder_projector<br/>Linear 1024 to 640, 0.66 M"]
+    states["Encoder states B x T' x 640<br/>T' = T / 8, one frame = 80 ms"]
+
+    subgraph tdt["Greedy TDT decoding, one step per emitted symbol"]
+        decoder["Decoder: prediction network<br/>12.2 M"]
+        joint["JointNetwork<br/>5.3 M"]
+        choose["argmax over 8193 tokens<br/>argmax over 5 durations: 0 to 4 frames"]
+        decoder --> joint --> choose
+        choose -- "non-blank token<br/>updates the LSTM state" --> decoder
+    end
+
+    result["Tokens, durations, frame starts<br/>per row"]
+
+    wave --> frontend --> feats --> subsampling
+    blocks --> projector --> states
+    states -- "frame at the row's pointer" --> joint
+    choose -- "duration moves the frame pointer" --> states
+    choose --> result
+```
+
+#### Subsampling
+
+Three stride-2 stages shrink time and frequency by 8. After each convolution, frames past a row's length are zeroed, but only when the batch has rows of different lengths.
+
+```mermaid
+flowchart TB
+    input["Features B x T x 128<br/>as B x 1 x T x 128"]
+    conv1["Conv2d 1 to 256, 3x3, stride 2<br/>B x 256 x T/2 x 64"]
+    relu1["ReLU"]
+    dw2["Depthwise Conv2d 256, 3x3, stride 2<br/>B x 256 x T/4 x 32"]
+    pw2["Pointwise Conv2d 256 to 256, 1x1"]
+    relu2["ReLU"]
+    dw3["Depthwise Conv2d 256, 3x3, stride 2<br/>B x 256 x T/8 x 16"]
+    pw3["Pointwise Conv2d 256 to 256, 1x1"]
+    relu3["ReLU"]
+    flatten["Transpose and flatten<br/>B x T' x 4096"]
+    linear["Linear 4096 to 1024<br/>B x T' x 1024"]
+
+    input --> conv1 --> relu1 --> dw2 --> pw2 --> relu2 --> dw3 --> pw3 --> relu3 --> flatten --> linear
+```
+
+#### Encoder block (one of 24)
+
+Each block is a Macaron FastConformer block: two half-weighted feed-forward branches around self-attention and a convolution branch, each with its own LayerNorm before it.
+
+```mermaid
+flowchart TB
+    x0["x: B x T' x 1024"]
+    ln1["LayerNorm"] --> ff1["FeedForward 1"] --> add1(("x + 0.5 * out"))
+    ln2["LayerNorm"] --> attn["Relative multi-head<br/>self-attention"] --> add2(("x + out"))
+    ln3["LayerNorm"] --> conv["Convolution module"] --> add3(("x + out"))
+    ln4["LayerNorm"] --> ff2["FeedForward 2"] --> add4(("x + 0.5 * out"))
+    lnout["LayerNorm"]
+    x1["x: B x T' x 1024"]
+
+    x0 --> ln1
+    x0 --> add1
+    add1 --> ln2
+    add1 --> add2
+    add2 --> ln3
+    add2 --> add3
+    add3 --> ln4
+    add3 --> add4
+    add4 --> lnout --> x1
+```
+
+#### Feed-forward branch
+
+```mermaid
+flowchart LR
+    input["B x T' x 1024"] --> linear1["linear1<br/>1024 to 4096"] --> silu["SiLU"] --> linear2["linear2<br/>4096 to 1024"] --> output["B x T' x 1024"]
+```
+
+#### Relative multi-head self-attention
+
+Eight heads of size 128. The content score uses `bias_u` and the relative-position score uses `bias_v` (Transformer-XL style). The relative score and the padding mask go to PyTorch's scaled dot-product attention as one additive bias.
+
+```mermaid
+flowchart TB
+    x["Normalized x<br/>B x T' x 1024"]
+    pos["Relative positions<br/>1 x 2T'-1 x 1024"]
+
+    q["q_proj 1024 to 1024<br/>B x 8 x T' x 128"]
+    k["k_proj 1024 to 1024"]
+    v["v_proj 1024 to 1024"]
+    qu["q + bias_u"]
+    qv["q + bias_v"]
+    rk["relative_k_proj 1024 to 1024,<br/>times 1 / sqrt 128<br/>once per batch"]
+    rel["q_v times relative keys<br/>B x 8 x T' x 2T'-1"]
+    shift["Relative shift, keep T' columns<br/>B x 8 x T' x T'"]
+    mask["Plus padding key bias<br/>0 for real frames, large negative for padding"]
+    sdpa["scaled_dot_product_attention<br/>query q_u, keys k, values v,<br/>additive mask, scale 1 / sqrt 128"]
+    merge["Merge heads<br/>B x T' x 1024<br/>padding rows set to 0"]
+    o["o_proj 1024 to 1024"]
+
+    x --> q
+    x --> k
+    x --> v
+    q --> qu
+    q --> qv
+    pos --> rk
+    qv --> rel
+    rk --> rel
+    rel --> shift --> mask --> sdpa
+    qu --> sdpa
+    k --> sdpa
+    v --> sdpa
+    sdpa --> merge --> o
+```
+
+#### Convolution module
+
+The two pointwise convolutions are 1x1 Conv1d weights in the checkpoint and run as linear layers. The BatchNorm is folded into the depthwise convolution when the model loads.
+
+```mermaid
+flowchart TB
+    x["Normalized x<br/>B x T' x 1024"]
+    pw1["pointwise_conv1 as linear<br/>1024 to 2048"]
+    glu["GLU over channels<br/>B x T' x 1024"]
+    pad["Padding frames set to 0"]
+    tr1["Transpose to B x 1024 x T'"]
+    dw["depthwise_conv<br/>Conv1d, kernel 9, groups 1024<br/>with the folded BatchNorm"]
+    tr2["Transpose to B x T' x 1024"]
+    silu["SiLU"]
+    pw2["pointwise_conv2 as linear<br/>1024 to 1024"]
+
+    x --> pw1 --> glu --> pad --> tr1 --> dw --> tr2 --> silu --> pw2
+```
+
+#### Prediction network and joint
+
+```mermaid
+flowchart TB
+    token["Previous token<br/>B x 1, blank at the start"]
+    embedding["Embedding<br/>8193 x 640"]
+    lstm["LSTM<br/>2 layers, 640"]
+    dproj["decoder_projector<br/>Linear 640 to 640"]
+    cache["DecoderCache<br/>hidden, cell, last output<br/>kept unchanged for blank rows"]
+    enc["Encoder state at the row's frame<br/>B x 1 x 640"]
+    sum(("decoder + encoder"))
+    relu["ReLU"]
+    head["head<br/>Linear 640 to 8198"]
+    tokens["8193 token logits<br/>8192 BPE pieces + blank"]
+    durations["5 duration logits<br/>0, 1, 2, 3, 4 frames"]
+
+    token --> embedding --> lstm --> dproj --> sum
+    cache <--> lstm
+    enc --> sum --> relu --> head
+    head --> tokens
+    head --> durations
+```
+
+#### One greedy TDT step
+
+```mermaid
+flowchart TB
+    start["Rows still decoding"]
+    logits["Decoder and joint<br/>logits for the current frame"]
+    pick["token = argmax of token logits<br/>duration = argmax of duration logits"]
+    blankzero{"blank token with<br/>duration 0?"}
+    guard{"non-blank token with duration 0,<br/>the 10th in a row on this frame?"}
+    advance1["Advance 1 frame"]
+    forced["Advance 1 frame,<br/>count a forced advance"]
+    advance["Advance by the duration"]
+    emit["Emit the token,<br/>non-blank tokens feed the decoder"]
+    done{"Frame pointer past<br/>the row's length?"}
+    finished["Row finished"]
+
+    start --> logits --> pick --> blankzero
+    blankzero -- "yes" --> advance1 --> emit
+    blankzero -- "no" --> guard
+    guard -- "yes" --> forced --> emit
+    guard -- "no" --> advance --> emit
+    emit --> done
+    done -- "no" --> start
+    done -- "yes" --> finished
+```
+
+On CUDA the whole step runs as one replayed CUDA Graph (`models/graphed_decoding.py`), with the same results as the step-by-step loop.
 
 ## Requirements
 
