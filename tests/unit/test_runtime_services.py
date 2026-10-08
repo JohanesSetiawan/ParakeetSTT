@@ -48,6 +48,8 @@ max_open_files = 4
 encoder_precision = "float16"
 cuda_graphs = true
 float32_matmul_precision = "high"
+float16_accumulation = true
+decode_workers = 3
 
 [memory]
 cap_to_free_memory = true
@@ -90,6 +92,8 @@ def test_valid_file_is_normalized(tmp_path: Path) -> None:
     assert settings.checkpoint.request_timeout_seconds == 30.0
     assert settings.inference.max_open_files == 4
     assert settings.inference.encoder_precision == "float16"
+    assert settings.inference.float16_accumulation is True
+    assert settings.inference.decode_workers == 3
     assert settings.memory.cap_to_free_memory is True
     assert settings.memory.auto_batch_budget is True
     assert settings.memory.reserve_mib == 256
@@ -119,6 +123,8 @@ def test_valid_file_is_normalized(tmp_path: Path) -> None:
         ('encoder_precision = "float16"', 'encoder_precision = "bfloat16"', "encoder_precision"),
         ("cuda_graphs = true", 'cuda_graphs = "on"', "cuda_graphs"),
         ('float32_matmul_precision = "high"', 'float32_matmul_precision = "medium"', "float32_matmul_precision"),
+        ("float16_accumulation = true", "float16_accumulation = 1", "float16_accumulation"),
+        ("decode_workers = 3", "decode_workers = 0", "decode_workers"),
         ("reserve_mib = 256", "reserve_mib = -1", "reserve_mib"),
         ("auto_batch_budget = true", "auto_batch_budget = 1", "auto_batch_budget"),
         ("cap_to_free_memory = true", 'cap_to_free_memory = "yes"', "cap_to_free_memory"),
@@ -243,3 +249,40 @@ def test_one_checkpoint_file_name_everywhere(tmp_path: Path) -> None:
     for module in ("src/checkpoint/derived.py", "src/checkpoint/orchestration.py", "src/checkpoint/bootstrap.py"):
         source = (Path(__file__).resolve().parents[2] / module).read_text(encoding="utf-8")
         assert '"model.pth"' not in source, module
+
+
+# =============================================================================
+# Float16 accumulation
+# =============================================================================
+
+
+def test_float16_accumulation_follows_the_setting_and_the_encoder_dtype() -> None:
+    from src.runtime.device import apply_float16_accumulation
+
+    backend = torch.backends.cuda.matmul
+    if not hasattr(backend, "allow_fp16_accumulation"):
+        pytest.skip("this PyTorch build has no float16 accumulation switch")
+    original = backend.allow_fp16_accumulation
+    try:
+        assert apply_float16_accumulation(True, torch.float16) == "on"
+        assert backend.allow_fp16_accumulation is True
+        assert apply_float16_accumulation(True, torch.float32) == "off (the encoder runs in float32)"
+        assert backend.allow_fp16_accumulation is False
+        apply_float16_accumulation(True, torch.float16)
+        assert apply_float16_accumulation(False, torch.float16) == "off"
+        assert backend.allow_fp16_accumulation is False
+    finally:
+        backend.allow_fp16_accumulation = original
+
+
+def test_float16_accumulation_reports_an_unsupported_build(caplog) -> None:
+    from types import SimpleNamespace
+
+    from src.runtime import device as device_module
+
+    with patch.object(device_module.torch.backends.cuda, "matmul", SimpleNamespace()):
+        with caplog.at_level(logging.WARNING, logger="src.runtime.device"):
+            state = device_module.apply_float16_accumulation(True, torch.float16)
+
+    assert state == "off (not supported by this PyTorch build)"
+    assert "does not support" in caplog.text

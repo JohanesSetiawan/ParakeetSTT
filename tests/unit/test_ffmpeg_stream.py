@@ -60,6 +60,7 @@ def plan_items(path: Path, overlap: int):
         max_batch_feature_frames=480,
         max_padding_fraction=1.0,
         max_open_files=8,
+        decode_workers=1,
     )
     return sorted(plan.items, key=lambda item: item.chunk_index)
 
@@ -164,3 +165,38 @@ def test_closing_mid_file_joins_the_stderr_thread_cleanly(m4a: Path) -> None:
     assert not stream._stderr_thread.is_alive()
     assert stream._process.stderr.closed
     assert thread_errors == []
+
+
+def test_ffmpeg_files_are_read_by_one_process_with_parallel_workers(m4a: Path, tiny_configuration) -> None:
+    """
+    FFmpeg seeks by estimate for some formats, so a file it decodes is never
+    split into decode streams, whatever decode_workers is: one process reads
+    it from the start, as with a single worker.
+    """
+
+    from src.inference.offline import OfflineTranscriber
+    from support import ScriptedModel, inference_settings
+
+    metadata = inspect_media(m4a)
+    spawned: list[list[str]] = []
+    real_popen = subprocess.Popen
+
+    def counting_popen(command, *args, **kwargs):
+        spawned.append(list(command))
+        return real_popen(command, *args, **kwargs)
+
+    transcriber = OfflineTranscriber(
+        ScriptedModel(3).eval(),
+        tiny_configuration,
+        inference_settings(batch_size=4, max_batch_feature_frames=400, decode_workers=4),
+    )
+    plan = transcriber._plan((metadata,))
+    with patch.object(media_module.subprocess, "Popen", counting_popen):
+        result = transcriber.transcribe([m4a], metadata=[metadata])
+
+    assert metadata.sample_accurate_seek is False
+    assert len(plan.items) > 4
+    assert {item.stream_index for item in plan.items} == {0}
+    assert len(spawned) == 1
+    assert "-ss" not in spawned[0]
+    assert len(result.files) == 1

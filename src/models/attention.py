@@ -18,10 +18,59 @@ D: per-head dimension, H / A
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import torch
 from torch import nn
 
 from ..configuration.config import ParakeetConfig
+
+
+# =============================================================================
+# Padding masks
+# =============================================================================
+# Every block needs the same two facts about padding: which keys attention
+# must ignore, and which frames are padding. Both are built once per batch;
+# deriving them from a (B, 1, T, T) boolean pair mask in each of the 24 blocks
+# cost three extra full-size kernels per block.
+# =============================================================================
+
+
+@dataclass(frozen=True)
+class EncoderMasks:
+    """
+    Padding facts of one encoder batch, shared by every block.
+
+    Attributes:
+        key_bias: Additive attention bias ``(B, 1, 1, T)`` in the encoder
+            dtype: 0 for real keys, a large finite negative value for padded
+            keys. Half of the dtype's lowest value, so adding a score can
+            never overflow to -inf; a row whose keys are all padding then
+            stays finite instead of turning into NaN in the softmax.
+        padded_frames: ``(B, T, 1)``, True for padding frames.
+    """
+
+    key_bias: torch.Tensor
+    padded_frames: torch.Tensor
+
+    @classmethod
+    def from_valid_frames(cls, valid_frames: torch.Tensor, dtype: torch.dtype) -> "EncoderMasks":
+        """
+        Build the masks from a valid-frame mask.
+
+        Args:
+            valid_frames: ``(B, T)``, True for real frames.
+            dtype: Floating-point type of the attention scores.
+        """
+
+        padded_frames = ~valid_frames
+        blocked_value = torch.finfo(dtype).min / 2
+        key_bias = torch.zeros(valid_frames.shape, dtype=dtype, device=valid_frames.device)
+        key_bias = key_bias.masked_fill(padded_frames, blocked_value)
+        return cls(
+            key_bias=key_bias[:, None, None, :],
+            padded_frames=padded_frames[:, :, None],
+        )
 
 
 # =============================================================================
@@ -126,9 +175,9 @@ def repeat_key_value(hidden_states: torch.Tensor, repetitions: int) -> torch.Ten
 # 1. content score from (query + bias_u) dot key;
 # 2. relative score from (query + bias_v) dot projected relative position.
 #
-# The relative score is supplied to SDPA as an additive position-bias mask. A
-# fully padded query row is neutralized before SDPA and zeroed afterward to avoid
-# NaN from a softmax row with no valid keys.
+# The relative score is supplied to SDPA as an additive position-bias mask,
+# with the padding key bias added in the same kernel. Padded query rows are
+# zeroed after SDPA.
 # =============================================================================
 
 
@@ -200,7 +249,7 @@ class Attention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         position_embeddings: torch.Tensor,
-        attention_mask: torch.Tensor | None,
+        masks: EncoderMasks | None,
     ) -> torch.Tensor:
         """
         Apply relative attention to ``(B, T, H)`` hidden states.
@@ -209,7 +258,7 @@ class Attention(nn.Module):
             hidden_states: Encoder hidden states ``(B, T, H)``.
             position_embeddings: Relative position tensor ``(1, 2T-1, H)``,
                 shared by every row.
-            attention_mask: Boolean query-key mask ``(B, 1, T, T)``.
+            masks: Padding masks of the batch, or None without padding.
 
         Returns:
             Projected attention output ``(B, T, H)``.
@@ -237,7 +286,11 @@ class Attention(nn.Module):
         )
 
         # One projection for the whole batch: (1, 2T-1, H) -> (1, 2T-1, A, D).
-        relative_key = self.relative_k_proj(position_embeddings)
+        # The score scaling is applied here, on 2T-1 rows, instead of on the
+        # (B, A, T, T) scores. With D = 128 the scale 1/sqrt(128) is not a
+        # power of two, so this moves one rounding step: the scores can differ
+        # in the last bit, which the labeled long-form WER did not register.
+        relative_key = self.relative_k_proj(position_embeddings) * self.scaling
         relative_key = relative_key.view(
             position_embeddings.shape[0],
             -1,
@@ -247,23 +300,17 @@ class Attention(nn.Module):
         # (B, A, T, D) @ (1, A, D, 2T-1) broadcasts to (B, A, T, 2T-1).
         relative_scores = query_with_position_bias @ relative_key.permute(0, 2, 3, 1)
         relative_scores = self._relative_shift(relative_scores)
-        relative_scores = relative_scores[..., :sequence_length] * self.scaling
+        relative_scores = relative_scores[..., :sequence_length]  # (B, A, T, T) view
 
         key = repeat_key_value(key, self.num_key_value_groups)
         value = repeat_key_value(value, self.num_key_value_groups)
-        additive_mask = relative_scores
 
-        if attention_mask is not None:
-            query_valid_mask = attention_mask.any(dim=-1)
-            additive_mask = torch.where(
-                attention_mask,
-                additive_mask,
-                torch.finfo(key.dtype).min,
-            )
-            additive_mask = additive_mask.masked_fill(
-                ~query_valid_mask.unsqueeze(-1),
-                0.0,
-            )
+        # The shifted scores are a strided view; SDPA needs a dense mask, and
+        # the padding bias is added in the same pass that materializes it.
+        if masks is not None:
+            additive_mask = relative_scores + masks.key_bias
+        else:
+            additive_mask = relative_scores.contiguous()
 
         attention_output = torch.nn.functional.scaled_dot_product_attention(
             query_with_content_bias,
@@ -277,7 +324,7 @@ class Attention(nn.Module):
         attention_output = attention_output.transpose(1, 2).contiguous()
         attention_output = attention_output.reshape(batch_size, sequence_length, -1)
 
-        if attention_mask is not None:
-            attention_output = attention_output * query_valid_mask.squeeze(1).unsqueeze(-1)
+        if masks is not None:
+            attention_output = attention_output.masked_fill(masks.padded_frames, 0.0)
 
         return self.o_proj(attention_output)

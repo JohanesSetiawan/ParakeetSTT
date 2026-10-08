@@ -6,6 +6,12 @@ segments, runs one full-weight model instance through bounded micro-batches,
 and merges token output by timestamp ownership. It stops on OOM and does not
 retry, reduce the plan, fall back to CPU, or write a partial result.
 
+Audio of the next batch is decoded while the model runs the current one, by
+several threads at once: each decode stream (a file, or every few blocks of
+chunks of a long file, see ``planning``) is read in order by one thread.
+Chunks whose decoder collapsed are re-decoded with shifted windows as soon as
+enough of them are waiting, cut from audio that was decoded with the chunk.
+
 Every file gets an explicit status so that anomalies (non-finite input,
 numerical failure, decoder guard, empty output) reach the caller instead of
 looking like a normal transcript.
@@ -14,9 +20,10 @@ looking like a normal transcript.
 from __future__ import annotations
 
 import dataclasses
-from concurrent.futures import Future, ThreadPoolExecutor
 import logging
 import time
+from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -37,6 +44,8 @@ from .planning import (
     WorkItem,
     build_execution_plan,
     estimate_feature_frames,
+    rows_per_batch,
+    target_frame_count,
 )
 from .recovery import Window, longest_untranscribed_gap, recovery_windows
 
@@ -149,6 +158,8 @@ class OfflineRunResult:
     media_decode_seconds: float
     feature_seconds: float
     generation_seconds: float
+    # Model time of collapse re-decodes. They run between planned batches, so
+    # this overlaps the decoding of the next batch, like generation does.
     recovery_seconds: float = 0.0
 
     @property
@@ -203,6 +214,127 @@ class _GenerationOnHost:
             encoder_finite=generation.encoder_finite.cpu().tolist(),
             features_finite=features_finite.cpu().tolist(),
         )
+
+
+@dataclass(frozen=True)
+class _DecodedItem:
+    """
+    One work item's audio.
+
+    ``segment`` is exactly the item's source window, which the model reads.
+    ``span`` adds the collapse-recovery reach on both sides (clipped to the
+    file); it is kept only for a chunk that turns out to need recovery.
+    """
+
+    segment: DecodedSegment
+    span: DecodedSegment
+    seconds: float
+
+
+@dataclass(frozen=True)
+class _DecodedBatch:
+    """A batch's audio in batch order, and the wall time decoding it took."""
+
+    items: tuple[_DecodedItem, ...]
+    seconds: float
+
+
+@dataclass
+class _PendingRecovery:
+    """
+    A collapsed chunk whose shifted windows are being tried in order.
+
+    Windows are tried one batch at a time, so most chunks cost one re-decode
+    instead of one per configured offset: on the 74-minute podcast 9 of 12
+    collapsed chunks recovered with the first offset.
+    """
+
+    chunk: ChunkResult
+    span: DecodedSegment
+    windows: tuple[Window, ...]
+    best: ChunkResult
+    tried: int = 0
+    seconds: float = 0.0
+
+    @property
+    def windows_left(self) -> int:
+        return len(self.windows) - self.tried
+
+
+class _StreamDecoder:
+    """
+    Read one decode stream's chunks in order through one decoder session.
+
+    Each chunk is read with ``context_samples`` of extra audio on both sides
+    (clipped to the file): the reach of the collapse-recovery windows, so a
+    re-decode cuts its windows from audio already in memory instead of
+    seeking back into the file. When the stream also reads the next chunk,
+    the audio after this one is the start of that read, so consecutive
+    chunks still decode every sample once; after a gap (the stream's next
+    block) the decoder seeks forward.
+
+    The session opens at the stream's first chunk and closes after its last.
+    One thread at a time uses an instance: a batch gives each stream one task,
+    and the next batch is decoded only after this one finished.
+    """
+
+    def __init__(
+        self,
+        path: Path,
+        chunk_indices: frozenset[int],
+        file_end: int,
+        context_samples: int,
+        target_sample_rate: int,
+    ) -> None:
+        self.path = path
+        self.file_end = file_end
+        self.context_samples = context_samples
+        self.target_sample_rate = target_sample_rate
+        self._chunk_indices = chunk_indices
+        self._remaining = len(chunk_indices)
+        self._session: MediaSession | None = None
+        # End frame and waveform of the previous read, kept only when this
+        # stream reads the very next chunk too.
+        self._previous: tuple[int, torch.Tensor] | None = None
+
+    def decode(self, items: list[WorkItem]) -> list[_DecodedItem]:
+        """Decode the next chunks of this stream, which must come in order."""
+
+        decoded: list[_DecodedItem] = []
+        for item in items:
+            started = time.perf_counter()
+            if self._session is None:
+                self._session = open_media_session(self.path)
+
+            span_start = max(0, item.source_start_frame - self.context_samples)
+            span_end = min(self.file_end, item.source_end_frame + self.context_samples)
+            previous_end, previous_waveform = self._previous or (None, None)
+            span, waveform = self._session.read_sequential_segment(
+                span_start,
+                span_end,
+                self.target_sample_rate,
+                previous_source_end_frame=previous_end,
+                previous_waveform=previous_waveform,
+            )
+            segment = slice_segment(span, item.source_start_frame, item.source_end_frame)
+
+            # A finished stream releases its decoder and audio at once.
+            self._remaining -= 1
+            self._previous = None
+            if self._remaining == 0:
+                self.close()
+            elif item.chunk_index + 1 in self._chunk_indices:
+                self._previous = (span_end, waveform)
+            decoded.append(_DecodedItem(segment, span, time.perf_counter() - started))
+        return decoded
+
+    def close(self) -> None:
+        """Release the decoder session and the overlap tail."""
+
+        self._previous = None
+        if self._session is not None:
+            self._session.close()
+            self._session = None
 
 
 def classify_file(
@@ -295,6 +427,12 @@ class OfflineTranscriber:
         self.recovery_offsets_samples = tuple(
             offset * self.hop_length for offset in settings.recovery_start_offsets_feature_frames
         )
+        # How far a shifted window reaches past its chunk: audio decoded on
+        # both sides of every chunk so that recovery never re-reads the file.
+        self.recovery_context_samples = max(
+            (abs(offset) for offset in self.recovery_offsets_samples),
+            default=0,
+        )
         # Same one-sample reserve as the planner, so a recovery window never
         # needs one more feature frame than the configured chunk budget.
         self.max_chunk_samples = settings.max_chunk_feature_frames * self.hop_length - 1
@@ -326,7 +464,32 @@ class OfflineTranscriber:
             max_batch_feature_frames=self.settings.max_batch_feature_frames,
             max_padding_fraction=self.settings.max_padding_fraction,
             max_open_files=self.settings.max_open_files,
+            decode_workers=self.settings.decode_workers,
         )
+
+    def _stream_decoders(self, plan: ExecutionPlan, file_ends: list[int]) -> dict[int, _StreamDecoder]:
+        """
+        One decoder per decode stream of the plan; none opens a file yet.
+
+        ``file_ends`` are the files' lengths at the target rate, the same
+        values recovery clips its windows to.
+        """
+
+        chunks_by_stream: dict[int, list[WorkItem]] = {}
+        for item in plan.items:
+            chunks_by_stream.setdefault(item.stream_index, []).append(item)
+
+        decoders: dict[int, _StreamDecoder] = {}
+        for stream_index, items in chunks_by_stream.items():
+            first = items[0]
+            decoders[stream_index] = _StreamDecoder(
+                first.path,
+                chunk_indices=frozenset(item.chunk_index for item in items),
+                file_end=file_ends[first.file_index],
+                context_samples=self.recovery_context_samples,
+                target_sample_rate=self.target_sample_rate,
+            )
+        return decoders
 
     # -------------------------------------------------------------------------
     # One micro-batch
@@ -335,50 +498,37 @@ class OfflineTranscriber:
     def _decode_batch_audio(
         self,
         items: tuple[WorkItem, ...],
-        sessions: dict[Path, MediaSession],
-        sequential_state: dict[Path, tuple[int, torch.Tensor]],
-        remaining_chunks: dict[Path, int],
-    ) -> tuple[tuple[DecodedSegment, ...], tuple[float, ...]]:
+        streams: dict[int, _StreamDecoder],
+        pool: ThreadPoolExecutor,
+    ) -> tuple[_DecodedItem, ...]:
         """
-        Decode each item in plan order, reusing per-file overlap tails.
+        Decode a batch with one task per decode stream, in parallel.
 
-        Returns the segments and each item's own decode time.
+        A stream's items stay in plan order inside its task. Different
+        streams share nothing, so they run side by side; libsndfile, FFmpeg
+        pipes, NumPy, and torch resampling release the GIL while they work.
 
-        A file's decoder session is opened at its first chunk and closed after
-        its last one, so single-chunk files never hold a handle beyond their
-        own batch and the number of open handles tracks the files that are
-        actually in progress, not the size of the folder.
+        Returns:
+            Each item's audio, in batch order.
         """
 
-        segments: list[DecodedSegment] = []
-        decode_seconds: list[float] = []
-        for item in items:
-            item_started = time.perf_counter()
-            session = sessions.get(item.path)
-            if session is None:
-                session = open_media_session(item.path)
-                sessions[item.path] = session
+        positions_by_stream: dict[int, list[int]] = {}
+        for position, item in enumerate(items):
+            positions_by_stream.setdefault(item.stream_index, []).append(position)
 
-            previous = sequential_state.get(item.path)
-            segment, waveform = session.read_sequential_segment(
-                item.source_start_frame,
-                item.source_end_frame,
-                self.target_sample_rate,
-                previous_source_end_frame=previous[0] if previous else None,
-                previous_waveform=previous[1] if previous else None,
+        tasks = {
+            stream_index: pool.submit(
+                streams[stream_index].decode,
+                [items[position] for position in positions],
             )
-            segments.append(segment)
+            for stream_index, positions in positions_by_stream.items()
+        }
 
-            # Keep the overlap tail only while the file still has chunks left,
-            # so finished files release their last waveform immediately.
-            remaining_chunks[item.path] -= 1
-            if remaining_chunks[item.path] > 0:
-                sequential_state[item.path] = (item.source_end_frame, waveform)
-            else:
-                sequential_state.pop(item.path, None)
-                sessions.pop(item.path).close()
-            decode_seconds.append(time.perf_counter() - item_started)
-        return tuple(segments), tuple(decode_seconds)
+        decoded_by_position: dict[int, _DecodedItem] = {}
+        for stream_index, positions in positions_by_stream.items():
+            stream_items = tasks[stream_index].result()
+            decoded_by_position.update(zip(positions, stream_items, strict=True))
+        return tuple(decoded_by_position[position] for position in range(len(items)))
 
     def _out_of_memory(self, stage: str, items: tuple[WorkItem, ...]) -> RuntimeError:
         """Build the stop-the-run error for an accelerator OOM."""
@@ -405,33 +555,40 @@ class OfflineTranscriber:
     def _decode_batch(
         self,
         items: tuple[WorkItem, ...],
-        sessions: dict[Path, MediaSession],
-        sequential_state: dict[Path, tuple[int, torch.Tensor]],
-        remaining_chunks: dict[Path, int],
-    ) -> tuple[tuple[DecodedSegment, ...], tuple[float, ...], float]:
-        """Decode one batch's audio; returns segments, per-item and total seconds."""
+        streams: dict[int, _StreamDecoder],
+        pool: ThreadPoolExecutor,
+    ) -> _DecodedBatch:
+        """Decode one batch's audio and time the whole batch."""
 
         decode_started = time.perf_counter()
-        segments, item_decode_seconds = self._decode_batch_audio(
-            items,
-            sessions,
-            sequential_state,
-            remaining_chunks,
+        decoded = self._decode_batch_audio(items, streams, pool)
+        batch_seconds = time.perf_counter() - decode_started
+
+        # Each item was timed on its own thread while other streams ran
+        # beside it, so the item times add up to more than the batch took.
+        # Scale them to the batch's wall time, keeping their proportions,
+        # so per-file processing time stays comparable with one worker.
+        thread_seconds = sum(item_audio.seconds for item_audio in decoded)
+        scale = batch_seconds / thread_seconds if thread_seconds > 0 else 0.0
+        attributed = tuple(
+            dataclasses.replace(item_audio, seconds=item_audio.seconds * scale)
+            for item_audio in decoded
         )
-        return segments, item_decode_seconds, time.perf_counter() - decode_started
+        return _DecodedBatch(items=attributed, seconds=batch_seconds)
 
     def _infer_batch(
         self,
         items: tuple[WorkItem, ...],
-        decoded: tuple[tuple[DecodedSegment, ...], tuple[float, ...], float],
+        decoded: _DecodedBatch,
     ) -> tuple[tuple[ChunkResult, ...], dict[str, float]]:
         """Extract features and infer one decoded batch, stopping on OOM."""
 
-        segments, item_decode_seconds, decode_seconds = decoded
+        segments = tuple(item_audio.segment for item_audio in decoded.items)
+        item_decode_seconds = tuple(item_audio.seconds for item_audio in decoded.items)
         results, feature_seconds, generation_seconds = self._infer_segments(items, segments)
         results = self._attribute_time(results, item_decode_seconds, feature_seconds + generation_seconds)
         timings = {
-            "decode": decode_seconds,
+            "decode": decoded.seconds,
             "feature": feature_seconds,
             "generation": generation_seconds,
         }
@@ -439,7 +596,7 @@ class OfflineTranscriber:
             "batch items=%s feature_frames=%s decode=%.3fs feature=%.3fs generation=%.3fs",
             [f"{item.path.name}#{item.chunk_index}" for item in items],
             [item.feature_frames for item in items],
-            decode_seconds,
+            decoded.seconds,
             feature_seconds,
             generation_seconds,
         )
@@ -550,84 +707,71 @@ class OfflineTranscriber:
             and chunk.gap_rms >= self.settings.gap_silence_rms
         )
 
-    def _recover_file(
-        self,
-        chunks: list[ChunkResult],
-        metadata: AudioMetadata,
-        session: MediaSession,
-    ) -> list[ChunkResult]:
-        """
-        Re-decode every collapsed chunk of one file with shifted windows.
-
-        Each collapsed chunk's windows are cut from one decode of the span they
-        cover; reading each window on its own meant one seek per window, and an
-        MP3 seek in libsndfile costs about 9 ms per minute of position (0.6 s at
-        minute 70). Candidates of several chunks share batches up to the
-        planned row limit, so the decoding loop's per-step cost is paid once
-        per group instead of once per chunk. Groups keep the decoded audio
-        bounded however many chunks collapsed.
-
-        Returns:
-            ``chunks`` with each collapsed chunk replaced by its first window
-            that no longer has an untranscribed gap, otherwise the smallest gap.
-        """
-
-        collapsed = [position for position, chunk in enumerate(chunks) if self._has_untranscribed_gap(chunk)]
-        windows_per_chunk = max(1, len(self.recovery_offsets_samples))
-        chunks_per_group = max(1, self._recovery_rows() // windows_per_chunk)
-        recovered = list(chunks)
-        for first in range(0, len(collapsed), chunks_per_group):
-            group = collapsed[first : first + chunks_per_group]
-            group_started = time.perf_counter()
-            outcomes = self._recover_group([chunks[position] for position in group], metadata, session)
-            # A group's time is shared evenly by its chunks.
-            group_seconds = (time.perf_counter() - group_started) / len(group)
-            for position, outcome in zip(group, outcomes, strict=True):
-                recovered[position] = dataclasses.replace(
-                    outcome,
-                    processing_seconds=chunks[position].processing_seconds + group_seconds,
-                )
-        return recovered
-
     def _recovery_rows(self) -> int:
         """Rows per recovery batch: the same limits as planned batches."""
 
-        rows_by_frames = self.settings.max_batch_feature_frames // self.settings.max_chunk_feature_frames
-        return max(1, min(self.settings.batch_size, rows_by_frames))
+        return rows_per_batch(
+            self.settings.batch_size,
+            self.settings.max_batch_feature_frames,
+            self.settings.max_chunk_feature_frames,
+        )
 
-    def _recover_group(
+    def _start_recovery(
         self,
-        chunks: list[ChunkResult],
-        metadata: AudioMetadata,
-        session: MediaSession,
-    ) -> list[ChunkResult]:
-        """Decode and transcribe the shifted windows of a few collapsed chunks together."""
+        chunk: ChunkResult,
+        span: DecodedSegment,
+        file_end: int,
+    ) -> _PendingRecovery | None:
+        """
+        Queue a collapsed chunk for re-decoding, or None if no window fits.
 
-        file_end = round(metadata.frame_count * self.target_sample_rate / metadata.sample_rate)
-        window_lists: list[list[Window]] = []
+        Every window lies inside ``span``: windows move the start by at most
+        the largest offset, and the span reaches that far on both sides.
+        """
+
+        item = chunk.item
+        windows = recovery_windows(
+            Window(item.source_start_frame, item.source_end_frame),
+            Window(item.core_start_frame, item.core_end_frame),
+            self.recovery_offsets_samples,
+            file_end,
+            self.max_chunk_samples,
+        )
+        if not windows:
+            self._report_unrecovered(chunk, 0)
+            return None
+        return _PendingRecovery(chunk=chunk, span=span, windows=tuple(windows), best=chunk)
+
+    def _run_recovery_batch(self, queue: deque[_PendingRecovery]) -> tuple[list[ChunkResult], float]:
+        """
+        Try the next windows of the oldest waiting chunks in one batch.
+
+        With fewer chunks than rows, each chunk tries several windows at
+        once, so the last few chunks finish in fewer batches. The choice is
+        the same either way: the first window, in configured order, without
+        the gap, else the one with the smallest gap.
+
+        Returns:
+            The chunks that finished (others go back to the queue) and the
+            time the batch took.
+        """
+
+        if not queue:
+            return [], 0.0
+        rows = self._recovery_rows()
+        entries = [queue.popleft() for _ in range(min(rows, len(queue)))]
+        windows_per_entry = max(1, rows // len(entries))
+
         candidate_items: list[WorkItem] = []
         candidate_segments: list[DecodedSegment] = []
-        for chunk in chunks:
-            item = chunk.item
-            windows = recovery_windows(
-                Window(item.source_start_frame, item.source_end_frame),
-                Window(item.core_start_frame, item.core_end_frame),
-                self.recovery_offsets_samples,
-                file_end,
-                self.max_chunk_samples,
-            )
-            window_lists.append(windows)
-            if not windows:
-                continue
-            span = session.read_segment(
-                min(window.start for window in windows),
-                max(window.end for window in windows),
-                self.target_sample_rate,
-            )
+        window_counts: list[int] = []
+        for entry in entries:
+            windows = entry.windows[entry.tried : entry.tried + windows_per_entry]
+            window_counts.append(len(windows))
             for window in windows:
                 candidate_items.append(
                     dataclasses.replace(
-                        item,
+                        entry.chunk.item,
                         source_start_frame=window.start,
                         source_end_frame=window.end,
                         feature_frames=estimate_feature_frames(
@@ -638,35 +782,44 @@ class OfflineTranscriber:
                         ),
                     )
                 )
-                candidate_segments.append(slice_segment(span, window.start, window.end))
+                candidate_segments.append(slice_segment(entry.span, window.start, window.end))
 
-        candidates: list[ChunkResult] = []
-        rows = self._recovery_rows()
-        for first in range(0, len(candidate_items), rows):
-            batch_items = tuple(candidate_items[first : first + rows])
-            batch_segments = tuple(candidate_segments[first : first + rows])
-            batch_results, _feature_seconds, _generation_seconds = self._infer_segments(batch_items, batch_segments)
-            candidates.extend(batch_results)
+        started = time.perf_counter()
+        candidates, _feature_seconds, _generation_seconds = self._infer_segments(
+            tuple(candidate_items),
+            tuple(candidate_segments),
+        )
+        seconds = time.perf_counter() - started
+        seconds_per_row = seconds / len(candidates)
 
-        outcomes = []
+        finished: list[ChunkResult] = []
         cursor = 0
-        for chunk, windows in zip(chunks, window_lists, strict=True):
-            chunk_candidates = candidates[cursor : cursor + len(windows)]
-            cursor += len(windows)
-            outcomes.append(self._choose_recovery(chunk, windows, chunk_candidates))
-        return outcomes
+        for entry, count in zip(entries, window_counts, strict=True):
+            outcome = self._advance_recovery(
+                entry,
+                candidates[cursor : cursor + count],
+                seconds_per_row * count,
+            )
+            cursor += count
+            if outcome is None:
+                queue.append(entry)
+            else:
+                finished.append(outcome)
+        return finished, seconds
 
-    def _choose_recovery(
+    def _advance_recovery(
         self,
-        chunk: ChunkResult,
-        windows: list[Window],
-        candidates: list[ChunkResult],
-    ) -> ChunkResult:
-        """First window, in configured order, without the gap; else the smallest gap."""
+        entry: _PendingRecovery,
+        candidates: tuple[ChunkResult, ...],
+        seconds: float,
+    ) -> ChunkResult | None:
+        """Judge the windows just tried; return the outcome once the chunk is done."""
 
-        item = chunk.item
-        best = chunk
-        for window, candidate in zip(windows, candidates, strict=True):
+        entry.seconds += seconds
+        item = entry.chunk.item
+        for candidate in candidates:
+            window = entry.windows[entry.tried]
+            entry.tried += 1
             candidate = dataclasses.replace(candidate, recovered=True)
             if not self._has_untranscribed_gap(candidate):
                 logger.info(
@@ -675,17 +828,32 @@ class OfflineTranscriber:
                     item.chunk_index,
                     (window.start - item.source_start_frame) / self.target_sample_rate,
                 )
-                return candidate
-            if candidate.gap_samples < best.gap_samples:
-                best = candidate
+                return self._finish_recovery(entry, candidate)
+            if candidate.gap_samples < entry.best.gap_samples:
+                entry.best = candidate
+
+        if entry.windows_left > 0:
+            return None
+        self._report_unrecovered(entry.best, entry.tried)
+        return self._finish_recovery(entry, entry.best)
+
+    @staticmethod
+    def _finish_recovery(entry: _PendingRecovery, outcome: ChunkResult) -> ChunkResult:
+        """The outcome, charged with the chunk's own time plus its re-decodes."""
+
+        return dataclasses.replace(
+            outcome,
+            processing_seconds=entry.chunk.processing_seconds + entry.seconds,
+        )
+
+    def _report_unrecovered(self, chunk: ChunkResult, attempts: int) -> None:
         logger.warning(
             "chunk %s#%d keeps an untranscribed gap of %.1f s after %d re-decodes",
-            item.path.name,
-            item.chunk_index,
-            best.gap_samples / self.target_sample_rate,
-            len(windows),
+            chunk.item.path.name,
+            chunk.item.chunk_index,
+            chunk.gap_samples / self.target_sample_rate,
+            attempts,
         )
-        return best
 
     # -------------------------------------------------------------------------
     # Merge
@@ -793,35 +961,48 @@ class OfflineTranscriber:
             sum(record.duration_seconds for record in metadata_tuple),
         )
 
-        remaining_chunks: dict[Path, int] = {path: 0 for path in path_tuple}
-        for item in plan.items:
-            remaining_chunks[item.path] += 1
-
         if self.device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(self.device)
 
-        sessions: dict[Path, MediaSession] = {}
-        sequential_state: dict[Path, tuple[int, torch.Tensor]] = {}
+        file_ends = [target_frame_count(record, self.target_sample_rate) for record in metadata_tuple]
+        streams = self._stream_decoders(plan, file_ends)
         chunk_results: dict[int, list[ChunkResult]] = {index: [] for index in range(len(path_tuple))}
+        recovery_queue: deque[_PendingRecovery] = deque()
+        recovery_rows = self._recovery_rows()
         stage_totals = {"decode": 0.0, "feature": 0.0, "generation": 0.0, "recovery": 0.0}
+
+        def keep(results: Iterable[ChunkResult]) -> None:
+            for result in results:
+                chunk_results[result.item.file_index].append(result)
+
+        def recover_waiting(minimum_queue: int) -> None:
+            while recovery_queue and len(recovery_queue) >= minimum_queue:
+                finished, seconds = self._run_recovery_batch(recovery_queue)
+                stage_totals["recovery"] += seconds
+                keep(finished)
+
         try:
-            # Media decoding runs one batch ahead on a worker thread, so the
-            # CPU decodes the next audio while the accelerator processes the
-            # current batch. A single worker keeps every file's chunks in plan
-            # order, and only that thread touches the decoder sessions and
-            # overlap tails. libsndfile, FFmpeg pipes, and torch resampling
-            # release the GIL while they work.
-            with ThreadPoolExecutor(max_workers=1, thread_name_prefix="media-decode") as decoder:
+            # One thread runs the batch after the current one: it hands each
+            # decode stream of that batch to the decode pool and waits for
+            # them, while this thread runs the model. A batch is decoded only
+            # after the previous one finished, so every stream reads its
+            # chunks in plan order.
+            with (
+                ThreadPoolExecutor(
+                    max_workers=self.settings.decode_workers,
+                    thread_name_prefix="media-decode",
+                ) as decode_pool,
+                ThreadPoolExecutor(max_workers=1, thread_name_prefix="batch-prefetch") as prefetcher,
+            ):
 
                 def decode_ahead(batch_index: int) -> Future | None:
                     if batch_index >= len(plan.batches):
                         return None
-                    return decoder.submit(
+                    return prefetcher.submit(
                         self._decode_batch,
                         plan.batches[batch_index],
-                        sessions,
-                        sequential_state,
-                        remaining_chunks,
+                        streams,
+                        decode_pool,
                     )
 
                 pending = decode_ahead(0)
@@ -831,26 +1012,30 @@ class OfflineTranscriber:
                     results, timings = self._infer_batch(batch, decoded)
                     for name, elapsed in timings.items():
                         stage_totals[name] += elapsed
-                    for result in results:
-                        chunk_results[result.item.file_index].append(result)
+
+                    for result, item_audio in zip(results, decoded.items, strict=True):
+                        if not self._has_untranscribed_gap(result):
+                            keep((result,))
+                            continue
+                        file_end = file_ends[result.item.file_index]
+                        waiting = self._start_recovery(result, item_audio.span, file_end)
+                        if waiting is None:
+                            keep((result,))
+                        else:
+                            recovery_queue.append(waiting)
+                    # Re-decode only full batches here; the rest waits for
+                    # more collapsed chunks or the end of the plan.
+                    recover_waiting(minimum_queue=recovery_rows)
+
                     if progress_callback is not None:
                         progress_callback(batch_index + 1, len(plan.batches))
         finally:
-            # The executor has shut down (waiting for any decode in flight),
-            # so no thread uses the sessions any more.
-            for session in sessions.values():
-                session.close()
+            # Both executors have shut down (waiting for any decode in
+            # flight), so no thread uses the decoders any more.
+            for stream in streams.values():
+                stream.close()
 
-        recovery_started = time.perf_counter()
-        for index, record in enumerate(metadata_tuple):
-            if not any(self._has_untranscribed_gap(chunk) for chunk in chunk_results[index]):
-                continue
-            # One session per file, visited in chunk order: libsndfile builds
-            # its MP3 seek index as it goes, so later seeks continue from the
-            # last position instead of scanning from the start of the file.
-            with open_media_session(record.path) as session:
-                chunk_results[index] = self._recover_file(chunk_results[index], record, session)
-        stage_totals["recovery"] = time.perf_counter() - recovery_started
+        recover_waiting(minimum_queue=1)
 
         file_results = tuple(
             self._merge_file(record, tuple(chunk_results[index]))

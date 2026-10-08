@@ -49,10 +49,12 @@ gap_silence_rms = 0.001
 recovery_start_offsets_feature_frames = [-25, 25, -50, 50]
 # Minimum wall-clock gap between two terminal progress lines.
 progress_interval_seconds = 2.0
-# Most multi-chunk files decoded at the same time. Each one holds an open
-# decoder (a file handle, or an ffmpeg process for formats libsndfile cannot
-# read) and its overlap tail until its last chunk, so a folder of hundreds of
-# long files must not open them all at once. Single-chunk files do not count.
+# Most decoders of multi-chunk files open at the same time, and the most such
+# files in progress. Each decoder is a file handle (or an ffmpeg process for
+# formats libsndfile cannot read) and holds an overlap tail until its last
+# chunk, so a folder of hundreds of long files must not open them all at
+# once. A long file gets several decoders (see decode_workers) only while
+# fewer files are in progress. Single-chunk files do not count.
 max_open_files = 8
 # Precision of the acoustic encoder on CUDA: "float16" or "float32". Float16
 # is about 2.8 times faster in the encoder and halves its weights; on two
@@ -68,6 +70,17 @@ cuda_graphs = true
 # encoder then ran 28 percent faster with the same tokens on sampled batches.
 # With the float16 encoder only the decoder and joint use float32 products.
 float32_matmul_precision = "highest"
+# CUDA float16 encoder only: matrix products also add in float16 (cuBLAS).
+# The encoder ran 1.17 times faster on the RTX 3050 Ti, and the word error
+# rate on the docs corpus was 6.66 percent against 6.67 without it.
+float16_accumulation = true
+# Threads that decode and resample audio while the GPU runs. A long file that
+# libsndfile reads (WAV, FLAC, MP3, ...) is dealt to up to this many decoders
+# in blocks of chunks, so each batch is decoded in parallel; chunks of
+# different files in one batch are decoded in parallel too. Files decoded
+# through ffmpeg stay one decoder each. Raw MP3 decoding of a 74-minute file
+# took 4.4 s on 1 thread, 3.1 s on 2, 2.3 s on 4 and 2.5 s on 8.
+decode_workers = 4
 
 [memory]
 # GPU only (ignored on CPU and MPS). After the model loads, PyTorch is capped

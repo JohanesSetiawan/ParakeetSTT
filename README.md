@@ -9,6 +9,7 @@ Output parity with the reference implementation was verified token-for-token and
 ## Contents
 
 - [What the model is](#what-the-model-is)
+- [Architecture](#architecture)
 - [Requirements](#requirements)
 - [Installation](#installation)
 - [Quick start](#quick-start)
@@ -41,6 +42,266 @@ Output parity with the reference implementation was verified token-for-token and
 | Weights license | CC-BY-4.0 (NVIDIA) |
 
 Decoding is greedy. Beam search and language-model rescoring are not implemented.
+
+## Architecture
+
+The diagrams below are drawn from the code. [AGENTS.md](AGENTS.md#2-architecture) has the same model diagrams with precision, checkpoint names, and threading details.
+
+### Codebase
+
+Every command reads `config.toml` and opens the dated log first. The transcribing commands (CLI, benchmark, worker) then share one model startup (`commands/model_loading.py`), plan the work, and run it batch by batch; `prepare_checkpoint` only prepares the weights.
+
+```mermaid
+flowchart TB
+    subgraph entry["Entry points"]
+        cli["inference.py<br/>commands/inference.py"]
+        bench["commands/benchmark.py"]
+        worker["commands/worker.py<br/>JSON Lines on stdin and stdout"]
+        prepare["commands/prepare_checkpoint.py"]
+    end
+
+    subgraph setup["Every command"]
+        settings["configuration/settings.py<br/>config.toml, validated"]
+        logs["runtime/logging_setup.py<br/>logs/log_DATE.txt, run id"]
+    end
+
+    subgraph startup["Model startup: commands/model_loading.py prepare_inference_model"]
+        device["runtime/device.py<br/>device, encoder precision,<br/>float16 accumulation"]
+        bootstrap["checkpoint/bootstrap.py<br/>readiness gate"]
+        orchestration["checkpoint/orchestration.py<br/>download, verify, convert"]
+        derived["checkpoint/derived.py<br/>model.encoder-float16.pth"]
+        loader["models/parakeet.py load_model<br/>strict, memory-mapped,<br/>BatchNorm folded"]
+        graphs["enable_graph_decoding<br/>CUDA Graph buffers"]
+        budget["inference/budget.py<br/>VRAM cap and batch budget"]
+    end
+
+    subgraph run["Transcription: inference/offline.py OfflineTranscriber"]
+        planner["inference/planning.py<br/>chunks, decode streams,<br/>round-robin, micro-batches"]
+        media["audio/media.py, audio/resampling.py<br/>decode, downmix, 16 kHz<br/>decode_workers threads"]
+        features["audio/features.py<br/>log-mel features"]
+        model["models/<br/>ParakeetTDT.generate"]
+        recovery["inference/recovery.py<br/>re-decode collapsed chunks"]
+        merging["inference/merging.py<br/>word-level seam merge"]
+        tokenizer["text/tokenization.py<br/>BPE decode"]
+    end
+
+    output["CSV, terminal, JSON line,<br/>metrics/benchmark_DATE.jsonl"]
+
+    cli --> settings
+    bench --> settings
+    worker --> settings
+    prepare --> settings
+    settings --> logs
+    logs -- "prepare_checkpoint" --> orchestration
+    logs -- "transcribing commands" --> device --> bootstrap
+    bootstrap -- "not ready" --> orchestration
+    orchestration --> derived
+    bootstrap -- "ready" --> derived --> loader --> graphs --> budget
+    budget --> planner --> media --> features --> model
+    model --> recovery
+    recovery -- "shifted windows" --> features
+    model --> merging
+    recovery --> merging
+    merging --> tokenizer --> output
+```
+
+### Model
+
+Parakeet TDT 0.6B v3 has 627 million parameters: a FastConformer encoder, a projection, an LSTM prediction network, and a joint network that predicts a token and a duration at every step.
+
+```mermaid
+flowchart TB
+    wave["Waveform<br/>16 kHz mono, B x samples"]
+    frontend["ParakeetFeatureExtractor<br/>pre-emphasis 0.97, STFT n_fft 512, window 400, hop 160<br/>128 mel bins, log, per-recording normalization"]
+    feats["Features B x T x 128<br/>mask B x T, one frame = 10 ms"]
+
+    subgraph encoder["Encoder: FastConformer, 608.9 M parameters"]
+        subsampling["Subsampling 8x<br/>4.3 M"]
+        positions["RelativePositionalEncoding<br/>1 x 2T'-1 x 1024, no parameters"]
+        blocks["EncoderBlock x 24<br/>25.2 M each"]
+        subsampling --> positions --> blocks
+        subsampling --> blocks
+    end
+
+    projector["encoder_projector<br/>Linear 1024 to 640, 0.66 M"]
+    states["Encoder states B x T' x 640<br/>T' = T / 8, one frame = 80 ms"]
+
+    subgraph tdt["Greedy TDT decoding, one step per emitted symbol"]
+        decoder["Decoder: prediction network<br/>12.2 M"]
+        joint["JointNetwork<br/>5.3 M"]
+        choose["argmax over 8193 tokens<br/>argmax over 5 durations: 0 to 4 frames"]
+        decoder --> joint --> choose
+        choose -- "non-blank token<br/>updates the LSTM state" --> decoder
+    end
+
+    result["Tokens, durations, frame starts<br/>per row"]
+
+    wave --> frontend --> feats --> subsampling
+    blocks --> projector --> states
+    states -- "frame at the row's pointer" --> joint
+    choose -- "duration moves the frame pointer" --> states
+    choose --> result
+```
+
+#### Subsampling
+
+Three stride-2 stages shrink time and frequency by 8. After each convolution, frames past a row's length are zeroed, but only when the batch has rows of different lengths.
+
+```mermaid
+flowchart TB
+    input["Features B x T x 128<br/>as B x 1 x T x 128"]
+    conv1["Conv2d 1 to 256, 3x3, stride 2<br/>B x 256 x T/2 x 64"]
+    relu1["ReLU"]
+    dw2["Depthwise Conv2d 256, 3x3, stride 2<br/>B x 256 x T/4 x 32"]
+    pw2["Pointwise Conv2d 256 to 256, 1x1"]
+    relu2["ReLU"]
+    dw3["Depthwise Conv2d 256, 3x3, stride 2<br/>B x 256 x T/8 x 16"]
+    pw3["Pointwise Conv2d 256 to 256, 1x1"]
+    relu3["ReLU"]
+    flatten["Transpose and flatten<br/>B x T' x 4096"]
+    linear["Linear 4096 to 1024<br/>B x T' x 1024"]
+
+    input --> conv1 --> relu1 --> dw2 --> pw2 --> relu2 --> dw3 --> pw3 --> relu3 --> flatten --> linear
+```
+
+#### Encoder block (one of 24)
+
+Each block is a Macaron FastConformer block: two half-weighted feed-forward branches around self-attention and a convolution branch, each with its own LayerNorm before it.
+
+```mermaid
+flowchart TB
+    x0["x: B x T' x 1024"]
+    ln1["LayerNorm"] --> ff1["FeedForward 1"] --> add1(("x + 0.5 * out"))
+    ln2["LayerNorm"] --> attn["Relative multi-head<br/>self-attention"] --> add2(("x + out"))
+    ln3["LayerNorm"] --> conv["Convolution module"] --> add3(("x + out"))
+    ln4["LayerNorm"] --> ff2["FeedForward 2"] --> add4(("x + 0.5 * out"))
+    lnout["LayerNorm"]
+    x1["x: B x T' x 1024"]
+
+    x0 --> ln1
+    x0 --> add1
+    add1 --> ln2
+    add1 --> add2
+    add2 --> ln3
+    add2 --> add3
+    add3 --> ln4
+    add3 --> add4
+    add4 --> lnout --> x1
+```
+
+#### Feed-forward branch
+
+```mermaid
+flowchart LR
+    input["B x T' x 1024"] --> linear1["linear1<br/>1024 to 4096"] --> silu["SiLU"] --> linear2["linear2<br/>4096 to 1024"] --> output["B x T' x 1024"]
+```
+
+#### Relative multi-head self-attention
+
+Eight heads of size 128. The content score uses `bias_u` and the relative-position score uses `bias_v` (Transformer-XL style). The relative score and the padding mask go to PyTorch's scaled dot-product attention as one additive bias.
+
+```mermaid
+flowchart TB
+    x["Normalized x<br/>B x T' x 1024"]
+    pos["Relative positions<br/>1 x 2T'-1 x 1024"]
+
+    q["q_proj 1024 to 1024<br/>B x 8 x T' x 128"]
+    k["k_proj 1024 to 1024"]
+    v["v_proj 1024 to 1024"]
+    qu["q + bias_u"]
+    qv["q + bias_v"]
+    rk["relative_k_proj 1024 to 1024,<br/>times 1 / sqrt 128<br/>once per batch"]
+    rel["q_v times relative keys<br/>B x 8 x T' x 2T'-1"]
+    shift["Relative shift, keep T' columns<br/>B x 8 x T' x T'"]
+    mask["Plus padding key bias<br/>0 for real frames, large negative for padding"]
+    sdpa["scaled_dot_product_attention<br/>query q_u, keys k, values v,<br/>additive mask, scale 1 / sqrt 128"]
+    merge["Merge heads<br/>B x T' x 1024<br/>padding rows set to 0"]
+    o["o_proj 1024 to 1024"]
+
+    x --> q
+    x --> k
+    x --> v
+    q --> qu
+    q --> qv
+    pos --> rk
+    qv --> rel
+    rk --> rel
+    rel --> shift --> mask --> sdpa
+    qu --> sdpa
+    k --> sdpa
+    v --> sdpa
+    sdpa --> merge --> o
+```
+
+#### Convolution module
+
+The two pointwise convolutions are 1x1 Conv1d weights in the checkpoint and run as linear layers. The BatchNorm is folded into the depthwise convolution when the model loads.
+
+```mermaid
+flowchart TB
+    x["Normalized x<br/>B x T' x 1024"]
+    pw1["pointwise_conv1 as linear<br/>1024 to 2048"]
+    glu["GLU over channels<br/>B x T' x 1024"]
+    pad["Padding frames set to 0"]
+    tr1["Transpose to B x 1024 x T'"]
+    dw["depthwise_conv<br/>Conv1d, kernel 9, groups 1024<br/>with the folded BatchNorm"]
+    tr2["Transpose to B x T' x 1024"]
+    silu["SiLU"]
+    pw2["pointwise_conv2 as linear<br/>1024 to 1024"]
+
+    x --> pw1 --> glu --> pad --> tr1 --> dw --> tr2 --> silu --> pw2
+```
+
+#### Prediction network and joint
+
+```mermaid
+flowchart TB
+    token["Previous token<br/>B x 1, blank at the start"]
+    embedding["Embedding<br/>8193 x 640"]
+    lstm["LSTM<br/>2 layers, 640"]
+    dproj["decoder_projector<br/>Linear 640 to 640"]
+    cache["DecoderCache<br/>hidden, cell, last output<br/>kept unchanged for blank rows"]
+    enc["Encoder state at the row's frame<br/>B x 1 x 640"]
+    sum(("decoder + encoder"))
+    relu["ReLU"]
+    head["head<br/>Linear 640 to 8198"]
+    tokens["8193 token logits<br/>8192 BPE pieces + blank"]
+    durations["5 duration logits<br/>0, 1, 2, 3, 4 frames"]
+
+    token --> embedding --> lstm --> dproj --> sum
+    cache <--> lstm
+    enc --> sum --> relu --> head
+    head --> tokens
+    head --> durations
+```
+
+#### One greedy TDT step
+
+```mermaid
+flowchart TB
+    start["Rows still decoding"]
+    logits["Decoder and joint<br/>logits for the current frame"]
+    pick["token = argmax of token logits<br/>duration = argmax of duration logits"]
+    blankzero{"blank token with<br/>duration 0?"}
+    guard{"non-blank token with duration 0,<br/>the 10th in a row on this frame?"}
+    advance1["Advance 1 frame"]
+    forced["Advance 1 frame,<br/>count a forced advance"]
+    advance["Advance by the duration"]
+    emit["Emit the token,<br/>non-blank tokens feed the decoder"]
+    done{"Frame pointer past<br/>the row's length?"}
+    finished["Row finished"]
+
+    start --> logits --> pick --> blankzero
+    blankzero -- "yes" --> advance1 --> emit
+    blankzero -- "no" --> guard
+    guard -- "yes" --> forced --> emit
+    guard -- "no" --> advance --> emit
+    emit --> done
+    done -- "no" --> start
+    done -- "yes" --> finished
+```
+
+On CUDA the whole step runs as one replayed CUDA Graph (`models/graphed_decoding.py`), with the same results as the step-by-step loop.
 
 ## Requirements
 
@@ -216,10 +477,12 @@ All settings live in `config.toml` at the repository root. Every key is required
 | `gap_silence_rms` | `0.001` | RMS below which such a stretch counts as silence (about -60 dBFS) and is left alone. |
 | `recovery_start_offsets_feature_frames` | `[-25, 25, -50, 50]` | Window-start shifts tried, in order, when re-decoding a collapsed chunk. Each must be at most `overlap_feature_frames` in size. An empty list disables recovery. |
 | `progress_interval_seconds` | `2.0` | Minimum time between two progress lines. The final line is always printed. |
-| `max_open_files` | `8` | Most multi-chunk files decoded at the same time. Each holds an open decoder (a file handle, or an `ffmpeg` process) and its overlap tail until its last chunk. Single-chunk files do not count. At least 1. |
+| `max_open_files` | `8` | Most decoders of multi-chunk files open at the same time, and the most such files in progress. Each decoder is a file handle (or an `ffmpeg` process) holding an overlap tail until its last chunk. A long file gets several decoders only while fewer files are in progress. Single-chunk files do not count. At least 1. |
 | `encoder_precision` | `"float16"` | `"float16"` or `"float32"`. Float16 runs the encoder about 2.8 times faster and halves its weights; the decoder and joint stay float32. Used on CUDA only; CPU and MPS run float32. |
 | `cuda_graphs` | `true` | Replay each greedy decoding step as one captured CUDA Graph instead of about 46 kernel launches. Same output; CUDA only. |
 | `float32_matmul_precision` | `"highest"` | `"highest"` (exact float32) or `"high"` (TF32 tensor cores on NVIDIA Ampere and newer). With `encoder_precision = "float32"`, `"high"` was 13% faster end to end with the same word error rate. |
+| `float16_accumulation` | `true` | With the float16 encoder on CUDA, matrix products also add in float16. The encoder ran 1.17 times faster, and corpus word error rate was 6.66% against 6.67% without it. Ignored for a float32 encoder. |
+| `decode_workers` | `4` | Threads that decode and resample audio while the GPU runs. A long file that libsndfile reads is dealt to several decoders in blocks, so each batch is decoded in parallel; chunks of different files are decoded in parallel too. Files decoded through `ffmpeg` keep one decoder each. At least 1. |
 
 ### `[memory]`
 
@@ -250,7 +513,7 @@ libsndfile handles WAV (PCM and float), FLAC, OGG/Vorbis, MP3 and the other form
 - **Channels:** multi-channel audio is averaged to mono.
 - **Sample rate:** any rate is resampled to 16 kHz with an anti-aliased windowed-sinc filter, so content above 8 kHz is removed instead of folding into the speech band. With 9 to 15 kHz hiss mixed into 48 kHz speech, word error rate stayed at 3.7% (the clean value); the old linear interpolation reached 15.6%.
 - **Non-finite samples:** NaN/Inf samples are replaced with zero and reported as `input_nonfinite`.
-- **FFmpeg decoding:** one `ffmpeg` process per file decodes the whole stream to 16 kHz mono in order, and each chunk continues exactly where the previous one stopped. Overlap regions are reused, not decoded again. A non-zero `ffmpeg` exit stops that file with the last lines of its error output.
+- **FFmpeg decoding:** one `ffmpeg` process per file decodes the whole stream to 16 kHz mono in order, and each chunk continues exactly where the previous one stopped. Overlap regions are reused, not decoded again. Such files are never split over several decoders, because `ffmpeg` seeks by estimate in some formats (raw AAC, for example). A non-zero `ffmpeg` exit stops that file with the last lines of its error output.
 - **Missing FFmpeg:** if `ffprobe` is not installed, formats libsndfile cannot read are reported as `unreadable` and the rest of the folder is still processed.
 - **Misconfigured FFmpeg path:** if `FFMPEG_BINARY` or `FFPROBE_BINARY` is set but points to a missing file, the run stops. That is treated as a setup error, not a property of one file.
 
@@ -260,9 +523,9 @@ There is no duration limit, and memory use does not grow with the length of the 
 
 1. **Planning.** Each file is cut into chunks. A chunk has a core that it owns, plus up to `overlap_feature_frames` of context on each side. The planner sizes chunks by the exact STFT frame count, `samples // 160 + 1`, so no chunk exceeds `max_chunk_feature_frames`.
 2. **Scheduling.** Chunks from all files are interleaved round-robin, so one long file cannot delay every short file behind it. At most `max_open_files` multi-chunk files are in progress at once; the next starts when one finishes, and single-chunk files are never held back. Chunks are then packed into micro-batches bounded by `batch_size`, by the padded size `max_batch_feature_frames` (after the memory budget), and by `max_padding_fraction`.
-3. **Decoding.** Each file keeps one decoder handle open from its first chunk to its last. The overlap samples a chunk shares with the previous one are reused rather than decoded twice. Audio for the next batch is decoded on a background thread while the GPU processes the current one. Only the current and next batch and one overlap tail per in-progress file are held in memory.
+3. **Decoding.** Audio for the next batch is decoded while the GPU processes the current one, by `decode_workers` threads. A long file that libsndfile reads is dealt to several decoders in blocks (with 16-row batches and 4 workers: chunks 0-3, 4-7, 8-11 and 12-15 to four decoders, then 16-19 to the first again), so every batch is read by four threads that all start near the beginning of the file. Each decoder keeps its handle open from its first chunk to its last, reuses the overlap a chunk shares with the previous one, and seeks forward between blocks. Every chunk is read with half a second of extra audio on each side, the reach of the recovery windows. Only the current and next batch and one overlap tail per decoder are held in memory.
 4. **Inference.** Each batch goes through feature extraction, the encoder (float16 by default), and greedy TDT decoding on the selected device. On CUDA each decoding step is one replayed CUDA Graph.
-5. **Collapse recovery.** On rare windows the model skips seconds of clear speech and emits nothing. The Hugging Face reference does the same on the same samples, so it is a property of the model. Moving the window start by a few hundred milliseconds usually fixes it. A chunk with a long non-silent stretch and no words is re-decoded with the shifted windows from `recovery_start_offsets_feature_frames`, and the first result without the gap is used. If none works, the file gets the status `untranscribed_gap`. The windows of each chunk are cut from one read of the audio, and the candidates of several chunks share batches.
+5. **Collapse recovery.** On rare windows the model skips seconds of clear speech and emits nothing. The Hugging Face reference does the same on the same samples, so it is a property of the model. Moving the window start by a few hundred milliseconds usually fixes it. A chunk with a long non-silent stretch and no words is re-decoded with the shifted windows from `recovery_start_offsets_feature_frames`, and the first result without the gap is used. If none works, the file gets the status `untranscribed_gap`. The windows are cut from the audio read with the chunk, so recovery never reads the file again. They are tried in order, one per chunk per batch (most chunks recover with the first), and run between planned batches as soon as a full batch of them is waiting; the rest run after the last planned batch.
 6. **Merging.** Tokens are grouped into words and a word is never split between chunks. In the overlap, the words both chunks agree on are taken once, from the chunk with more context at that point. Neighboring chunks can place the same word up to about half a second apart, so agreement is checked within `merge_tolerance_feature_frames`. Without agreement, each whole word goes to the chunk whose core holds its start. Repeated words are kept as spoken; nothing is corrected against a word list.
 
 The batch budget is fitted to the free GPU memory before the first batch (see [`[memory]`](#memory)). If the accelerator still runs out of memory, the run stops with a diagnostic. It does not retry, shrink the batch, fall back to CPU, or write a partial CSV.
@@ -273,22 +536,23 @@ These numbers come from one machine: an NVIDIA GeForce RTX 3050 Ti Laptop GPU wi
 
 | Workload | Audio | Wall-clock | Real-time factor | Peak VRAM allocated |
 |---|---|---|---|---|
-| One MP3, 48 kHz stereo | 36 min (2163 s) | 5.9 s | 0.0027 | 2034 MiB |
-| One MP3, 48 kHz stereo | 74 min (4420 s) | 12.6 s | 0.0028 | 2034 MiB |
-| The 36-minute recording as M4A (AAC, through FFmpeg) | 36 min (2163 s) | 5.8 s | 0.0027 | 2034 MiB |
-| Folder: 15 short WAV + both MP3s, benchmark command, 3 rounds | 112.6 min | 19.06 s (spread 0.12 s) | 0.0028 | 2034 MiB |
+| One MP3, 48 kHz stereo | 36 min (2163 s) | 4.0 s | 0.0019 | 2033 MiB |
+| One MP3, 48 kHz stereo | 74 min (4420 s) | 7.9 s | 0.0018 | 2033 MiB |
+| The 36-minute recording as M4A (AAC, through FFmpeg, one decoder) | 36 min (2163 s) | 4.6 s | 0.0021 | 2033 MiB |
+| Folder: 15 short WAV + both MP3s, benchmark command, 3 rounds | 112.6 min | 11.92 s (spread 0.23 s) | 0.0018 | 2033 MiB |
 
-The same 112.6-minute folder took 97.4 s with the earlier float32 settings (2 chunks per batch, no CUDA Graph, no decode prefetch). Word error rate against the labeled transcripts in that folder:
+The same 112.6-minute folder took 97.4 s with the earlier float32 settings (2 chunks per batch, no CUDA Graph, no decode prefetch), and 19.06 s before parallel decoding, float16 accumulation, the leaner encoder, and in-memory collapse recovery. Word error rate against the labeled transcripts in that folder:
 
 | Settings | Corpus WER | 36-min podcast | 74-min podcast |
 |---|---|---|---|
-| Default (float16 encoder) | 6.67% | 7.42% | 6.29% |
+| Default (float16 encoder, float16 accumulation) | 6.66% | 7.39% | 6.29% |
+| Before this release's speed changes (float16 encoder) | 6.67% | 7.42% | 6.29% |
 | `encoder_precision = "float32"` | 6.63% | 7.43% | 6.22% |
 | Hugging Face `ParakeetForTDT` pipeline, 15 s chunks without overlap | | 9.94% | 8.45% |
 
 The Hugging Face pipeline's default chunking (with overlap) repeats the overlapped speech in its transcript (52% WER) and cannot run either podcast in one piece on a 4 GB card (it ran out of memory above 3 minutes).
 
-- **Where the time goes** (112.6-minute folder): generation 13.2 s, mostly the encoder (per 16-chunk batch about 0.38 s of encoder against about 0.05 s of graph-replayed decoding loop); media decoding about 13 s, almost all hidden behind the GPU work; collapse recovery about 3.5 s (15 of 486 chunks re-decoded).
+- **Where the time goes** (112.6-minute folder): generation 10.1 s, mostly the encoder (per 16-chunk batch about 0.27 s of encoder against about 0.05 s of graph-replayed decoding loop); media decoding about 6.5 s of batch time on four threads, hidden behind the GPU work; collapse recovery about 0.7 s (14 of 486 chunks re-decoded). The GPU is the limit: the 74-minute file spends 6.5 s of its 7.9 s in the model.
 - **Short files:** one `inference.py` run on a 9-second clip takes about 6 s, almost all of it startup. The [worker](#worker-for-many-short-files) answered such clips in 0.12 s each after a 5.2 s start.
 - **Model load:** about 2.1 s once the checkpoint and its float16 file are prepared and in the OS cache.
 - **Memory does not grow with length:** peak VRAM was the same for the 36- and 74-minute files.
@@ -447,7 +711,8 @@ tests/
 - **Decoder collapse cannot always be recovered.** The first chunk of a file has no earlier audio to shift into, and some windows stay collapsed at every tried shift. Such files are marked `untranscribed_gap` rather than passed off as complete.
 - **Float16 is not token-identical across batch shapes.** The transcript text of each test clip is the same alone and in a mixed batch, but a blank or a duration can move by one frame. With `encoder_precision = "float32"` every token and duration is identical.
 - **cuDNN float16 depthwise convolution:** in cuDNN 9.24 it returned wrong values for some inputs in batches of 7 or more rows, emptying whole chunks. The depthwise convolutions therefore always run in float32; the cost is included in the numbers above.
-- **Recovery reads seek.** Collapse recovery reads each chunk's audio again: an MP3 seek costs time that grows with the position in the file, and an FFmpeg re-read starts at the requested time, which can be offset from the stream by a few samples (a few milliseconds).
+- **Decoder blocks seek.** Each decoder seeks forward to its next block of chunks. An MP3 seek costs about 25 ms per 3 minutes skipped, which the parallel threads hide. Set `decode_workers = 1` to read every file as one continuous stream.
+- **FFmpeg files decode on one thread.** Formats libsndfile cannot read (M4A, AAC, ...) keep one decoder per file, so a single long such file does not get the parallel decoding speedup; several of them still decode in parallel.
 - **Without CUDA** there is no CUDA Graph decoding and the encoder runs in float32, so CPU and MPS are much slower; neither has been benchmarked.
 - **Scope:** the runtime does offline transcription only. There is no streaming, speaker diarization, word-level timestamps in the output, beam search, or language-model rescoring.
 - **Language:** the model has no language selection. It transcribes whatever it recognizes among its 25 languages.

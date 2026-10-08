@@ -26,6 +26,19 @@ from ..configuration.config import ParakeetConfig
 # =============================================================================
 
 
+def convolved_length(layer: nn.Conv2d, length: int | torch.Tensor) -> int | torch.Tensor:
+    """
+    Time length after one Conv2d, by the standard convolution formula.
+
+    The single definition used for valid lengths, output masks, and the
+    padding check, which must always agree. Pointwise stride-one layers
+    return the length unchanged. Works on Python ints and length tensors.
+    """
+
+    padded = length + layer.padding[0] + layer.padding[1] - layer.kernel_size[0]
+    return padded // layer.stride[0] + 1
+
+
 class Subsampling(nn.Module):
     """Reduce ``(B, T, M)`` log-mel features into ``(B, T/8, H)`` states."""
 
@@ -66,24 +79,40 @@ class Subsampling(nn.Module):
             encoder["hidden_size"],
         )
 
+    def leaves_padding(self, shortest_length: int, padded_length: int) -> bool:
+        """
+        Whether the time masks change anything for this batch.
+
+        The feature extractor always pads one frame (``samples // hop + 1``
+        frames, ``samples // hop`` valid), but the first strided convolution
+        maps both lengths to the same count. Masks matter only if, after some
+        convolution, the shortest row is still shorter than the padded one.
+
+        Args:
+            shortest_length: Valid input frames of the shortest row.
+            padded_length: Input frames of the padded batch.
+        """
+
+        for layer in self.layers:
+            if isinstance(layer, nn.Conv2d):
+                shortest_length = convolved_length(layer, shortest_length)
+                padded_length = convolved_length(layer, padded_length)
+                if shortest_length < padded_length:
+                    return True
+        return False
+
     def output_length(self, input_lengths: torch.Tensor) -> torch.Tensor:
         """
-        Propagate valid frame lengths through every strided convolution.
+        Propagate valid frame lengths through every convolution.
 
-        The standard discrete convolution length formula is applied only to
-        Conv2d layers whose stride differs from one. ReLU and pointwise stride-one
-        convolutions preserve sequence length.
+        Uses ``convolved_length``; ReLU layers and pointwise stride-one
+        convolutions keep the length.
         """
 
         lengths = input_lengths
         for layer in self.layers:
-            if isinstance(layer, nn.Conv2d) and layer.stride != (1, 1):
-                lengths = (
-                    lengths
-                    + layer.padding[0]
-                    + layer.padding[1]
-                    - layer.kernel_size[0]
-                ) // layer.stride[0] + 1
+            if isinstance(layer, nn.Conv2d):
+                lengths = convolved_length(layer, lengths)
         return lengths
 
     def forward(
@@ -109,12 +138,7 @@ class Subsampling(nn.Module):
             hidden_states = layer(hidden_states)
 
             if isinstance(layer, nn.Conv2d) and valid_lengths is not None:
-                valid_lengths = (
-                    valid_lengths
-                    + layer.padding[0]
-                    + layer.padding[1]
-                    - layer.kernel_size[0]
-                ) // layer.stride[0] + 1
+                valid_lengths = convolved_length(layer, valid_lengths)
                 current_length = hidden_states.shape[2]
                 time_mask = (
                     torch.arange(current_length, device=hidden_states.device)[None, :]

@@ -137,7 +137,9 @@ class ParakeetTDT(nn.Module):
           whose cost is kernel launches, not arithmetic;
         * the relative positional frequencies, whose smallest values lose
           most of their precision in float16;
-        * every depthwise convolution (see ConvolutionModule.forward).
+        * every depthwise convolution (see ConvolutionModule.forward) and the
+          BatchNorm after it, which runs on the convolution's float32 output
+          and keeps its running variance exact for folding.
         """
 
         frequencies = self.encoder.encode_positions.inv_freq.clone()
@@ -147,6 +149,14 @@ class ParakeetTDT(nn.Module):
         for module in self.encoder.modules():
             if isinstance(module, ConvolutionModule):
                 module.depthwise_conv.float()
+                module.norm.float()
+
+    def fold_batch_norm(self) -> None:
+        """Fold every convolution-branch BatchNorm (see ConvolutionModule.fold_batch_norm)."""
+
+        for module in self.encoder.modules():
+            if isinstance(module, ConvolutionModule):
+                module.fold_batch_norm()
 
     def encode(
         self,
@@ -429,6 +439,7 @@ def load_model(
     device: torch.device | None = None,
     encoder_dtype: torch.dtype = torch.float32,
     checkpoint_file: Path | None = None,
+    fold_batch_norm: bool = True,
 ) -> tuple[ParakeetTDT, ParakeetConfig, dict[str, Any]]:
     """
     Strict-load ``model.pth`` into the standalone architecture.
@@ -443,6 +454,10 @@ def load_model(
         checkpoint_file: Checkpoint to read instead of ``model.pth``, such as
             the float16-encoder file from ``checkpoint.derived``. Its encoder
             may already be in ``encoder_dtype``.
+        fold_batch_norm: Fold the convolution BatchNorms into the depthwise
+            convolutions (same outputs, fewer kernels). The folded state dict
+            no longer matches the checkpoint layout, so code that saves the
+            state dict (the derived float16 file) passes False.
 
     Returns:
         Loaded eval-mode model, validated configuration, and checkpoint metadata.
@@ -501,6 +516,8 @@ def load_model(
                 f"The checkpoint stores a {stored_dtype} encoder and cannot be loaded as {encoder_dtype}"
             )
         model.set_encoder_dtype(encoder_dtype)
+    if fold_batch_norm:
+        model.fold_batch_norm()
 
     model = model.to(resolved_device)
     model.eval()

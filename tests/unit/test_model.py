@@ -11,7 +11,8 @@ import torch
 
 from src.audio.features import ParakeetFeatureExtractor, build_mel_filter_bank
 from src.configuration.config import ParakeetConfig, load_config
-from src.models.attention import Attention
+from src.models.attention import Attention, EncoderMasks
+from src.models.conformer import ConvolutionModule
 from src.models.parakeet import ParakeetTDT, load_model
 from src.text.tokenization import BpeTokenizer
 from support import TINY_BLANK_ID, TINY_PAD_ID, TINY_VOCAB_SIZE, write_tiny_checkpoint
@@ -204,7 +205,7 @@ def test_model_pth_round_trip_is_strict_and_fully_materialized(tmp_path: Path) -
         tmp_path / "model.pth",
     )
 
-    loaded, _configuration, metadata = load_model(tmp_path, device=CPU)
+    loaded, _configuration, metadata = load_model(tmp_path, device=CPU, fold_batch_norm=False)
 
     assert metadata == {"note": "tiny"}
     for name, tensor in source.state_dict().items():
@@ -303,11 +304,117 @@ def test_attention_masks_fully_padded_queries_without_nan() -> None:
         weights_dir=Path("."),
     )
     attention = Attention(configuration, layer_index=0).eval()
-    valid_lengths = torch.tensor([2, 4])
-    output_mask = torch.arange(4)[None, :] < valid_lengths[:, None]
-    attention_mask = output_mask[:, None, :, None] & output_mask[:, None, None, :]
+    valid_lengths = torch.tensor([2, 4, 0])
+    valid_frames = torch.arange(4)[None, :] < valid_lengths[:, None]
+    masks = EncoderMasks.from_valid_frames(valid_frames, torch.float32)
 
-    output = attention(torch.randn(2, 4, 8), torch.randn(2, 7, 8), attention_mask)
+    # The third row is all padding: every key is blocked, which must still
+    # give finite values (the bias is finite), and padded rows come out zero.
+    output = attention(torch.randn(3, 4, 8), torch.randn(1, 7, 8), masks)
 
-    assert tuple(output.shape) == (2, 4, 8)
+    assert tuple(output.shape) == (3, 4, 8)
     assert torch.isfinite(output).all()
+    padded_rows = output.masked_select(masks.padded_frames)
+    o_proj_bias = attention.o_proj.bias
+    assert o_proj_bias is None and torch.all(padded_rows == 0)
+
+
+def test_encoder_masks_bias_only_padded_keys() -> None:
+    valid_frames = torch.tensor([[True, True, False], [True, True, True]])
+
+    masks = EncoderMasks.from_valid_frames(valid_frames, torch.float16)
+
+    assert tuple(masks.key_bias.shape) == (2, 1, 1, 3)
+    assert tuple(masks.padded_frames.shape) == (2, 3, 1)
+    blocked = torch.finfo(torch.float16).min / 2
+    assert masks.key_bias[0, 0, 0].tolist() == [0.0, 0.0, blocked]
+    assert masks.key_bias[1, 0, 0].tolist() == [0.0, 0.0, 0.0]
+    # Adding any realistic score to the bias must not overflow to -inf.
+    assert torch.isfinite(masks.key_bias + torch.tensor(-1000.0, dtype=torch.float16)).all()
+
+
+def randomize_batch_norms(model: ParakeetTDT) -> None:
+    """Give every convolution BatchNorm non-trivial statistics, as a trained checkpoint has."""
+
+    generator = torch.Generator().manual_seed(7)
+    for module in model.modules():
+        if isinstance(module, torch.nn.BatchNorm1d):
+            channels = module.num_features
+            module.running_mean.copy_(torch.randn(channels, generator=generator) * 0.3)
+            module.running_var.copy_(torch.rand(channels, generator=generator) + 0.5)
+            module.weight.data.copy_(torch.rand(channels, generator=generator) + 0.5)
+            module.bias.data.copy_(torch.randn(channels, generator=generator) * 0.2)
+
+
+def tiny_features(lengths: list[int], mel_bins: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Random features padded to the longest row, with the extractor's mask convention."""
+
+    generator = torch.Generator().manual_seed(3)
+    longest = max(lengths) + 1
+    features = torch.randn(len(lengths), longest, mel_bins, generator=generator)
+    mask = torch.arange(longest)[None, :] < torch.tensor(lengths)[:, None]
+    return features * mask[:, :, None], mask
+
+
+def test_folded_batch_norm_gives_the_same_encoder_output(tmp_path: Path) -> None:
+    model = build_tiny_model(tmp_path).eval()
+    randomize_batch_norms(model)
+    mel_bins = model.configuration.encoder["num_mel_bins"]
+    features, mask = tiny_features([40, 23], mel_bins)
+
+    with torch.inference_mode():
+        unfolded, _ = model.encoder(features, mask)
+        model.fold_batch_norm()
+        folded, _ = model.encoder(features, mask)
+        model.fold_batch_norm()  # a second fold changes nothing
+        folded_again, _ = model.encoder(features, mask)
+
+    assert all(
+        isinstance(module.norm, torch.nn.Identity)
+        for module in model.encoder.modules()
+        if isinstance(module, ConvolutionModule)
+    )
+    assert torch.allclose(folded, unfolded, atol=1e-5)
+    assert torch.equal(folded_again, folded)
+
+
+def test_padded_rows_match_running_each_row_alone(tmp_path: Path) -> None:
+    """Shared masks: padding in a mixed batch must not change any real frame."""
+
+    model = build_tiny_model(tmp_path).eval()
+    randomize_batch_norms(model)
+    model.fold_batch_norm()
+    mel_bins = model.configuration.encoder["num_mel_bins"]
+    lengths = [40, 23, 40]
+    features, mask = tiny_features(lengths, mel_bins)
+
+    with torch.inference_mode():
+        batch_states, batch_mask = model.encoder(features, mask)
+        for row, length in enumerate(lengths):
+            row_features = features[row : row + 1, : length + 1]
+            row_mask = mask[row : row + 1, : length + 1]
+            alone, alone_mask = model.encoder(row_features, row_mask)
+            valid = int(alone_mask.sum())
+            assert int(batch_mask[row].sum()) == valid
+            assert torch.allclose(batch_states[row, :valid], alone[0, :valid], atol=1e-5), row
+
+
+@pytest.mark.parametrize(
+    ("shortest", "padded", "expected"),
+    [
+        (1499, 1500, False),  # a full chunk: the extractor's padding frame vanishes at stride 2
+        (1498, 1500, True),
+        (41, 42, False),
+        (40, 41, True),  # odd padded length: the padding frame survives the first stage
+        (23, 41, True),
+    ],
+)
+def test_subsampling_knows_when_masks_change_nothing(
+    tmp_path: Path,
+    shortest: int,
+    padded: int,
+    expected: bool,
+) -> None:
+    model = build_tiny_model(tmp_path)
+
+    assert model.encoder.subsampling.leaves_padding(shortest, padded) is expected

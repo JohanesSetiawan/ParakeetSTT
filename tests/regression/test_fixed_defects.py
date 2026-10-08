@@ -62,6 +62,7 @@ def sequential_chunks(path: Path, max_chunk: int, overlap: int):
         max_batch_feature_frames=4 * max_chunk,
         max_padding_fraction=1.0,
         max_open_files=8,
+        decode_workers=1,
     )
     results = []
     with open_media_session(path) as session:
@@ -167,7 +168,7 @@ def test_chunk_at_exact_budget_boundary_is_not_one_frame_over(cores: int) -> Non
     max_chunk, overlap = 1500, 50
     total_samples = cores * (max_chunk - 2 * overlap) * HOP_LENGTH
     plan = build_execution_plan(
-        [AudioMetadata(Path("a.wav"), TARGET_RATE, 1, total_samples, "WAV")],
+        [AudioMetadata(Path("a.wav"), TARGET_RATE, 1, total_samples, "WAV", True)],
         target_sample_rate=TARGET_RATE,
         hop_length=HOP_LENGTH,
         max_chunk_feature_frames=max_chunk,
@@ -176,6 +177,7 @@ def test_chunk_at_exact_budget_boundary_is_not_one_frame_over(cores: int) -> Non
         max_batch_feature_frames=3000,
         max_padding_fraction=0.25,
         max_open_files=8,
+        decode_workers=1,
     )
 
     assert max(item.feature_frames for item in plan.items) <= max_chunk
@@ -184,7 +186,7 @@ def test_chunk_at_exact_budget_boundary_is_not_one_frame_over(cores: int) -> Non
 def test_natural_repetition_is_not_flagged_as_gibberish() -> None:
     """A repeated-token heuristic marked real speech and both long test recordings as gibberish."""
 
-    item = WorkItem(0, Path("a.wav"), 0, 0, 1, 0, 1, 1)
+    item = WorkItem(0, Path("a.wav"), 0, 0, 1, 0, 1, 1, 0)
     chunk = offline_module.ChunkResult(
         item=item,
         token_ids=(5, 5, 5, 5, 5),
@@ -429,7 +431,7 @@ def test_batch_budget_counts_padded_frames() -> None:
     """1333 + 1000 + 667 = 3000 passed a 3000 budget but allocates 3 x 1333 = 3999 frames."""
 
     metadata = tuple(
-        AudioMetadata(Path(f"f{index}.wav"), TARGET_RATE, 1, (frames - 1) * HOP_LENGTH, "WAV")
+        AudioMetadata(Path(f"f{index}.wav"), TARGET_RATE, 1, (frames - 1) * HOP_LENGTH, "WAV", True)
         for index, frames in enumerate((1333, 1000, 667))
     )
     plan = build_execution_plan(
@@ -442,6 +444,7 @@ def test_batch_budget_counts_padded_frames() -> None:
         max_batch_feature_frames=3000,
         max_padding_fraction=0.5,
         max_open_files=8,
+        decode_workers=1,
     )
 
     assert [item.feature_frames for item in plan.items] == [1333, 1000, 667]
@@ -751,11 +754,13 @@ def test_ffmpeg_stream_start_failure_names_the_file(tmp_path: Path) -> None:
 # =============================================================================
 
 
-def test_collapse_recovery_reads_the_audio_once_per_chunk(tmp_path: Path, tiny_configuration) -> None:
+def test_collapse_recovery_never_reads_the_file_again(tmp_path: Path, tiny_configuration) -> None:
     """
     Every shifted window was decoded on its own, one seek each. An MP3 seek in
     libsndfile costs about 9 ms per minute of position, so recovering chunks
     late in a 74-minute podcast cost more than the model (9 s for 12 chunks).
+    One read per collapsed chunk still cost 1.5 s there; the windows are now
+    cut from audio decoded together with the chunk, so recovery reads nothing.
     """
 
     from src.audio.media import MediaSession
@@ -764,10 +769,11 @@ def test_collapse_recovery_reads_the_audio_once_per_chunk(tmp_path: Path, tiny_c
     path = tmp_path / "speech.wav"
     write_float_wav(path, torch.full((48_000,), 0.1), TARGET_RATE)
     offsets = (-3, 3, -5, 5)
+    # Every call after the first collapses, so no window succeeds and every
+    # collapsed chunk tries all of its windows.
+    model = SteadySpeechModel(3, collapse_calls=frozenset(range(1, 1000)))
     transcriber = OfflineTranscriber(
-        # Every call after the first collapses, so no window succeeds and the
-        # old code read all four windows for every collapsed chunk.
-        SteadySpeechModel(3, collapse_calls=frozenset(range(1, 1000))).eval(),
+        model.eval(),
         tiny_configuration,
         inference_settings(
             batch_size=1,
@@ -777,32 +783,30 @@ def test_collapse_recovery_reads_the_audio_once_per_chunk(tmp_path: Path, tiny_c
             recovery_start_offsets_feature_frames=offsets,
         ),
     )
-    reads_during_recovery: list[tuple[int, int]] = []
-    recovered_chunks: list[int] = []
-    recovering = [False]
+    sessions_opened = [0]
+    fresh_reads = [0]
+    original_open = offline_module.open_media_session
     original_read = MediaSession.read_segment
-    original_recover = OfflineTranscriber._recover_file
+
+    def counting_open(media_path: Path):
+        sessions_opened[0] += 1
+        return original_open(media_path)
 
     def counting_read(self, start: int, end: int, rate: int):
-        if recovering[0]:
-            reads_during_recovery.append((start, end))
+        fresh_reads[0] += 1
         return original_read(self, start, end, rate)
 
-    def flagged_recover(self, chunks, metadata, session):
-        recovered_chunks.extend(chunk.item.chunk_index for chunk in chunks if self._has_untranscribed_gap(chunk))
-        recovering[0] = True
-        try:
-            return original_recover(self, chunks, metadata, session)
-        finally:
-            recovering[0] = False
-
-    with patch.object(MediaSession, "read_segment", counting_read), patch.object(
-        OfflineTranscriber, "_recover_file", flagged_recover
+    with patch.object(offline_module, "open_media_session", counting_open), patch.object(
+        MediaSession, "read_segment", counting_read
     ):
         file_result = transcriber.transcribe([path]).files[0]
 
-    assert recovered_chunks
-    assert len(reads_during_recovery) == len(recovered_chunks)
+    chunk_count = len(file_result.chunks)
+    assert model.calls > chunk_count  # recovery did run
+    # One session and one fresh read (the stream's first chunk); the other
+    # chunks continue the stream, and recovery adds no read at all.
+    assert sessions_opened == [1]
+    assert fresh_reads == [1]
     assert file_result.status is FileStatus.UNTRANSCRIBED_GAP
 
 
