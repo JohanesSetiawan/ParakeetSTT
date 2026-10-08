@@ -124,6 +124,29 @@ def test_streams_of_one_batch_run_on_several_threads(tmp_path: Path, tiny_config
     assert overlapping[0]
 
 
+def test_item_decode_times_add_up_to_the_batch_time(tmp_path: Path, tiny_configuration) -> None:
+    """Review finding: parallel item times were summed, so files were charged more than wall time."""
+
+    path = tmp_path / "speech.wav"
+    write_float_wav(path, tone(6.0, TARGET_RATE), TARGET_RATE)
+    batches = []
+    original = OfflineTranscriber._infer_batch
+
+    def recording(self, items, decoded):
+        batches.append(decoded)
+        return original(self, items, decoded)
+
+    transcriber = OfflineTranscriber(ScriptedModel(3).eval(), tiny_configuration, stream_settings(4))
+    with patch.object(OfflineTranscriber, "_infer_batch", recording):
+        result = transcriber.transcribe([path])
+
+    assert batches
+    for decoded in batches:
+        item_total = sum(item_audio.seconds for item_audio in decoded.items)
+        assert item_total == pytest.approx(decoded.seconds, rel=1e-9, abs=1e-12)
+    assert result.files[0].processing_seconds >= result.media_decode_seconds
+
+
 def test_every_stream_session_is_closed(tmp_path: Path, tiny_configuration) -> None:
     paths = []
     for index in range(3):

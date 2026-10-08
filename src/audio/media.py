@@ -193,6 +193,10 @@ def _metadata_from_probe(path: Path, probe: dict[str, object]) -> AudioMetadata:
         channels=channels,
         frame_count=max(1, round(duration_seconds * sample_rate)),
         format_name=str(stream.get("codec_name") or "FFmpeg audio"),
+        # FFmpeg's input seek is estimated for some formats (raw ADTS AAC,
+        # MP3 with only a coarse TOC), so these files are read from the start
+        # as one stream and never split into seeking decode streams.
+        sample_accurate_seek=False,
     )
 
 
@@ -227,6 +231,7 @@ def inspect_media(path: Path) -> AudioMetadata:
         channels=int(information.channels),
         frame_count=int(information.frames),
         format_name=str(information.format),
+        sample_accurate_seek=True,
     )
 
 
@@ -419,28 +424,20 @@ def _read_ffmpeg_segment(
 
 class _FfmpegStream:
     """
-    One FFmpeg process that decodes a file to mono target-rate float32.
+    One FFmpeg process that decodes a whole file to mono target-rate float32.
 
-    Chunks of a decode stream are read in order, so each new piece continues
-    exactly where the previous one stopped. One process per stream replaces
-    one process (plus a seek) per chunk, and FFmpeg's resampler runs over the
-    stream continuously instead of restarting at every chunk. A stream that
-    covers a later region of the file starts there with FFmpeg's own seek,
-    instead of decoding and discarding everything before it.
+    Chunks of a file are read in order, so each new piece continues exactly
+    where the previous one stopped. One process per file replaces one process
+    (plus a seek) per chunk, and FFmpeg's resampler runs over the file
+    continuously instead of restarting at every chunk.
     """
 
     STDERR_LINES_KEPT = 20
 
-    def __init__(self, path: Path, target_sample_rate: int, start_frame: int = 0) -> None:
-        start_seconds = start_frame / target_sample_rate if start_frame > 0 else None
-        command = _ffmpeg_decode_command(
-            _require_ffmpeg(),
-            path,
-            target_sample_rate,
-            start_seconds=start_seconds,
-        )
+    def __init__(self, path: Path, target_sample_rate: int) -> None:
+        command = _ffmpeg_decode_command(_require_ffmpeg(), path, target_sample_rate)
         self.path = path
-        self.position = start_frame
+        self.position = 0
         self.exhausted = False
         self._stderr_tail: deque[str] = deque(maxlen=self.STDERR_LINES_KEPT)
         try:
@@ -766,16 +763,8 @@ class MediaSession:
         # Same clamp as the soundfile path: an overlap reaching past this
         # chunk's end leaves nothing new to read.
         new_start_frame = min(source_start_frame + max(0, reusable_frames), source_end_frame)
-        # A stream skips ahead by decoding and discarding. When the jump is
-        # longer than the piece to read (a decode stream moving on to its
-        # next block), starting FFmpeg again at the new position is cheaper.
-        if self._stream is not None:
-            skip = new_start_frame - self._stream.position
-            if skip > source_end_frame - new_start_frame:
-                self._stream.close()
-                self._stream = None
         if self._stream is None:
-            self._stream = _FfmpegStream(self.path, target_sample_rate, new_start_frame)
+            self._stream = _FfmpegStream(self.path, target_sample_rate)
 
         if new_start_frame < self._stream.position:
             segment = _read_ffmpeg_segment(

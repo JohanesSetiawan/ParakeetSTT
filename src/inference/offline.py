@@ -44,6 +44,7 @@ from .planning import (
     WorkItem,
     build_execution_plan,
     estimate_feature_frames,
+    rows_per_batch,
     target_frame_count,
 )
 from .recovery import Window, longest_untranscribed_gap, recovery_windows
@@ -466,8 +467,13 @@ class OfflineTranscriber:
             decode_workers=self.settings.decode_workers,
         )
 
-    def _stream_decoders(self, plan: ExecutionPlan) -> dict[int, _StreamDecoder]:
-        """One decoder per decode stream of the plan; none opens a file yet."""
+    def _stream_decoders(self, plan: ExecutionPlan, file_ends: list[int]) -> dict[int, _StreamDecoder]:
+        """
+        One decoder per decode stream of the plan; none opens a file yet.
+
+        ``file_ends`` are the files' lengths at the target rate, the same
+        values recovery clips its windows to.
+        """
 
         chunks_by_stream: dict[int, list[WorkItem]] = {}
         for item in plan.items:
@@ -476,11 +482,10 @@ class OfflineTranscriber:
         decoders: dict[int, _StreamDecoder] = {}
         for stream_index, items in chunks_by_stream.items():
             first = items[0]
-            metadata = plan.metadata[first.file_index]
             decoders[stream_index] = _StreamDecoder(
                 first.path,
                 chunk_indices=frozenset(item.chunk_index for item in items),
-                file_end=target_frame_count(metadata, self.target_sample_rate),
+                file_end=file_ends[first.file_index],
                 context_samples=self.recovery_context_samples,
                 target_sample_rate=self.target_sample_rate,
             )
@@ -557,7 +562,19 @@ class OfflineTranscriber:
 
         decode_started = time.perf_counter()
         decoded = self._decode_batch_audio(items, streams, pool)
-        return _DecodedBatch(items=decoded, seconds=time.perf_counter() - decode_started)
+        batch_seconds = time.perf_counter() - decode_started
+
+        # Each item was timed on its own thread while other streams ran
+        # beside it, so the item times add up to more than the batch took.
+        # Scale them to the batch's wall time, keeping their proportions,
+        # so per-file processing time stays comparable with one worker.
+        thread_seconds = sum(item_audio.seconds for item_audio in decoded)
+        scale = batch_seconds / thread_seconds if thread_seconds > 0 else 0.0
+        attributed = tuple(
+            dataclasses.replace(item_audio, seconds=item_audio.seconds * scale)
+            for item_audio in decoded
+        )
+        return _DecodedBatch(items=attributed, seconds=batch_seconds)
 
     def _infer_batch(
         self,
@@ -693,8 +710,11 @@ class OfflineTranscriber:
     def _recovery_rows(self) -> int:
         """Rows per recovery batch: the same limits as planned batches."""
 
-        rows_by_frames = self.settings.max_batch_feature_frames // self.settings.max_chunk_feature_frames
-        return max(1, min(self.settings.batch_size, rows_by_frames))
+        return rows_per_batch(
+            self.settings.batch_size,
+            self.settings.max_batch_feature_frames,
+            self.settings.max_chunk_feature_frames,
+        )
 
     def _start_recovery(
         self,
@@ -944,8 +964,8 @@ class OfflineTranscriber:
         if self.device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(self.device)
 
-        streams = self._stream_decoders(plan)
         file_ends = [target_frame_count(record, self.target_sample_rate) for record in metadata_tuple]
+        streams = self._stream_decoders(plan, file_ends)
         chunk_results: dict[int, list[ChunkResult]] = {index: [] for index in range(len(path_tuple))}
         recovery_queue: deque[_PendingRecovery] = deque()
         recovery_rows = self._recovery_rows()

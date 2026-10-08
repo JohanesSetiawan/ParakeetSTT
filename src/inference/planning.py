@@ -11,13 +11,20 @@ from typing import Iterable
 
 @dataclass(frozen=True)
 class AudioMetadata:
-    """Measured source properties needed by the execution planner."""
+    """
+    Measured source properties needed by the execution planner.
+
+    ``sample_accurate_seek`` is True when libsndfile decodes the file, which
+    seeks to any sample exactly; only such files are split into several
+    decode streams. Files decoded through FFmpeg are read as one stream.
+    """
 
     path: Path
     sample_rate: int
     channels: int
     frame_count: int
     format_name: str
+    sample_accurate_seek: bool
 
     @property
     def duration_seconds(self) -> float:
@@ -145,9 +152,21 @@ def _padding_fraction(items: Iterable[WorkItem]) -> float:
     return (capacity - used) / capacity
 
 
+def rows_per_batch(batch_size: int, max_batch_feature_frames: int, max_chunk_feature_frames: int) -> int:
+    """
+    Most rows a batch can hold: the row limit, or the full-length chunks that
+    fit in the padded frame budget, whichever is smaller (at least one).
+    Planned batches, decode-stream blocks, and recovery batches all use it.
+    """
+
+    rows_by_frames = max_batch_feature_frames // max_chunk_feature_frames
+    return max(1, min(batch_size, rows_by_frames))
+
+
 def _decode_streams(
     chunk_counts: list[int],
-    rows_per_batch: int,
+    splittable: list[bool],
+    rows_in_batch: int,
     decode_workers: int,
     max_open_files: int,
 ) -> list[list[int]]:
@@ -165,13 +184,17 @@ def _decode_streams(
 
     The workers are shared by the long files in progress, so with several of
     them each file gets fewer streams, and with at least as many files as
-    workers every file is read by one stream, as before.
+    workers every file is read by one stream, as before. Every stream holds
+    its own decoder, so the streams of all files in progress never exceed
+    ``max_open_files`` either. Files that cannot seek exactly (decoded
+    through FFmpeg) are always one stream.
 
     Args:
         chunk_counts: Chunks of each file, in file order.
-        rows_per_batch: Most rows a planned batch can hold.
+        splittable: Whether each file may be split (sample-accurate seek).
+        rows_in_batch: Most rows a planned batch can hold.
         decode_workers: Threads available for decoding.
-        max_open_files: Most multi-chunk files in progress at once.
+        max_open_files: Most decoders of multi-chunk files open at once.
 
     Returns:
         For each file, the stream index of each of its chunks. Indices are
@@ -182,17 +205,25 @@ def _decode_streams(
         raise ValueError("decode_workers must be at least 1")
     long_files = sum(1 for count in chunk_counts if count > 1)
     files_in_progress = max(1, min(max_open_files, long_files))
-    streams_per_file = max(1, decode_workers // files_in_progress)
-    block_chunks = max(1, math.ceil(rows_per_batch / decode_workers))
+    decoders_in_progress = min(decode_workers, max_open_files)
+    streams_per_file = max(1, decoders_in_progress // files_in_progress)
+    block_chunks = max(1, math.ceil(rows_in_batch / decode_workers))
 
     streams: list[list[int]] = []
     next_stream_index = 0
-    for count in chunk_counts:
+    for count, can_split in zip(chunk_counts, splittable, strict=True):
         blocks = math.ceil(count / block_chunks)
-        stream_count = max(1, min(streams_per_file, blocks))
-        streams.append(
-            [next_stream_index + (chunk_index // block_chunks) % stream_count for chunk_index in range(count)]
-        )
+        if can_split:
+            stream_count = max(1, min(streams_per_file, blocks))
+        else:
+            stream_count = 1
+
+        file_streams: list[int] = []
+        for chunk_index in range(count):
+            block_index = chunk_index // block_chunks
+            stream_of_file = block_index % stream_count
+            file_streams.append(next_stream_index + stream_of_file)
+        streams.append(file_streams)
         next_stream_index += stream_count
     return streams
 
@@ -308,7 +339,7 @@ def build_execution_plan(
     max_batch_feature_frames: int,
     max_padding_fraction: float,
     max_open_files: int,
-    decode_workers: int = 1,
+    decode_workers: int,
 ) -> ExecutionPlan:
     """
     Create an automatic cost-aware plan without a duration cutoff.
@@ -345,10 +376,10 @@ def build_execution_plan(
         )
         for record in metadata_list
     ]
-    rows_per_batch = max(1, min(batch_size, max_batch_feature_frames // max_chunk_feature_frames))
     file_streams = _decode_streams(
         [len(ranges) for ranges in file_ranges],
-        rows_per_batch,
+        [record.sample_accurate_seek for record in metadata_list],
+        rows_per_batch(batch_size, max_batch_feature_frames, max_chunk_feature_frames),
         decode_workers,
         max_open_files,
     )

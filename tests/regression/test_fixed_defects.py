@@ -62,6 +62,7 @@ def sequential_chunks(path: Path, max_chunk: int, overlap: int):
         max_batch_feature_frames=4 * max_chunk,
         max_padding_fraction=1.0,
         max_open_files=8,
+        decode_workers=1,
     )
     results = []
     with open_media_session(path) as session:
@@ -167,7 +168,7 @@ def test_chunk_at_exact_budget_boundary_is_not_one_frame_over(cores: int) -> Non
     max_chunk, overlap = 1500, 50
     total_samples = cores * (max_chunk - 2 * overlap) * HOP_LENGTH
     plan = build_execution_plan(
-        [AudioMetadata(Path("a.wav"), TARGET_RATE, 1, total_samples, "WAV")],
+        [AudioMetadata(Path("a.wav"), TARGET_RATE, 1, total_samples, "WAV", True)],
         target_sample_rate=TARGET_RATE,
         hop_length=HOP_LENGTH,
         max_chunk_feature_frames=max_chunk,
@@ -176,6 +177,7 @@ def test_chunk_at_exact_budget_boundary_is_not_one_frame_over(cores: int) -> Non
         max_batch_feature_frames=3000,
         max_padding_fraction=0.25,
         max_open_files=8,
+        decode_workers=1,
     )
 
     assert max(item.feature_frames for item in plan.items) <= max_chunk
@@ -429,7 +431,7 @@ def test_batch_budget_counts_padded_frames() -> None:
     """1333 + 1000 + 667 = 3000 passed a 3000 budget but allocates 3 x 1333 = 3999 frames."""
 
     metadata = tuple(
-        AudioMetadata(Path(f"f{index}.wav"), TARGET_RATE, 1, (frames - 1) * HOP_LENGTH, "WAV")
+        AudioMetadata(Path(f"f{index}.wav"), TARGET_RATE, 1, (frames - 1) * HOP_LENGTH, "WAV", True)
         for index, frames in enumerate((1333, 1000, 667))
     )
     plan = build_execution_plan(
@@ -442,6 +444,7 @@ def test_batch_budget_counts_padded_frames() -> None:
         max_batch_feature_frames=3000,
         max_padding_fraction=0.5,
         max_open_files=8,
+        decode_workers=1,
     )
 
     assert [item.feature_frames for item in plan.items] == [1333, 1000, 667]

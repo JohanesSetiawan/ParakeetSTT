@@ -60,6 +60,7 @@ def plan_items(path: Path, overlap: int):
         max_batch_feature_frames=480,
         max_padding_fraction=1.0,
         max_open_files=8,
+        decode_workers=1,
     )
     return sorted(plan.items, key=lambda item: item.chunk_index)
 
@@ -166,10 +167,17 @@ def test_closing_mid_file_joins_the_stderr_thread_cleanly(m4a: Path) -> None:
     assert thread_errors == []
 
 
-def test_a_long_jump_ahead_restarts_ffmpeg_at_the_new_position(m4a: Path) -> None:
-    """A decode stream moving to its next block must not decode the audio in between."""
+def test_ffmpeg_files_are_read_by_one_process_with_parallel_workers(m4a: Path, tiny_configuration) -> None:
+    """
+    FFmpeg seeks by estimate for some formats, so a file it decodes is never
+    split into decode streams, whatever decode_workers is: one process reads
+    it from the start, as with a single worker.
+    """
 
-    reference = full_decode(m4a)
+    from src.inference.offline import OfflineTranscriber
+    from support import ScriptedModel, inference_settings
+
+    metadata = inspect_media(m4a)
     spawned: list[list[str]] = []
     real_popen = subprocess.Popen
 
@@ -177,20 +185,18 @@ def test_a_long_jump_ahead_restarts_ffmpeg_at_the_new_position(m4a: Path) -> Non
         spawned.append(list(command))
         return real_popen(command, *args, **kwargs)
 
-    with patch.object(media_module.subprocess, "Popen", counting_popen), open_media_session(m4a) as session:
-        session.read_sequential_segment(0, 8000, TARGET_RATE)
-        # Short jump (less than the piece read): the stream skips ahead.
-        session.read_sequential_segment(12_000, 20_000, TARGET_RATE)
-        # Long jump: a new process starts at the requested position.
-        jumped, _waveform = session.read_sequential_segment(56_000, 64_000, TARGET_RATE)
+    transcriber = OfflineTranscriber(
+        ScriptedModel(3).eval(),
+        tiny_configuration,
+        inference_settings(batch_size=4, max_batch_feature_frames=400, decode_workers=4),
+    )
+    plan = transcriber._plan((metadata,))
+    with patch.object(media_module.subprocess, "Popen", counting_popen):
+        result = transcriber.transcribe([m4a], metadata=[metadata])
 
-    assert len(spawned) == 2
+    assert metadata.sample_accurate_seek is False
+    assert len(plan.items) > 4
+    assert {item.stream_index for item in plan.items} == {0}
+    assert len(spawned) == 1
     assert "-ss" not in spawned[0]
-    assert spawned[1][spawned[1].index("-ss") + 1] == f"{56_000 / TARGET_RATE:.9f}"
-    assert jumped.waveform.numel() == 8000
-    # FFmpeg seeks accurately; only the AAC decoder's start-up at the seek
-    # point differs (measured: the first 32 ms). A decoder's first chunk of a
-    # block begins with the recovery reach and the overlap before the core,
-    # so that stretch never reaches a transcribed core.
-    settle = 512
-    assert torch.allclose(jumped.waveform[settle:], reference[56_000 + settle : 64_000], atol=1e-4)
+    assert len(result.files) == 1

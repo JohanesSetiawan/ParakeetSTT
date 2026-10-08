@@ -13,6 +13,7 @@ from src.inference.planning import (
     build_execution_plan,
     estimate_feature_frames,
     padded_batch_frames,
+    rows_per_batch,
 )
 
 HOP_LENGTH = 160
@@ -30,7 +31,7 @@ def make_plan(
     max_open_files: int = 8,
 ) -> ExecutionPlan:
     metadata = tuple(
-        AudioMetadata(Path(f"file_{index}.wav"), SAMPLE_RATE, 1, frames, "WAV")
+        AudioMetadata(Path(f"file_{index}.wav"), SAMPLE_RATE, 1, frames, "WAV", True)
         for index, frames in enumerate(frame_counts)
     )
     return build_execution_plan(
@@ -43,6 +44,7 @@ def make_plan(
         max_batch_feature_frames=max_batch or 2 * max_chunk,
         max_padding_fraction=padding,
         max_open_files=max_open_files,
+        decode_workers=1,
     )
 
 
@@ -205,12 +207,18 @@ def test_open_file_limit_must_be_positive() -> None:
 CHUNK_SAMPLES = 100 * HOP_LENGTH - 1
 
 
-def stream_plan(chunk_counts: list[int], decode_workers: int, max_open_files: int = 8) -> ExecutionPlan:
+def stream_plan(
+    chunk_counts: list[int],
+    decode_workers: int,
+    max_open_files: int = 8,
+    seekable: list[bool] | None = None,
+) -> ExecutionPlan:
     """Files of exactly ``chunk_counts`` chunks, in batches of 8 rows."""
 
+    seekable = seekable or [True] * len(chunk_counts)
     metadata = tuple(
-        AudioMetadata(Path(f"file_{index}.wav"), SAMPLE_RATE, 1, chunks * CHUNK_SAMPLES, "WAV")
-        for index, chunks in enumerate(chunk_counts)
+        AudioMetadata(Path(f"file_{index}.wav"), SAMPLE_RATE, 1, chunks * CHUNK_SAMPLES, "WAV", can_seek)
+        for index, (chunks, can_seek) in enumerate(zip(chunk_counts, seekable, strict=True))
     )
     return build_execution_plan(
         metadata,
@@ -265,8 +273,33 @@ def test_workers_are_shared_by_the_long_files_in_progress() -> None:
 
     assert [len(set(streams_by_chunk(two_files, index))) for index in range(2)] == [2, 2]
     assert all(len(set(streams_by_chunk(many_files, index))) == 1 for index in range(5))
-    # Only two files are in rotation at once, so each gets two streams.
-    assert all(len(set(streams_by_chunk(limited, index))) == 2 for index in range(5))
+    # Two files in rotation already hold the two decoders the limit allows.
+    assert all(len(set(streams_by_chunk(limited, index))) == 1 for index in range(5))
+
+
+def test_streams_never_hold_more_decoders_than_max_open_files() -> None:
+    """Review finding: 8 workers gave one file 8 open decoders with max_open_files = 2."""
+
+    plan = stream_plan([40], decode_workers=8, max_open_files=2)
+
+    assert len(set(streams_by_chunk(plan))) == 2
+
+
+def test_files_without_sample_accurate_seek_stay_one_stream() -> None:
+    """FFmpeg-decoded files are read from the start, never split at estimated seeks."""
+
+    plan = stream_plan([20, 20], decode_workers=4, seekable=[False, True])
+
+    assert set(streams_by_chunk(plan, 0)) == {0}
+    assert len(set(streams_by_chunk(plan, 1))) == 2
+
+
+@pytest.mark.parametrize(
+    ("batch_size", "max_batch", "max_chunk", "expected"),
+    [(16, 24_000, 1500, 16), (16, 12_000, 1500, 8), (4, 24_000, 1500, 4), (16, 1500, 1500, 1)],
+)
+def test_rows_per_batch_takes_the_tighter_limit(batch_size, max_batch, max_chunk, expected) -> None:
+    assert rows_per_batch(batch_size, max_batch, max_chunk) == expected
 
 
 def test_short_files_never_get_more_streams_than_blocks() -> None:
