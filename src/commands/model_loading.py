@@ -128,7 +128,11 @@ class PreparedModel:
     memory_budget: MemoryBudget
 
 
-def prepare_inference_model(settings: Settings, report: Callable[[str], None]) -> PreparedModel:
+def prepare_inference_model(
+    settings: Settings,
+    report: Callable[[str], None],
+    notice: Callable[[str], None] | None = None,
+) -> PreparedModel:
     """
     Load the model for inference and report each decision as it is made.
 
@@ -139,11 +143,15 @@ def prepare_inference_model(settings: Settings, report: Callable[[str], None]) -
         settings: Validated application settings.
         report: Receives one plain-text line per decision (the caller decides
             whether that is the terminal, standard error, or only the log).
+        notice: Receives what the user must see even when ``report`` only
+            logs: first-run download and conversion progress, and warnings.
+            Defaults to ``report``.
 
     Returns:
         The prepared model and the decisions behind it.
     """
 
+    notice = notice or report
     device = select_device()
     apply_float32_matmul_precision(settings.inference.float32_matmul_precision)
     encoder_dtype, precision = encoder_dtype_for(settings.inference.encoder_precision, device)
@@ -152,8 +160,8 @@ def prepare_inference_model(settings: Settings, report: Callable[[str], None]) -
     bootstrap, (model, configuration, _metadata) = ensure_first_run_ready(
         checkpoint_dir=settings.paths.weights_dir,
         checkpoint_settings=settings.checkpoint,
-        loader=inference_model_loader(device, encoder_dtype, progress_callback=report),
-        progress_callback=report,
+        loader=inference_model_loader(device, encoder_dtype, progress_callback=notice),
+        progress_callback=notice,
     )
     load_seconds = time.perf_counter() - load_started
     report(f"Weights: {bootstrap.action}")
@@ -181,6 +189,8 @@ def prepare_inference_model(settings: Settings, report: Callable[[str], None]) -
     )
     for line in memory_budget.lines():
         report(line)
+    for line in memory_budget.warnings():
+        notice(line)
 
     return PreparedModel(
         model=model,

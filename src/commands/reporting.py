@@ -14,19 +14,25 @@ import time
 from typing import Callable, TextIO
 
 
-def line_reporter(logger: logging.Logger, stream: TextIO | None = None) -> Callable[[str], None]:
+def line_reporter(
+    logger: logging.Logger,
+    stream: TextIO | None = None,
+    echo: bool = True,
+) -> Callable[[str], None]:
     """
-    A reporter that prints each line and writes it to the run log at INFO.
+    A reporter that writes each line to the run log at INFO, and prints it.
 
     Args:
         logger: The command's logger (a literal name under ``src``).
         stream: Where to print; standard output by default. The worker
             passes standard error so standard output carries only its
             protocol.
+        echo: Print as well as log. False keeps details in the log only.
     """
 
     def report(line: str) -> None:
-        print(line, file=stream if stream is not None else sys.stdout)
+        if echo:
+            print(line, file=stream if stream is not None else sys.stdout)
         logger.info(line)
 
     return report

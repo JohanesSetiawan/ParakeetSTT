@@ -8,11 +8,14 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+import dataclasses
+
 from src.checkpoint.bootstrap import (
     clear_readiness_marker,
     ensure_first_run_ready,
     readiness_marker_path,
 )
+from src.checkpoint.orchestration import remove_source_weights
 from support import checkpoint_settings
 
 PREPARE = "src.checkpoint.bootstrap.prepare_checkpoint"
@@ -104,3 +107,105 @@ def test_repair_and_clear_force_full_preparation(prepared_checkpoint: Path) -> N
     assert repaired.action == "prepared"
     assert repaired.preparation is preparation
     assert not marker_path.exists()
+
+
+# =============================================================================
+# Releasing model.safetensors after a proven model.pth
+# =============================================================================
+
+SOURCE_BYTES = b"verified safetensors payload"
+SOURCE_SHA256 = "a" * 64
+
+
+def write_converted_checkpoint(directory: Path, converted_from: str = SOURCE_SHA256) -> Path:
+    """model.pth, model.safetensors, and the two manifests that tie them together."""
+
+    (directory / "model.pth").write_bytes(b"prepared")
+    (directory / "model.safetensors").write_bytes(SOURCE_BYTES)
+    (directory / "download_manifest.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "files": {"model.safetensors": {"sha256": SOURCE_SHA256, "size_bytes": len(SOURCE_BYTES)}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (directory / "conversion_manifest.json").write_text(
+        json.dumps({"schema_version": 1, "source_safetensors_sha256": converted_from}),
+        encoding="utf-8",
+    )
+    return directory
+
+
+def releasing_settings(keep: bool):
+    return dataclasses.replace(checkpoint_settings(), keep_safetensors=keep)
+
+
+def test_safetensors_is_removed_after_a_successful_load(tmp_path: Path) -> None:
+    write_converted_checkpoint(tmp_path)
+    write_marker(tmp_path, recorded_size=len(b"prepared"))
+    messages: list[str] = []
+
+    result, _loaded = ensure_first_run_ready(
+        tmp_path,
+        releasing_settings(keep=False),
+        MagicMock(return_value="model"),
+        progress_callback=messages.append,
+    )
+
+    assert result.action == "ready"
+    assert not (tmp_path / "model.safetensors").exists()
+    assert (tmp_path / "model.pth").is_file()
+    assert any("Removed model.safetensors" in message for message in messages)
+
+
+def test_safetensors_is_kept_when_configured(tmp_path: Path) -> None:
+    write_converted_checkpoint(tmp_path)
+    write_marker(tmp_path, recorded_size=len(b"prepared"))
+
+    ensure_first_run_ready(tmp_path, releasing_settings(keep=True), MagicMock())
+
+    assert (tmp_path / "model.safetensors").read_bytes() == SOURCE_BYTES
+
+
+def test_safetensors_is_kept_when_the_load_fails(tmp_path: Path) -> None:
+    write_converted_checkpoint(tmp_path)
+    write_marker(tmp_path, recorded_size=len(b"prepared"))
+    loader = MagicMock(side_effect=RuntimeError("missing keys"))
+
+    with pytest.raises(RuntimeError, match="missing keys"):
+        ensure_first_run_ready(tmp_path, releasing_settings(keep=False), loader)
+
+    assert (tmp_path / "model.safetensors").is_file()
+
+
+@pytest.mark.parametrize("mismatch", ["other source", "resized file", "no conversion manifest"])
+def test_safetensors_is_kept_without_matching_evidence(tmp_path: Path, mismatch: str) -> None:
+    """Never delete a file that model.pth was not provably converted from."""
+
+    write_converted_checkpoint(tmp_path, converted_from="b" * 64 if mismatch == "other source" else SOURCE_SHA256)
+    if mismatch == "resized file":
+        (tmp_path / "model.safetensors").write_bytes(SOURCE_BYTES + b"x")
+    if mismatch == "no conversion manifest":
+        (tmp_path / "conversion_manifest.json").unlink()
+
+    assert remove_source_weights(tmp_path) == 0
+    assert (tmp_path / "model.safetensors").is_file()
+
+
+def test_a_failed_removal_is_a_warning_not_a_failure(tmp_path: Path) -> None:
+    write_converted_checkpoint(tmp_path)
+    write_marker(tmp_path, recorded_size=len(b"prepared"))
+    messages: list[str] = []
+
+    with patch("src.checkpoint.bootstrap.remove_source_weights", side_effect=PermissionError("in use")):
+        result, loaded = ensure_first_run_ready(
+            tmp_path,
+            releasing_settings(keep=False),
+            MagicMock(return_value="model"),
+            progress_callback=messages.append,
+        )
+
+    assert (result.action, loaded) == ("ready", "model")
+    assert any(message.startswith("Warning: could not remove model.safetensors") for message in messages)

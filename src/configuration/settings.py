@@ -41,9 +41,16 @@ class PathSettings:
 
 @dataclass(frozen=True)
 class LoggingSettings:
-    """Run-log verbosity."""
+    """
+    Run-log verbosity and how much the terminal shows.
+
+    With ``terminal_details`` off, the terminal shows the device, progress,
+    results, and warnings; every other startup and timing line goes to the
+    run log only.
+    """
 
     level: str
+    terminal_details: bool
 
 
 @dataclass(frozen=True)
@@ -54,6 +61,7 @@ class CheckpointSettings:
     download_attempts: int
     retry_backoff_seconds: float
     stream_block_bytes: int
+    keep_safetensors: bool
 
 
 @dataclass(frozen=True)
@@ -203,7 +211,10 @@ def _parse_logging(document: dict[str, Any]) -> LoggingSettings:
     valid_levels = ("DEBUG", "INFO", "WARNING", "ERROR")
     if not isinstance(level, str) or level.upper() not in valid_levels:
         raise ValueError(f"logging.level must be one of {valid_levels}, got {level!r}")
-    return LoggingSettings(level=level.upper())
+    return LoggingSettings(
+        level=level.upper(),
+        terminal_details=_boolean(section, "logging", "terminal_details"),
+    )
 
 
 def _parse_checkpoint(document: dict[str, Any]) -> CheckpointSettings:
@@ -216,6 +227,7 @@ def _parse_checkpoint(document: dict[str, Any]) -> CheckpointSettings:
         download_attempts=_integer(section, "checkpoint", "download_attempts", minimum=1),
         retry_backoff_seconds=_number(section, "checkpoint", "retry_backoff_seconds", minimum=0.0),
         stream_block_bytes=_integer(section, "checkpoint", "stream_block_bytes", minimum=1),
+        keep_safetensors=_boolean(section, "checkpoint", "keep_safetensors"),
     )
 
 

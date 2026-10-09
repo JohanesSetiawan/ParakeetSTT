@@ -23,12 +23,14 @@ metrics_dir = "metrics"
 
 [logging]
 level = "info"
+terminal_details = false
 
 [checkpoint]
 request_timeout_seconds = 30
 download_attempts = 2
 retry_backoff_seconds = 0.5
 stream_block_bytes = 4096
+keep_safetensors = false
 
 [inference]
 batch_size = 4
@@ -87,6 +89,8 @@ def test_valid_file_is_normalized(tmp_path: Path) -> None:
 
     assert settings.paths.weights_dir == (tmp_path / "weights/model").resolve()
     assert settings.logging.level == "INFO"
+    assert settings.logging.terminal_details is False
+    assert settings.checkpoint.keep_safetensors is False
     assert settings.inference.audio_extensions == (".wav", ".mp3")
     assert settings.inference.overlap_feature_frames == 0
     assert settings.checkpoint.request_timeout_seconds == 30.0
@@ -125,6 +129,8 @@ def test_valid_file_is_normalized(tmp_path: Path) -> None:
         ('float32_matmul_precision = "high"', 'float32_matmul_precision = "medium"', "float32_matmul_precision"),
         ("float16_accumulation = true", "float16_accumulation = 1", "float16_accumulation"),
         ("decode_workers = 3", "decode_workers = 0", "decode_workers"),
+        ("terminal_details = false", "terminal_details = 0", "terminal_details"),
+        ("keep_safetensors = false", 'keep_safetensors = "no"', "keep_safetensors"),
         ("reserve_mib = 256", "reserve_mib = -1", "reserve_mib"),
         ("auto_batch_budget = true", "auto_batch_budget = 1", "auto_batch_budget"),
         ("cap_to_free_memory = true", 'cap_to_free_memory = "yes"', "cap_to_free_memory"),
@@ -224,6 +230,21 @@ def test_device_report_describes_the_running_process() -> None:
     assert report.precision == "float32"
     assert report.torch_version == torch.__version__
     assert all(line.isascii() for line in report.lines())
+
+
+def test_quiet_line_reporter_only_logs(caplog) -> None:
+    import io
+    import logging
+
+    from src.commands.reporting import line_reporter
+
+    stream = io.StringIO()
+    report = line_reporter(logging.getLogger("src.commands.test"), stream, echo=False)
+    with caplog.at_level(logging.INFO, logger="src.commands.test"):
+        report("Encoder precision: float16")
+
+    assert stream.getvalue() == ""
+    assert [record.getMessage() for record in caplog.records] == ["Encoder precision: float16"]
 
 
 def test_line_reporter_prints_and_logs_each_line(caplog) -> None:

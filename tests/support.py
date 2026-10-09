@@ -146,6 +146,7 @@ def checkpoint_settings() -> CheckpointSettings:
         download_attempts=2,
         retry_backoff_seconds=0.0,
         stream_block_bytes=4,
+        keep_safetensors=True,
     )
 
 

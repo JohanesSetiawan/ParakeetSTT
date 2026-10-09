@@ -238,6 +238,48 @@ def ensure_converted_checkpoint(
     return result
 
 
+SOURCE_WEIGHTS_FILENAME = "model.safetensors"
+
+
+def remove_source_weights(checkpoint_dir: Path) -> int:
+    """
+    Delete ``model.safetensors`` when ``model.pth`` was converted from it.
+
+    Only the conversion step reads the safetensors file, so after a
+    successful conversion it is a second 2.5 GB copy of the same weights.
+    It is deleted only when the conversion manifest records exactly the
+    verified download (same SHA-256 as the download manifest), so nothing
+    is removed that ``model.pth`` was not built from. A later full
+    preparation downloads it again.
+
+    Returns:
+        Bytes freed; 0 when there was nothing to remove or the evidence does
+        not match.
+
+    Raises:
+        OSError: If the file exists, matches, and cannot be deleted.
+    """
+
+    checkpoint_dir = checkpoint_dir.resolve()
+    source_path = checkpoint_dir / SOURCE_WEIGHTS_FILENAME
+    if not source_path.is_file() or not (checkpoint_dir / CHECKPOINT_FILENAME).is_file():
+        return 0
+
+    conversion = _load_conversion_manifest(checkpoint_dir)
+    download_entry = load_manifest(checkpoint_dir)["files"].get(SOURCE_WEIGHTS_FILENAME)
+    if conversion is None or not isinstance(download_entry, dict):
+        return 0
+    if conversion.get("source_safetensors_sha256") != download_entry.get("sha256"):
+        return 0
+    if download_entry.get("size_bytes") != source_path.stat().st_size:
+        return 0
+
+    freed = source_path.stat().st_size
+    source_path.unlink()
+    logger.info("removed %s (%d bytes); model.pth was converted from it", source_path, freed)
+    return freed
+
+
 def prepare_checkpoint(
     checkpoint_dir: Path,
     checkpoint_settings: CheckpointSettings,

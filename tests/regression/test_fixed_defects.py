@@ -371,8 +371,10 @@ def test_module_entry_point_writes_failures_to_the_run_log(tmp_path: Path) -> No
 
     assert completed.returncode == 1, completed.stderr
     stdout_lines = completed.stdout.splitlines()
-    run_id = next(line.split(": ", 1)[1] for line in stdout_lines if line.startswith("Run id: "))
     log_path = Path(next(line.split(": ", 1)[1] for line in stdout_lines if line.startswith("Log file: ")))
+    # The run id is printed with the error ("Details: <log> (run <id>)").
+    details = next(line for line in completed.stderr.splitlines() if line.startswith("Details: "))
+    run_id = details.rsplit("(run ", 1)[1].rstrip(")")
     assert log_path.parent == load_settings().paths.log_dir
     run_lines = [line for line in log_path.read_text(encoding="utf-8").splitlines() if f"run={run_id}" in line]
     assert any("run failed" in line for line in run_lines)
