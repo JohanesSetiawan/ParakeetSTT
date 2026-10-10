@@ -84,12 +84,17 @@ class MemoryBudget:
             f"Batch feature frames: {self.batch_feature_frames} "
             f"(configured {self.configured_batch_feature_frames})"
         )
-        if self.headroom_reduced:
-            lines.append(
-                "Warning: less than memory.reserve_mib of GPU memory was free; running "
-                "without that headroom. Other GPU programs may now cause an out-of-memory stop."
-            )
         return tuple(lines)
+
+    def warnings(self) -> tuple[str, ...]:
+        """Lines the user must see even when details stay in the log."""
+
+        if not self.headroom_reduced:
+            return ()
+        return (
+            "Warning: less than memory.reserve_mib of GPU memory was free; running "
+            "without that headroom. Other GPU programs may now cause an out-of-memory stop.",
+        )
 
 
 def chunks_that_fit(

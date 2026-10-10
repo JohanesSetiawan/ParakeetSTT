@@ -10,6 +10,10 @@ metrics_dir = "metrics"
 [logging]
 # Python logging level for the dated run log (DEBUG adds per-batch detail).
 level = "INFO"
+# false: the terminal shows the device, progress, results, and warnings, and
+# the startup and timing details go to the run log only. true: the terminal
+# also shows them (versions, precision, memory budget, stage timings).
+terminal_details = false
 
 [checkpoint]
 request_timeout_seconds = 120.0
@@ -17,6 +21,11 @@ download_attempts = 3
 # Wait before retry N is retry_backoff_seconds * N.
 retry_backoff_seconds = 2.0
 stream_block_bytes = 1048576
+# model.safetensors (2.5 GB, the verified download) is only read to build
+# model.pth. With false it is deleted once model.pth has been converted from
+# it and loaded successfully; a later repair downloads it again. true keeps
+# it, so a repair works offline.
+keep_safetensors = false
 
 [inference]
 # Most rows (chunks) in one batch. Short clips need many rows to fill the

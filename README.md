@@ -309,7 +309,7 @@ On CUDA the whole step runs as one replayed CUDA Graph (`models/graphed_decoding
 - **PyTorch.** Any build for your platform: CUDA, Apple MPS, or CPU. The device is chosen automatically. Development used PyTorch 2.14 with CUDA 13.2.
 - **soundfile** (libsndfile) for decoding WAV, FLAC, OGG, MP3 and the other formats libsndfile supports. It installs NumPy with it.
 - **FFmpeg (optional).** Only needed for formats libsndfile cannot read, such as M4A/AAC, Opus in MP4/WebM, or audio inside video files. `ffmpeg` and `ffprobe` are found through `PATH`, or through the `FFMPEG_BINARY` and `FFPROBE_BINARY` environment variables.
-- **Disk:** about 6.2 GB for the checkpoint directory: the 2.5 GB `model.safetensors` download, the 2.5 GB converted `model.pth`, and the 1.2 GB `model.encoder-float16.pth` built from it on the first float16 run.
+- **Disk:** about 3.7 GB for the checkpoint directory after the first run: the 2.5 GB `model.pth` and the 1.2 GB `model.encoder-float16.pth` built from it. During the first run the 2.5 GB `model.safetensors` download is there too (6.2 GB in total); it is deleted once `model.pth` has loaded, unless `checkpoint.keep_safetensors = true`.
 - **GPU memory:** with the default float16 encoder the weights take about 1.2 GB on the device (2.4 GB in float32). Transcription peaked at about 2.0 GB with the default settings on a 4 GB laptop GPU; the batch size adapts to the free memory. See [Measured performance](#measured-performance).
 
 ## Installation
@@ -322,7 +322,22 @@ On CUDA the whole step runs as one replayed CUDA Graph (`models/graphed_decoding
    python -m venv venv
    ```
 
-2. Install PyTorch for your platform using the selector at [pytorch.org](https://pytorch.org/get-started/locally/). Keep the index URL it gives you and add `--no-cache-dir`.
+2. Install PyTorch. It is not in `requirements.txt`, because the right package depends on your operating system and GPU:
+
+   - **NVIDIA GPU (Windows or Linux):** run `nvidia-smi`; the top right of its table shows the highest CUDA version your driver supports. On [pytorch.org](https://pytorch.org/get-started/locally/) choose Stable, your OS, Pip, Python, and the newest CUDA entry that is not above that version. Run the command it shows with `venv\Scripts\python.exe -m pip` and add `--no-cache-dir`.
+   - **No NVIDIA GPU (CPU only, Windows or Linux):**
+
+     ```powershell
+     venv\Scripts\python.exe -m pip install torch --index-url https://download.pytorch.org/whl/cpu --no-cache-dir
+     ```
+
+   - **Mac:** `venv/bin/python -m pip install torch --no-cache-dir` (Apple silicon runs on MPS).
+
+   Check the result. On an NVIDIA machine the second value must be `True`; otherwise the CPU build was installed and transcription runs much slower:
+
+   ```powershell
+   venv\Scripts\python.exe -c "import torch; print(torch.__version__, torch.cuda.is_available())"
+   ```
 
 3. Install the runtime dependencies (and, to run the tests, the development ones):
 
@@ -351,30 +366,17 @@ venv\Scripts\python.exe inference.py --transcribe path\to\folder
 
 `--transcribe` is the only argument. Everything else is set in `config.toml`.
 
-The first run downloads the checkpoint from Hugging Face, verifies every file against pinned hashes, converts it to `model.pth`, builds the float16 encoder file, and writes a readiness marker. Later runs skip all of that.
+There is nothing to choose: the device and precision are picked automatically (float16 encoder on an NVIDIA GPU, float32 on CPU and Apple MPS), and the batch size adapts to the free GPU memory.
+
+The first run downloads the checkpoint from Hugging Face (about 2.5 GB), verifies every file against pinned hashes, converts it to `model.pth`, builds the float16 encoder file, writes a readiness marker, and deletes the downloaded `model.safetensors` copy. It prints each of these steps. Later runs skip all of that.
 
 For many short files sent one at a time, keep a [worker](#worker-for-many-short-files) running instead: each `inference.py` run spends about 5 s on startup.
 
 A folder run prints plain-text progress. This example is the five test clips in `tests/data/librispeech/` on an RTX 3050 Ti Laptop GPU:
 
 ```text
-Run id: 44ddd8e4ed21
-Log file: ...\logs\log_2026-10-06.txt
-Weights: ready
-Device: cuda:0
-Accelerator: CUDA
-Device count: 1
-Device name: NVIDIA GeForce RTX 3050 Ti Laptop GPU
-Precision: float16
-PyTorch: 2.14.0+cu132
-CUDA runtime: 13.2
-Python: 3.13.13
-Encoder precision: float16 encoder, float32 decoder and joint
-Model load seconds: 2.115
-CUDA Graph decoding: on
-Accelerator memory ceiling: 2990 MiB
-Memory per full chunk: 55 MiB, full chunks that fit: 30
-Batch feature frames: 24000 (configured 24000)
+Log file: ...\logs\log_2026-10-10.txt
+Running on: NVIDIA GeForce RTX 3050 Ti Laptop GPU (CUDA, 1 device), float16 encoder, float32 decoder and joint, PyTorch 2.14.0+cu132, CUDA 13.2
 Transcribing 5 file(s)
 Batch: 1 / 6, Progress: 16.67 percent, Elapsed: 0.1 s, ETA: 0.6 s
 Batch: 6 / 6, Progress: 100.00 percent, Elapsed: 0.6 s, ETA: 0.0 s
@@ -382,25 +384,21 @@ CSV: ...\transcriptions.csv
 Files: 5
 File statuses: ok=5
 Total audio seconds: 46.630
-Wall-clock seconds: 0.591
-Media decode seconds: 0.022
-Feature extraction seconds: 0.026
-Model generation seconds: 0.549
-Real-time factor: 0.012674
-Throughput audio seconds per second: 78.902
-Work items: 7, batches: 6
-Peak accelerator memory allocated: 1313.0 MiB
-Peak process memory: 1958.2 MiB
+Processing seconds: 0.654 (71.3x faster than real time)
 ```
+
+`Running on:` sums up the device, precision, and library versions on one line. Everything else goes to the run log: Python version, model load time, the memory budget, and stage timings. A run slower than real time (on a CPU, for example) says so: `(2.5x slower than real time)`. Set `logging.terminal_details = true` to print the details as well:
 
 - `Accelerator memory ceiling` is the most PyTorch may hold on the GPU (see [`[memory]`](#memory)); `Memory per full chunk` and `full chunks that fit` are measured at startup and set the batch size.
 - `Peak process memory` is the largest resident memory of the whole process so far (peak working set on Windows, peak RSS elsewhere). Most of it is the memory-mapped checkpoint while it is copied to the GPU.
+
+Warnings (an unreadable file, little free GPU memory, a weights folder that cannot be written) are always printed.
 
 ## Output
 
 ### Single file
 
-The terminal shows `Status:`, `Transcript:`, the audio duration, and the same timing summary as a folder run.
+The terminal shows `Status:`, `Transcript:`, the audio duration, and the processing time.
 
 ### Folder
 
@@ -450,6 +448,7 @@ All settings live in `config.toml` at the repository root. Every key is required
 | Key | Default | Meaning |
 |---|---|---|
 | `level` | `"INFO"` | `DEBUG`, `INFO`, `WARNING`, or `ERROR`. `DEBUG` adds a line per batch with its items, frame counts, and stage timings. |
+| `terminal_details` | `false` | `false`: the terminal shows the device, progress, results, and warnings, and the startup and timing details go to the run log only. `true`: the terminal shows them too. |
 
 ### `[checkpoint]`
 
@@ -459,6 +458,7 @@ All settings live in `config.toml` at the repository root. Every key is required
 | `download_attempts` | `3` | Attempts per file for network failures. At least 1. |
 | `retry_backoff_seconds` | `2.0` | The wait before attempt N is this value times (N - 1). |
 | `stream_block_bytes` | `1048576` | Read size while streaming and hashing downloads. |
+| `keep_safetensors` | `false` | `false` deletes the downloaded `model.safetensors` (2.5 GB) once `model.pth` has been converted from it and loaded; a later repair downloads it again. `true` keeps it, so a repair works offline. |
 
 ### `[inference]`
 
@@ -621,6 +621,7 @@ It prepares `weights_dir` as follows:
 3. **Convert.** It converts `model.safetensors` into `model.pth`, reading tensor by tensor with bounded memory. It checks that all required keys are present, that no weight is NaN/Inf, and that the vocabulary and output dimensions match.
 4. **Record.** It writes `download_manifest.json` and `conversion_manifest.json`, so unchanged artifacts are never converted twice.
 5. **Mark ready.** The inference command strict-loads the model. Only when that succeeds does it write `.ready`, which records the size of `model.pth`.
+6. **Release the download copy.** After that load, `model.safetensors` is deleted when every link is proven: it is the verified download, the conversion manifest names it as the source, and `model.pth` has the size and SHA-256 that conversion recorded (a replaced checkpoint of the same architecture has the same size, so only the hash tells). Hashing `model.pth` takes a few seconds, once. Nothing is deleted while a conversion is in progress or after another process has started a repair, and a problem with a manifest only prints a warning. Nothing reads the file afterwards; keep it with `checkpoint.keep_safetensors = true`. If a later run needs a full preparation (a missing marker, or a replaced `model.pth`), the file is downloaded again.
 
 On every later run the fast path checks only that `.ready` exists and that `model.pth` still has the recorded size. A deleted, truncated, or replaced checkpoint triggers a full preparation again. To force one, delete `weights_dir/.ready`.
 

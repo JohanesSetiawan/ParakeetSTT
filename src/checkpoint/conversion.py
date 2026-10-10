@@ -24,6 +24,8 @@ from typing import Any, BinaryIO, Callable
 
 import torch
 
+from ..configuration.config import SOURCE_WEIGHTS_FILENAME
+
 
 SAFETENSORS_PREFIX_BYTES = 8
 
@@ -244,12 +246,12 @@ def resolve_safetensors_files(checkpoint_dir: Path) -> list[Path]:
             raise FileNotFoundError(f"Missing safetensors shards: {missing_shards}")
         return shard_paths
 
-    single_path = checkpoint_dir / "model.safetensors"
+    single_path = checkpoint_dir / SOURCE_WEIGHTS_FILENAME
     if single_path.is_file():
         return [single_path]
 
     raise FileNotFoundError(
-        f"No model.safetensors or model.safetensors.index.json under {checkpoint_dir}"
+        f"No {SOURCE_WEIGHTS_FILENAME} or model.safetensors.index.json under {checkpoint_dir}"
     )
 
 

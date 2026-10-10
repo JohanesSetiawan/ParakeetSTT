@@ -145,6 +145,17 @@ def test_budget_is_not_applied_off_cuda(tmp_path: Path) -> None:
     assert "cpu" in budget.lines()[0]
 
 
+def test_headroom_warning_is_kept_apart_from_the_details() -> None:
+    """The warning must reach the terminal even when details stay in the log."""
+
+    reduced = MemoryBudget(True, "", 3000 * MIB, 100 * MIB, 6, 12000, 9000, headroom_reduced=True)
+    normal = MemoryBudget(True, "", 3000 * MIB, 100 * MIB, 6, 12000, 9000)
+
+    assert len(reduced.warnings()) == 1 and "reserve_mib" in reduced.warnings()[0]
+    assert not any("Warning" in line for line in reduced.lines())
+    assert normal.warnings() == ()
+
+
 def test_report_lines_name_the_used_and_configured_budget() -> None:
     budget = MemoryBudget(True, "", 3000 * MIB, 100 * MIB, 6, 12000, 9000)
 

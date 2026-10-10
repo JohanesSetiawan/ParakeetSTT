@@ -23,10 +23,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, TypeVar
 
-from ..configuration.config import CHECKPOINT_FILENAME
+from ..configuration.config import CHECKPOINT_FILENAME, SOURCE_WEIGHTS_FILENAME
 from ..configuration.settings import CheckpointSettings
 from ..runtime.filesystem import write_json_atomic
-from .orchestration import CheckpointPreparationResult, prepare_checkpoint
+from .orchestration import CheckpointPreparationResult, prepare_checkpoint, remove_source_weights
 
 
 logger = logging.getLogger(__name__)
@@ -88,6 +88,42 @@ def _marker_is_current(marker_path: Path, checkpoint_path: Path) -> bool:
     return marker.get("model_pth_size_bytes") == checkpoint_path.stat().st_size
 
 
+def _release_source_weights(
+    checkpoint_dir: Path,
+    checkpoint_settings: CheckpointSettings,
+    progress_callback: Callable[[str], None] | None,
+) -> None:
+    """
+    Delete the safetensors copy after model.pth has been loaded successfully.
+
+    Runs only after a strict load, so the file is never removed while
+    model.pth is unproven. The model is already loaded at this point, so
+    nothing here may fail the run: an unreadable or malformed manifest, a
+    read-only directory, or a file in use costs disk space, not correctness,
+    and is reported as a warning.
+    """
+
+    if checkpoint_settings.keep_safetensors:
+        return
+    checkpoint_path = checkpoint_dir / CHECKPOINT_FILENAME
+    marker_path = readiness_marker_path(checkpoint_dir)
+    try:
+        freed = remove_source_weights(
+            checkpoint_dir,
+            still_ready=lambda: _marker_is_current(marker_path, checkpoint_path),
+        )
+    except (OSError, ValueError) as error:
+        logger.warning("could not remove %s: %s", SOURCE_WEIGHTS_FILENAME, error)
+        if progress_callback is not None:
+            progress_callback(f"Warning: could not remove {SOURCE_WEIGHTS_FILENAME} ({error})")
+        return
+    if freed and progress_callback is not None:
+        progress_callback(
+            f"Removed {SOURCE_WEIGHTS_FILENAME} ({freed / 2**30:.1f} GiB); model.pth was built from it. "
+            "Set checkpoint.keep_safetensors = true to keep it."
+        )
+
+
 def clear_readiness_marker(checkpoint_dir: Path) -> None:
     """Remove readiness state so the next call performs full preparation."""
 
@@ -127,6 +163,7 @@ def ensure_first_run_ready(
 
     if _marker_is_current(marker_path, resolved_dir / CHECKPOINT_FILENAME):
         loaded = loader(resolved_dir)
+        _release_source_weights(resolved_dir, checkpoint_settings, progress_callback)
         return BootstrapResult(action="ready", marker_path=str(marker_path), preparation=None), loaded
 
     if marker_path.is_file():
@@ -148,6 +185,7 @@ def ensure_first_run_ready(
     marker_path = _write_readiness_marker(resolved_dir)
     if progress_callback is not None:
         progress_callback(f"Checkpoint ready marker created: {marker_path}")
+    _release_source_weights(resolved_dir, checkpoint_settings, progress_callback)
 
     result = BootstrapResult(action="prepared", marker_path=str(marker_path), preparation=preparation)
     return result, loaded

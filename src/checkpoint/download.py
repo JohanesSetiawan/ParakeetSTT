@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
+from ..configuration.config import SOURCE_WEIGHTS_FILENAME
 from ..configuration.settings import CheckpointSettings
 from ..runtime.filesystem import write_json_atomic
 
@@ -93,7 +94,7 @@ CHECKPOINT_DOWNLOADS: tuple[DownloadSpec, ...] = (
         expected_git_blob_sha1="e368b292e2ad5232aae2a3e45f4761097e5fc216",
     ),
     DownloadSpec(
-        "model.safetensors",
+        SOURCE_WEIGHTS_FILENAME,
         "https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3/resolve/main/model.safetensors?download=true",
         2508311120,
         expected_sha256="3a2026366188c8c68598edbbff92f8d11590a08e0ae2e6775544e7b07d6a5e11",

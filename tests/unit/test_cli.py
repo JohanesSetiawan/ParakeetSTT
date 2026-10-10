@@ -188,3 +188,36 @@ def test_eta_uses_the_measured_rate() -> None:
 
     assert "ETA: 16.0 s" in lines[-1]
     assert "Progress: 20.00 percent" in lines[-1]
+
+
+# =============================================================================
+# Speed line
+# =============================================================================
+
+
+def speed_result(audio_seconds: float) -> OfflineRunResult:
+    file_result = OfflineFileResult(Path("a.wav"), audio_seconds, "text", FileStatus.OK, ())
+    plan = ExecutionPlan((), (), (), 16000, 1500, 24000)
+    return OfflineRunResult((file_result,), plan, 1.0, {"available": False}, 0.0, 0.0, 0.0)
+
+
+@pytest.mark.parametrize(
+    ("audio_seconds", "wall_seconds", "expected"),
+    [
+        (600.0, 2.0, "(300.0x faster than real time)"),
+        (10.0, 25.0, "(2.5x slower than real time)"),  # review finding: was "0x faster"
+        (10.0, 10.0, "(1.0x faster than real time)"),
+    ],
+)
+def test_speed_line_never_claims_a_slow_run_is_fast(audio_seconds, wall_seconds, expected) -> None:
+    from src.commands.inference import _speed_line
+
+    line = _speed_line(speed_result(audio_seconds), wall_seconds)
+
+    assert line == f"Processing seconds: {wall_seconds:.3f} {expected}"
+
+
+def test_speed_line_without_audio_shows_only_the_time() -> None:
+    from src.commands.inference import _speed_line
+
+    assert _speed_line(speed_result(0.0), 1.5) == "Processing seconds: 1.500"

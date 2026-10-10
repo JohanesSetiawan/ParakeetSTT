@@ -242,19 +242,49 @@ def _format_bytes(value: object) -> str:
     return f"{value / 2**20:.1f} MiB"
 
 
-def _print_stage_summary(result: OfflineRunResult, wall_seconds: float) -> None:
-    total_audio = result.total_audio_seconds
-    print(f"Total audio seconds: {total_audio:.3f}")
-    print(f"Wall-clock seconds: {wall_seconds:.3f}")
-    print(f"Media decode seconds: {result.media_decode_seconds:.3f}")
-    print(f"Feature extraction seconds: {result.feature_seconds:.3f}")
-    print(f"Model generation seconds: {result.generation_seconds:.3f}")
-    if total_audio > 0 and wall_seconds > 0:
-        print(f"Real-time factor: {wall_seconds / total_audio:.6f}")
-        print(f"Throughput audio seconds per second: {total_audio / wall_seconds:.3f}")
-    print(f"Work items: {len(result.plan.items)}, batches: {len(result.plan.batches)}")
-    print(f"Peak accelerator memory allocated: {_format_bytes(result.peak_memory.get('peak_allocated_bytes'))}")
-    print(f"Peak process memory: {_format_bytes(peak_process_memory_bytes())}")
+def _audio_per_second(result: OfflineRunResult, wall_seconds: float) -> float | None:
+    """Seconds of audio transcribed per second of wall time, if both are known."""
+
+    if result.total_audio_seconds <= 0 or wall_seconds <= 0:
+        return None
+    return result.total_audio_seconds / wall_seconds
+
+
+def _speed_line(result: OfflineRunResult, wall_seconds: float) -> str:
+    """One line every user sees: how long the transcription took."""
+
+    speed = _audio_per_second(result, wall_seconds)
+    if speed is None:
+        return f"Processing seconds: {wall_seconds:.3f}"
+    if speed >= 1.0:
+        comparison = f"{speed:.1f}x faster than real time"
+    else:
+        # A CPU can be slower than the audio; never claim "0x faster".
+        comparison = f"{1.0 / speed:.1f}x slower than real time"
+    return f"Processing seconds: {wall_seconds:.3f} ({comparison})"
+
+
+def _stage_details(result: OfflineRunResult, wall_seconds: float) -> list[str]:
+    """
+    Stage timings and memory peaks: the terminal shows them only on request.
+
+    The wall time itself is on the speed line, which every run prints.
+    """
+
+    lines = [
+        f"Media decode seconds: {result.media_decode_seconds:.3f}",
+        f"Feature extraction seconds: {result.feature_seconds:.3f}",
+        f"Model generation seconds: {result.generation_seconds:.3f}",
+        f"Collapse recovery seconds: {result.recovery_seconds:.3f}",
+    ]
+    speed = _audio_per_second(result, wall_seconds)
+    if speed is not None:
+        lines.append(f"Real-time factor: {1.0 / speed:.6f}")
+        lines.append(f"Throughput audio seconds per second: {speed:.3f}")
+    lines.append(f"Work items: {len(result.plan.items)}, batches: {len(result.plan.batches)}")
+    lines.append(f"Peak accelerator memory allocated: {_format_bytes(result.peak_memory.get('peak_allocated_bytes'))}")
+    lines.append(f"Peak process memory: {_format_bytes(peak_process_memory_bytes())}")
+    return lines
 
 
 def _print_status_counts(result: OfflineRunResult, unreadable_count: int) -> None:
@@ -308,8 +338,16 @@ def transcribe_input(input_path: Path, settings: Settings, run_id: str) -> Comma
     for path, reason in discovered.unreadable:
         print(f"Skipped unreadable file: {path.name} ({reason.splitlines()[0][:160]})")
 
-    prepared = prepare_inference_model(settings, line_reporter(logger))
+    # Details (versions, precision, memory budget, stage timings) always go
+    # to the run log; the terminal shows them only with terminal_details.
+    details = line_reporter(logger, echo=settings.logging.terminal_details)
+    notices = line_reporter(logger)
+    prepared = prepare_inference_model(settings, details, notices)
     model, configuration, inference_settings = prepared.model, prepared.configuration, prepared.inference
+    if not settings.logging.terminal_details:
+        # The detailed lines went to the log only; the terminal still names
+        # the device, precision, and library versions, on one line.
+        print(prepared.runtime.summary(prepared.precision))
 
     print(f"Transcribing {len(discovered.audio)} file(s)")
     transcriber = OfflineTranscriber(model, configuration, inference_settings)
@@ -327,7 +365,9 @@ def transcribe_input(input_path: Path, settings: Settings, run_id: str) -> Comma
         print(f"Status: {file_result.status.value}")
         print(f"Transcript: {file_result.transcript}")
         print(f"Audio duration seconds: {file_result.duration_seconds:.3f}")
-        _print_stage_summary(result, wall_seconds)
+        notices(_speed_line(result, wall_seconds))
+        for line in _stage_details(result, wall_seconds):
+            details(line)
         return CommandOutcome(result, (), None, False)
 
     output_path = resolved_input / inference_settings.output_filename
@@ -338,7 +378,10 @@ def transcribe_input(input_path: Path, settings: Settings, run_id: str) -> Comma
     print(f"CSV: {written_path}")
     print(f"Files: {len(rows)}")
     _print_status_counts(result, len(discovered.unreadable))
-    _print_stage_summary(result, wall_seconds)
+    print(f"Total audio seconds: {result.total_audio_seconds:.3f}")
+    notices(_speed_line(result, wall_seconds))
+    for line in _stage_details(result, wall_seconds):
+        details(line)
     logger.info("csv=%s rows=%d fallback=%s", written_path, len(rows), fallback_used)
     return CommandOutcome(result, discovered.unreadable, written_path, fallback_used)
 
@@ -355,7 +398,8 @@ def main(argv: list[str] | None = None) -> int:
     arguments = parse_arguments(argv)
     settings = load_settings()
     run_id, log_path = configure_run_logging(settings.paths.log_dir, settings.logging.level)
-    print(f"Run id: {run_id}")
+    if settings.logging.terminal_details:
+        print(f"Run id: {run_id}")
     print(f"Log file: {log_path}")
     logger.info("command=transcribe argv=%s", sys.argv[1:] if argv is None else argv)
 

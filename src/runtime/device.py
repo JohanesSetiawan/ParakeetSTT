@@ -29,6 +29,27 @@ class RuntimeReport:
     cuda_version: str
     python_version: str
 
+    @property
+    def accelerator_label(self) -> str:
+        """The accelerator for people: ``CPU`` when there is none."""
+
+        return "CPU" if self.accelerator == "none" else self.accelerator
+
+    def summary(self, precision_description: str) -> str:
+        """
+        Everything ``lines`` reports, on one line for the terminal.
+
+        Args:
+            precision_description: How the model runs, e.g. "float16 encoder,
+                float32 decoder and joint".
+        """
+
+        devices = f"{self.device_count} device" + ("s" if self.device_count != 1 else "")
+        return (
+            f"Running on: {self.device_name} ({self.accelerator_label}, {devices}), "
+            f"{precision_description}, PyTorch {self.torch_version}, CUDA {self.cuda_version}"
+        )
+
     def lines(self) -> tuple[str, ...]:
         """Return plain-text ``Label: value`` lines for terminal and log."""
 

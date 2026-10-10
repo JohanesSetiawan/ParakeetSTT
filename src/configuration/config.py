@@ -42,6 +42,8 @@ SUPPORTED_JOINT_ACTIVATION = "relu"
 # The converted PyTorch checkpoint inside a weights directory. Every module
 # that reads, validates, or derives from it uses this one name.
 CHECKPOINT_FILENAME = "model.pth"
+# The downloaded Hugging Face weights that model.pth is converted from.
+SOURCE_WEIGHTS_FILENAME = "model.safetensors"
 
 
 @dataclass(frozen=True)

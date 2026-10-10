@@ -48,8 +48,11 @@ def test_single_file_prints_the_expected_transcript(real_settings, speech_clips)
     assert completed.returncode == 0, completed.stderr
     assert "Status: ok" in completed.stdout
     assert f"Transcript: {clip.expected_transcript}" in completed.stdout
-    for label in ("Device:", "Precision:", "Encoder precision:", "Model load seconds:", "Real-time factor:"):
+    for label in ("Running on:", "Processing seconds:", "Log file:"):
         assert label in completed.stdout
+    # Startup and timing details go to the log unless terminal_details is on.
+    for detail in ("Encoder precision:", "Model load seconds:", "Real-time factor:", "Run id:"):
+        assert detail not in completed.stdout
 
 
 def test_folder_run_writes_one_row_per_file_with_status(real_settings, speech_clips, tmp_path: Path) -> None:
