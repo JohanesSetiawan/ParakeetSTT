@@ -5,11 +5,12 @@ Parity with the reference implementation, Hugging Face `ParakeetForTDT`.
 runtime. The reference runs on CPU so it does not compete with the session
 model for GPU memory on small cards.
 
-The reference model is built from `config.json` and strict-loads the state
-dict of `model.pth`: the key names are the checkpoint's own, and `model.pth`
-is verified against the downloaded safetensors when it is converted, which
-is then deleted by default (`checkpoint.keep_safetensors`). Both sides
-therefore run bit-identical weights, and the test compares implementations.
+When `model.safetensors` is present (`checkpoint.keep_safetensors = true`),
+the reference loads it with `from_pretrained`, so the test also covers the
+conversion to `model.pth`. Otherwise (the default deletes it) the reference
+is built from `config.json` and strict-loads the state dict of `model.pth`
+under the checkpoint's own key names; the test then compares the
+implementations only, and conversion is covered by the unit tests.
 """
 
 from __future__ import annotations
@@ -25,8 +26,14 @@ transformers = pytest.importorskip("transformers", reason="transformers not inst
 def reference(real_settings):
     from src.configuration.config import CHECKPOINT_FILENAME
 
+    from src.configuration.config import SOURCE_WEIGHTS_FILENAME
+
     weights_dir = real_settings.paths.weights_dir
     processor = transformers.AutoProcessor.from_pretrained(str(weights_dir))
+    if (weights_dir / SOURCE_WEIGHTS_FILENAME).is_file():
+        model = transformers.ParakeetForTDT.from_pretrained(str(weights_dir), dtype=torch.float32)
+        return processor, model.eval()
+
     model = transformers.ParakeetForTDT(transformers.AutoConfig.from_pretrained(str(weights_dir)))
     bundle = torch.load(weights_dir / CHECKPOINT_FILENAME, map_location="cpu", weights_only=True)
     model.load_state_dict(bundle["state_dict"], strict=True)

@@ -22,7 +22,7 @@ from typing import Any, Callable
 
 import torch
 
-from ..configuration.config import CHECKPOINT_FILENAME
+from ..configuration.config import CHECKPOINT_FILENAME, SOURCE_WEIGHTS_FILENAME
 from ..configuration.settings import CheckpointSettings
 from ..runtime.filesystem import write_json_atomic
 from .artifacts import sha256_file
@@ -36,6 +36,8 @@ logger = logging.getLogger(__name__)
 
 CONVERSION_MANIFEST_FILENAME = "conversion_manifest.json"
 CONVERSION_SCHEMA_VERSION = 1
+# A conversion writes here first and replaces model.pth only when it is done.
+CONVERSION_TEMPORARY_FILENAME = f"{CHECKPOINT_FILENAME}.converting"
 
 
 @dataclass(frozen=True)
@@ -150,9 +152,9 @@ def ensure_converted_checkpoint(
     files = download_manifest["files"]
 
     config_entry = files.get("config.json")
-    safetensors_entry = files.get("model.safetensors")
+    safetensors_entry = files.get(SOURCE_WEIGHTS_FILENAME)
     if not isinstance(config_entry, dict) or not isinstance(safetensors_entry, dict):
-        raise ValueError("Download manifest lacks config.json or model.safetensors evidence")
+        raise ValueError(f"Download manifest lacks config.json or {SOURCE_WEIGHTS_FILENAME} evidence")
 
     config_sha256 = config_entry["sha256"]
     safetensors_sha256 = safetensors_entry["sha256"]
@@ -208,7 +210,7 @@ def ensure_converted_checkpoint(
 
     # Convert to a same-directory temporary path so a failed conversion cannot
     # corrupt the last valid model.pth. The converter creates the parent directory.
-    temporary_output = checkpoint_dir / f"{CHECKPOINT_FILENAME}.converting"
+    temporary_output = checkpoint_dir / CONVERSION_TEMPORARY_FILENAME
     temporary_output.unlink(missing_ok=True)
     try:
         convert_checkpoint(
@@ -238,31 +240,38 @@ def ensure_converted_checkpoint(
     return result
 
 
-SOURCE_WEIGHTS_FILENAME = "model.safetensors"
-
-
-def remove_source_weights(checkpoint_dir: Path) -> int:
+def remove_source_weights(checkpoint_dir: Path, still_ready: Callable[[], bool]) -> int:
     """
     Delete ``model.safetensors`` when ``model.pth`` was converted from it.
 
     Only the conversion step reads the safetensors file, so after a
     successful conversion it is a second 2.5 GB copy of the same weights.
-    It is deleted only when the conversion manifest records exactly the
-    verified download (same SHA-256 as the download manifest), so nothing
-    is removed that ``model.pth`` was not built from. A later full
-    preparation downloads it again.
+    Every link is checked before deleting:
+
+    - the safetensors file is the verified download (download manifest);
+    - the conversion manifest records that download as its source;
+    - ``model.pth`` is the file that conversion wrote: size and SHA-256.
+      Checkpoints of the same architecture have the same size, so only the
+      hash proves it. Hashing 2.5 GB takes seconds, but it runs once: after
+      the deletion there is nothing left to check;
+    - no conversion is in progress, and ``still_ready()`` holds right before
+      the deletion. A repair in another process clears the readiness marker
+      first, so this never removes a file a running conversion needs.
 
     Returns:
-        Bytes freed; 0 when there was nothing to remove or the evidence does
-        not match.
+        Bytes freed; 0 when there was nothing to remove or any link fails.
 
     Raises:
-        OSError: If the file exists, matches, and cannot be deleted.
+        OSError: If a file cannot be read, or a proven copy cannot be deleted.
+        ValueError: If a manifest is malformed.
     """
 
     checkpoint_dir = checkpoint_dir.resolve()
     source_path = checkpoint_dir / SOURCE_WEIGHTS_FILENAME
-    if not source_path.is_file() or not (checkpoint_dir / CHECKPOINT_FILENAME).is_file():
+    output_path = checkpoint_dir / CHECKPOINT_FILENAME
+    if not source_path.is_file() or not output_path.is_file():
+        return 0
+    if (checkpoint_dir / CONVERSION_TEMPORARY_FILENAME).exists():
         return 0
 
     conversion = _load_conversion_manifest(checkpoint_dir)
@@ -272,6 +281,12 @@ def remove_source_weights(checkpoint_dir: Path) -> int:
     if conversion.get("source_safetensors_sha256") != download_entry.get("sha256"):
         return 0
     if download_entry.get("size_bytes") != source_path.stat().st_size:
+        return 0
+    if conversion.get("output_size_bytes") != output_path.stat().st_size:
+        return 0
+    if conversion.get("output_sha256") != sha256_file(output_path):
+        return 0
+    if not still_ready():
         return 0
 
     freed = source_path.stat().st_size

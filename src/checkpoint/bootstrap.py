@@ -23,7 +23,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, TypeVar
 
-from ..configuration.config import CHECKPOINT_FILENAME
+from ..configuration.config import CHECKPOINT_FILENAME, SOURCE_WEIGHTS_FILENAME
 from ..configuration.settings import CheckpointSettings
 from ..runtime.filesystem import write_json_atomic
 from .orchestration import CheckpointPreparationResult, prepare_checkpoint, remove_source_weights
@@ -97,22 +97,29 @@ def _release_source_weights(
     Delete the safetensors copy after model.pth has been loaded successfully.
 
     Runs only after a strict load, so the file is never removed while
-    model.pth is unproven. A failure to delete (read-only directory, file in
-    use) costs disk space, not correctness, so it is a warning.
+    model.pth is unproven. The model is already loaded at this point, so
+    nothing here may fail the run: an unreadable or malformed manifest, a
+    read-only directory, or a file in use costs disk space, not correctness,
+    and is reported as a warning.
     """
 
     if checkpoint_settings.keep_safetensors:
         return
+    checkpoint_path = checkpoint_dir / CHECKPOINT_FILENAME
+    marker_path = readiness_marker_path(checkpoint_dir)
     try:
-        freed = remove_source_weights(checkpoint_dir)
-    except OSError as error:
-        logger.warning("could not remove model.safetensors: %s", error)
+        freed = remove_source_weights(
+            checkpoint_dir,
+            still_ready=lambda: _marker_is_current(marker_path, checkpoint_path),
+        )
+    except (OSError, ValueError) as error:
+        logger.warning("could not remove %s: %s", SOURCE_WEIGHTS_FILENAME, error)
         if progress_callback is not None:
-            progress_callback(f"Warning: could not remove model.safetensors ({error})")
+            progress_callback(f"Warning: could not remove {SOURCE_WEIGHTS_FILENAME} ({error})")
         return
     if freed and progress_callback is not None:
         progress_callback(
-            f"Removed model.safetensors ({freed / 2**30:.1f} GiB); model.pth was built from it. "
+            f"Removed {SOURCE_WEIGHTS_FILENAME} ({freed / 2**30:.1f} GiB); model.pth was built from it. "
             "Set checkpoint.keep_safetensors = true to keep it."
         )
 

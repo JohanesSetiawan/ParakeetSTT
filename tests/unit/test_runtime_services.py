@@ -247,6 +247,20 @@ def test_quiet_line_reporter_only_logs(caplog) -> None:
     assert [record.getMessage() for record in caplog.records] == ["Encoder precision: float16"]
 
 
+def test_runtime_summary_names_everything_on_one_line() -> None:
+    from src.runtime.device import RuntimeReport
+
+    cpu = RuntimeReport("cpu", "none", 1, "x86_64", "float32", "2.x", "not available", "3.13")
+    gpu = RuntimeReport("cuda:0", "CUDA", 2, "Some GPU", "float16", "2.x", "13.x", "3.13")
+
+    assert cpu.summary("float32") == (
+        "Running on: x86_64 (CPU, 1 device), float32, PyTorch 2.x, CUDA not available"
+    )
+    assert gpu.summary("float16 encoder") == (
+        "Running on: Some GPU (CUDA, 2 devices), float16 encoder, PyTorch 2.x, CUDA 13.x"
+    )
+
+
 def test_line_reporter_prints_and_logs_each_line(caplog) -> None:
     import io
     import logging

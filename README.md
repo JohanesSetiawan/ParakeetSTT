@@ -375,8 +375,8 @@ For many short files sent one at a time, keep a [worker](#worker-for-many-short-
 A folder run prints plain-text progress. This example is the five test clips in `tests/data/librispeech/` on an RTX 3050 Ti Laptop GPU:
 
 ```text
-Log file: ...\logs\log_2026-10-09.txt
-Device: NVIDIA GeForce RTX 3050 Ti Laptop GPU (CUDA)
+Log file: ...\logs\log_2026-10-10.txt
+Running on: NVIDIA GeForce RTX 3050 Ti Laptop GPU (CUDA, 1 device), float16 encoder, float32 decoder and joint, PyTorch 2.14.0+cu132, CUDA 13.2
 Transcribing 5 file(s)
 Batch: 1 / 6, Progress: 16.67 percent, Elapsed: 0.1 s, ETA: 0.6 s
 Batch: 6 / 6, Progress: 100.00 percent, Elapsed: 0.6 s, ETA: 0.0 s
@@ -384,10 +384,10 @@ CSV: ...\transcriptions.csv
 Files: 5
 File statuses: ok=5
 Total audio seconds: 46.630
-Processing seconds: 0.570 (82x faster than real time)
+Processing seconds: 0.654 (71.3x faster than real time)
 ```
 
-Everything else goes to the run log: library versions, precision, model load time, the memory budget, and stage timings. Set `logging.terminal_details = true` to print them as well:
+`Running on:` sums up the device, precision, and library versions on one line. Everything else goes to the run log: Python version, model load time, the memory budget, and stage timings. A run slower than real time (on a CPU, for example) says so: `(2.5x slower than real time)`. Set `logging.terminal_details = true` to print the details as well:
 
 - `Accelerator memory ceiling` is the most PyTorch may hold on the GPU (see [`[memory]`](#memory)); `Memory per full chunk` and `full chunks that fit` are measured at startup and set the batch size.
 - `Peak process memory` is the largest resident memory of the whole process so far (peak working set on Windows, peak RSS elsewhere). Most of it is the memory-mapped checkpoint while it is copied to the GPU.
@@ -621,7 +621,7 @@ It prepares `weights_dir` as follows:
 3. **Convert.** It converts `model.safetensors` into `model.pth`, reading tensor by tensor with bounded memory. It checks that all required keys are present, that no weight is NaN/Inf, and that the vocabulary and output dimensions match.
 4. **Record.** It writes `download_manifest.json` and `conversion_manifest.json`, so unchanged artifacts are never converted twice.
 5. **Mark ready.** The inference command strict-loads the model. Only when that succeeds does it write `.ready`, which records the size of `model.pth`.
-6. **Release the download copy.** After that load, `model.safetensors` is deleted when the conversion manifest shows that `model.pth` was built from exactly the verified download. Nothing reads it afterwards; keep it with `checkpoint.keep_safetensors = true`. If a later run needs a full preparation (a missing marker, or a replaced `model.pth`), the file is downloaded again.
+6. **Release the download copy.** After that load, `model.safetensors` is deleted when every link is proven: it is the verified download, the conversion manifest names it as the source, and `model.pth` has the size and SHA-256 that conversion recorded (a replaced checkpoint of the same architecture has the same size, so only the hash tells). Hashing `model.pth` takes a few seconds, once. Nothing is deleted while a conversion is in progress or after another process has started a repair, and a problem with a manifest only prints a warning. Nothing reads the file afterwards; keep it with `checkpoint.keep_safetensors = true`. If a later run needs a full preparation (a missing marker, or a replaced `model.pth`), the file is downloaded again.
 
 On every later run the fast path checks only that `.ready` exists and that `model.pth` still has the recorded size. A deleted, truncated, or replaced checkpoint triggers a full preparation again. To force one, delete `weights_dir/.ready`.
 

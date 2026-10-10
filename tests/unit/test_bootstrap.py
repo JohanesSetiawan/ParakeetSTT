@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
+import dataclasses
+import hashlib
 import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
-
-import dataclasses
 
 from src.checkpoint.bootstrap import (
     clear_readiness_marker,
@@ -115,12 +115,17 @@ def test_repair_and_clear_force_full_preparation(prepared_checkpoint: Path) -> N
 
 SOURCE_BYTES = b"verified safetensors payload"
 SOURCE_SHA256 = "a" * 64
+CHECKPOINT_BYTES = b"prepared"
+
+
+def always_ready() -> bool:
+    return True
 
 
 def write_converted_checkpoint(directory: Path, converted_from: str = SOURCE_SHA256) -> Path:
     """model.pth, model.safetensors, and the two manifests that tie them together."""
 
-    (directory / "model.pth").write_bytes(b"prepared")
+    (directory / "model.pth").write_bytes(CHECKPOINT_BYTES)
     (directory / "model.safetensors").write_bytes(SOURCE_BYTES)
     (directory / "download_manifest.json").write_text(
         json.dumps(
@@ -132,7 +137,14 @@ def write_converted_checkpoint(directory: Path, converted_from: str = SOURCE_SHA
         encoding="utf-8",
     )
     (directory / "conversion_manifest.json").write_text(
-        json.dumps({"schema_version": 1, "source_safetensors_sha256": converted_from}),
+        json.dumps(
+            {
+                "schema_version": 1,
+                "source_safetensors_sha256": converted_from,
+                "output_size_bytes": len(CHECKPOINT_BYTES),
+                "output_sha256": hashlib.sha256(CHECKPOINT_BYTES).hexdigest(),
+            }
+        ),
         encoding="utf-8",
     )
     return directory
@@ -144,7 +156,7 @@ def releasing_settings(keep: bool):
 
 def test_safetensors_is_removed_after_a_successful_load(tmp_path: Path) -> None:
     write_converted_checkpoint(tmp_path)
-    write_marker(tmp_path, recorded_size=len(b"prepared"))
+    write_marker(tmp_path, recorded_size=len(CHECKPOINT_BYTES))
     messages: list[str] = []
 
     result, _loaded = ensure_first_run_ready(
@@ -162,7 +174,7 @@ def test_safetensors_is_removed_after_a_successful_load(tmp_path: Path) -> None:
 
 def test_safetensors_is_kept_when_configured(tmp_path: Path) -> None:
     write_converted_checkpoint(tmp_path)
-    write_marker(tmp_path, recorded_size=len(b"prepared"))
+    write_marker(tmp_path, recorded_size=len(CHECKPOINT_BYTES))
 
     ensure_first_run_ready(tmp_path, releasing_settings(keep=True), MagicMock())
 
@@ -171,7 +183,7 @@ def test_safetensors_is_kept_when_configured(tmp_path: Path) -> None:
 
 def test_safetensors_is_kept_when_the_load_fails(tmp_path: Path) -> None:
     write_converted_checkpoint(tmp_path)
-    write_marker(tmp_path, recorded_size=len(b"prepared"))
+    write_marker(tmp_path, recorded_size=len(CHECKPOINT_BYTES))
     loader = MagicMock(side_effect=RuntimeError("missing keys"))
 
     with pytest.raises(RuntimeError, match="missing keys"):
@@ -180,8 +192,19 @@ def test_safetensors_is_kept_when_the_load_fails(tmp_path: Path) -> None:
     assert (tmp_path / "model.safetensors").is_file()
 
 
-@pytest.mark.parametrize("mismatch", ["other source", "resized file", "no conversion manifest"])
-def test_safetensors_is_kept_without_matching_evidence(tmp_path: Path, mismatch: str) -> None:
+@pytest.mark.parametrize(
+    "mismatch",
+    [
+        "other source",
+        "resized file",
+        "no conversion manifest",
+        # Review finding: a same-architecture model.pth has the same size,
+        # so only its hash shows it is not the converted file.
+        "replaced model.pth",
+        "conversion in progress",
+    ],
+)
+def test_safetensors_is_kept_without_a_proven_chain(tmp_path: Path, mismatch: str) -> None:
     """Never delete a file that model.pth was not provably converted from."""
 
     write_converted_checkpoint(tmp_path, converted_from="b" * 64 if mismatch == "other source" else SOURCE_SHA256)
@@ -189,14 +212,52 @@ def test_safetensors_is_kept_without_matching_evidence(tmp_path: Path, mismatch:
         (tmp_path / "model.safetensors").write_bytes(SOURCE_BYTES + b"x")
     if mismatch == "no conversion manifest":
         (tmp_path / "conversion_manifest.json").unlink()
+    if mismatch == "replaced model.pth":
+        (tmp_path / "model.pth").write_bytes(b"replaced")  # same length, other content
+    if mismatch == "conversion in progress":
+        (tmp_path / "model.pth.converting").write_bytes(b"partial")
 
-    assert remove_source_weights(tmp_path) == 0
+    assert remove_source_weights(tmp_path, always_ready) == 0
     assert (tmp_path / "model.safetensors").is_file()
+
+
+def test_safetensors_is_kept_when_a_repair_starts_meanwhile(tmp_path: Path) -> None:
+    """Review finding: a repair in another process clears the marker before it converts."""
+
+    write_converted_checkpoint(tmp_path)
+
+    assert remove_source_weights(tmp_path, still_ready=lambda: False) == 0
+    assert (tmp_path / "model.safetensors").is_file()
+
+
+@pytest.mark.parametrize("manifest", ["conversion_manifest.json", "download_manifest.json"])
+@pytest.mark.parametrize("damage", ["truncated", "unsupported schema"])
+def test_a_damaged_manifest_never_fails_a_loaded_run(tmp_path: Path, manifest: str, damage: str) -> None:
+    """Review finding: a ValueError from a manifest escaped and failed every transcription."""
+
+    write_converted_checkpoint(tmp_path)
+    write_marker(tmp_path, recorded_size=len(CHECKPOINT_BYTES))
+    if damage == "truncated":
+        (tmp_path / manifest).write_text('{"schema_version": 1, "fi', encoding="utf-8")
+    else:
+        (tmp_path / manifest).write_text('{"schema_version": 99, "files": {}}', encoding="utf-8")
+    messages: list[str] = []
+
+    result, loaded = ensure_first_run_ready(
+        tmp_path,
+        releasing_settings(keep=False),
+        MagicMock(return_value="model"),
+        progress_callback=messages.append,
+    )
+
+    assert (result.action, loaded) == ("ready", "model")
+    assert (tmp_path / "model.safetensors").is_file()
+    assert any(message.startswith("Warning: could not remove model.safetensors") for message in messages)
 
 
 def test_a_failed_removal_is_a_warning_not_a_failure(tmp_path: Path) -> None:
     write_converted_checkpoint(tmp_path)
-    write_marker(tmp_path, recorded_size=len(b"prepared"))
+    write_marker(tmp_path, recorded_size=len(CHECKPOINT_BYTES))
     messages: list[str] = []
 
     with patch("src.checkpoint.bootstrap.remove_source_weights", side_effect=PermissionError("in use")):
