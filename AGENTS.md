@@ -43,14 +43,20 @@ inference.py --transcribe <file|folder>
     configuration/settings.py   load and validate config.toml
     runtime/logging_setup.py    open logs/log_<date>.txt, assign run id
     discover_audio_files        content-probe inputs (audio/media.inspect_media)
-    commands/model_loading.py   prepare_inference_model (shared by every command):
-      runtime/device.py           device, float32 matmul precision, encoder precision,
-                                  float16 accumulation
+    commands/model_loading.py   prepare_inference_model (shared by every command), which
+                                decides every "auto" setting for the device in use:
+      runtime/device.py           torch.accelerator device, refuses a GPU the PyTorch
+                                  build has no kernels for, encoder precision (auto:
+                                  float16 with tensor cores), float32 matmul precision
       checkpoint/bootstrap.py     readiness gate, then a single strict model load
         checkpoint/orchestration.py  download + verify + convert when not ready
         checkpoint/derived.py     model.encoder-float16.pth built once from model.pth
-      inference/offline.enable_graph_decoding   CUDA Graph static buffers
-      inference/budget.py         allocator ceiling + calibrated batch budget
+      runtime/device.py           float16 accumulation (auto: GEMM microbenchmark),
+                                  decode workers (auto: logical CPUs / 4)
+      inference/budget.py         allocator ceiling, calibration (1 and 8 rows),
+                                  chunks that fit, batch rows (auto: 70%, at most 64)
+      inference/offline.enable_graph_decoding   CUDA Graph for those rows, captured now;
+                                  its memory is measured and taken off the rows
     inference/offline.py        OfflineTranscriber.transcribe
       inference/planning.py       chunks, decode streams, bounded round-robin, micro-batches
       per batch (decode runs one batch ahead: one task per decode stream
@@ -72,6 +78,10 @@ python -m src.commands.benchmark --input <file|folder>
 
 python -m src.commands.worker
   same startup once, then JSON Lines requests on stdin, responses on stdout
+
+python -m src.commands.doctor
+  environment facts, the same startup, the LibriSpeech accuracy check, encoder
+  throughput; one JSON line appended to <metrics_dir>/doctor_<date>.jsonl
 ```
 
 ### Package dependencies
@@ -95,6 +105,7 @@ flowchart TB
     commands --> audio
     commands --> runtime
     commands --> configuration
+    commands -- "doctor: scoring" --> text
     inference --> models
     inference --> audio
     inference --> text
@@ -154,7 +165,7 @@ sequenceDiagram
 | Joint | `models/joint.py` | ReLU(enc + dec), then linear to 8193 token logits + 5 duration logits |
 | Greedy TDT loop | `ParakeetTDT._decode_eager`, or `models/graphed_decoding.py` on CUDA | per step: argmax token, argmax duration, advance frame pointer |
 
-Precision (`ParakeetTDT.set_encoder_dtype`): with `encoder_precision = "float16"` on CUDA, the encoder and encoder projector run in float16; the decoder, joint, the relative positional frequencies (`inv_freq`), every depthwise convolution, and the BatchNorm after it stay float32. `encode()` casts features to the encoder dtype and returns float32 states to the loop. With `float16_accumulation` (`runtime/device.py` `apply_float16_accumulation`) cuBLAS also adds the float16 products in float16; the setting is process-wide and is set explicitly either way.
+Precision (`ParakeetTDT.set_encoder_dtype`): with a float16 encoder (`encoder_precision = "auto"` on a CUDA GPU with tensor cores, or `"float16"` on any CUDA GPU), the encoder and encoder projector run in float16; the decoder, joint, the relative positional frequencies (`inv_freq`), every depthwise convolution, and the BatchNorm after it stay float32. `encode()` casts features to the encoder dtype and returns float32 states to the loop. With `float16_accumulation` (`runtime/device.py` `apply_float16_accumulation`) cuBLAS also adds the float16 products in float16; the setting is process-wide and is set explicitly either way.
 
 Greedy TDT rules (`generate`):
 
@@ -413,8 +424,8 @@ flowchart TB
 |---|---|---|
 | `configuration/config.py` | Load and validate checkpoint JSON (`config.json`, processor, generation) | standard library only |
 | `configuration/settings.py` | Load and validate `config.toml` | standard library, `config.py` |
-| `runtime/` | Device selection and report, precision policy, dated run logging, atomic writes, peak process memory, GPU memory measurement and allocator cap | standard library, torch |
-| `text/` | Tokenizer decoding from `tokenizer.json` | standard library, torch |
+| `runtime/` | Device selection through `torch.accelerator`, synchronization, CUDA capability and build support, precision policy and the float16 accumulation microbenchmark, decode-worker rule, dated run logging, atomic writes, peak process memory, accelerator memory statistics and the CUDA allocator cap | standard library, torch |
+| `text/` | Tokenizer decoding from `tokenizer.json`; word error rate scoring (`scoring.py`, used by the doctor command and the tests) | standard library, torch, numpy |
 | `models/` | Network modules, the eager TDT loop and its CUDA Graph form (`graphed_decoding.py`), strict checkpoint loading | torch, `configuration`, `runtime.device` |
 | `audio/features.py` | Feature extraction | torch, `configuration` |
 | `audio/resampling.py` | Windowed-sinc resampling on a global grid | torch |
@@ -423,9 +434,9 @@ flowchart TB
 | `inference/merging.py` | Word grouping and seam alignment | standard library only |
 | `inference/recovery.py` | Gap detection and recovery windows | standard library only |
 | `inference/offline.py` | Orchestration, parallel decode streams (`_StreamDecoder`), inline collapse recovery, merge, statuses, `enable_graph_decoding` | everything above except `commands` and `checkpoint` |
-| `inference/budget.py` | Allocator ceiling and calibrated batch budget | `audio.features`, `configuration`, `models`, `runtime.memory` |
+| `inference/budget.py` | Allocator ceiling, calibrated chunks that fit, rows per batch (`batch_rows_for`), rows left after the graph decoder (`rows_after_reserving`) | `audio.features`, `configuration`, `models`, `runtime.memory` |
 | `checkpoint/` | Download, verify, convert, readiness marker, derived float16 encoder file | standard library, torch, `configuration.settings`, `runtime` |
-| `commands/` | CLI parsing, terminal output, wiring; shared startup in `model_loading.py`; the benchmark and worker commands | anything |
+| `commands/` | CLI parsing, terminal output, wiring; shared startup and every "auto" decision in `model_loading.py`; the benchmark, worker, and doctor commands | anything |
 
 Rules:
 
@@ -475,7 +486,8 @@ A change that breaks any of these is a regression, whatever else it improves.
 
 16. **Memory does not scale with duration.** Never hold a full-file waveform, feature tensor, encoder output, or logits for long audio.
 17. **OOM policy.** The batch budget is fitted to free memory before the first batch, and the allocator is capped at physically free memory so Windows cannot spill into system memory. If an OOM still happens, stop with a diagnostic. No retry, no silent batch reduction during a run, no CPU fallback, no partial CSV. `memory.reserve_mib` is preferred headroom: when keeping it leaves no room for one chunk, the run uses the physical memory and prints a warning; it fails before the first batch only when one chunk does not physically fit.
-18. **Device agnostic.** Device resolution happens once in `runtime/device.select_device()`. Components use the model's device. Do not assume CUDA.
+18. **Device agnostic.** Device resolution happens once in `runtime/device.select_device()`, through `torch.accelerator` (any accelerator the PyTorch build supports, else the CPU). Components use the model's device, synchronize with `runtime.device.synchronize`, and read memory statistics through `runtime.memory` (unavailable statistics are reported as such, never a failure). Only the features that exist on NVIDIA GPUs check for CUDA: tensor-core float16, float16 accumulation, CUDA Graphs, the memory budget and allocator cap. Do not assume CUDA anywhere else.
+19. **"auto" is decided once, at startup.** `InferenceSettings` fields that config.toml sets to `"auto"` are None (or `"auto"` for `encoder_precision`) after parsing. `prepare_inference_model` replaces every one with a decision and reports it with its reason; `OfflineTranscriber` and `enable_graph_decoding` refuse unresolved settings (`require_resolved`). Order: device and precision, load, float16 accumulation, memory budget on the model without a graph decoder, batch rows, then the graph decoder for those rows, captured immediately; its memory is measured and taken off the rows, and when not even one chunk fits next to it, graph decoding is turned off with a warning instead of failing. The calibration uses one row and the first of 8 or 3 rows that fits: two close points (1 and 3) let 20 MiB of cache noise turn 53 MiB per row into 43 and the chosen batch ran out of memory.
 
 ## 5. Configuration discipline
 
@@ -483,7 +495,7 @@ A change that breaks any of these is a regression, whatever else it improves.
 - Every key is required. Validation reports `section.key` and the rule it broke. There are no silent defaults.
 - Cross-field rules enforced today:
   - `max_chunk_feature_frames > 2 * overlap_feature_frames`
-  - `max_batch_feature_frames >= max_chunk_feature_frames`
+  - `max_batch_feature_frames >= max_chunk_feature_frames` when it is a number
   - `0 <= max_padding_fraction <= 1`
   - `request_timeout_seconds > 0`
   - `download_attempts >= 1`
@@ -492,7 +504,8 @@ A change that breaks any of these is a regression, whatever else it improves.
   - `warmup_rounds >= 0`, `measured_rounds >= 1`, `git_timeout_seconds > 0`
   - `max_open_files >= 1`, `decode_workers >= 1`, `reserve_mib >= 0`
   - `logging.terminal_details` and `checkpoint.keep_safetensors` are booleans
-  - `encoder_precision` in `("float32", "float16")`, `float32_matmul_precision` in `("highest", "high")`
+  - `encoder_precision` in `("auto", "float32", "float16")`, `float32_matmul_precision` in `("highest", "high")`
+  - `batch_size`, `max_batch_feature_frames`, and `decode_workers` are `"auto"` or an integer; `float16_accumulation` is `"auto"` or a boolean
 - Constants that belong to the checkpoint's input contract (feature constants, pinned hashes) stay in code with a comment explaining why they are not settings.
 - Adding a setting means:
   1. add a field to the dataclass;
@@ -572,9 +585,9 @@ venv\Scripts\python.exe -m pytest -m regression       # only the fixed-defect gu
 
 | Tier | Location | Needs | Contents |
 |---|---|---|---|
-| unit | `tests/unit/` | nothing | `test_planning.py` (frame estimate, tiling and batch properties), `test_model.py` (config validation, features, TDT loop, duration table, non-finite rows, strict loading, tokenizer, attention), `test_offline.py` (sequential decoding bit-identity, downmix, ffprobe metadata, merge, statuses), `test_merging.py` (word grouping, seam alignment, fallback ownership), `test_recovery.py` (gap detection, recovery windows, collapse recovery wiring), `test_resampling.py` (pass band, alias rejection, interval equals whole file), `test_ffmpeg_stream.py` (persistent stream equals one continuous decode, one process per file, reads behind the stream, process closed; skipped without FFmpeg), `test_benchmark.py` (peak process memory, summary statistics, rounds without audio, warm-up and measured rounds appended as one JSON line), `test_memory_budget.py` (row arithmetic, ceiling and headroom, cache release, report), `test_graphed_decoding.py` (the static-buffer step against the eager loop on CPU, guard, duration table, non-finite rows, oversized batches), `test_derived_checkpoint.py` (float16 file built once, rebuilt when stale or damaged, same weights as casting, no widening), `test_worker.py` (protocol, folders, bad requests), `test_scoring.py` (numpy word errors against the textbook recurrence, reference files), `test_checkpoint.py` (download reuse, retry, pin rejection, conversion, against a real local HTTP server), `test_bootstrap.py`, `test_cli.py`, `test_runtime_services.py` |
+| unit | `tests/unit/` | nothing | `test_planning.py` (frame estimate, tiling and batch properties), `test_model.py` (config validation, features, TDT loop, duration table, non-finite rows, strict loading, tokenizer, attention), `test_offline.py` (sequential decoding bit-identity, downmix, ffprobe metadata, merge, statuses), `test_merging.py` (word grouping, seam alignment, fallback ownership), `test_recovery.py` (gap detection, recovery windows, collapse recovery wiring), `test_resampling.py` (pass band, alias rejection, interval equals whole file), `test_ffmpeg_stream.py` (persistent stream equals one continuous decode, one process per file, reads behind the stream, process closed; skipped without FFmpeg), `test_benchmark.py` (peak process memory, summary statistics, rounds without audio, warm-up and measured rounds appended as one JSON line), `test_memory_budget.py` (row arithmetic, ceiling and headroom, cache release, report), `test_graphed_decoding.py` (the static-buffer step against the eager loop on CPU, guard, duration table, non-finite rows, oversized batches), `test_derived_checkpoint.py` (float16 file built once, rebuilt when stale or damaged, same weights as casting, no widening), `test_worker.py` (protocol, folders, bad requests), `test_scoring.py` (numpy word errors against the textbook recurrence, reference files), `test_checkpoint.py` (download reuse, retry, pin rejection, conversion, against a real local HTTP server), `test_bootstrap.py`, `test_cli.py`, `test_runtime_services.py` (settings including every "auto" field, device selection through `torch.accelerator`, tensor-core precision, build support, decode-worker rule, float16 accumulation decision), `test_model_loading.py` (resolved settings, the graph decoder's memory taken off the rows or graph decoding turned off, report lines), `test_decode_streams.py` |
 | regression | `tests/regression/test_fixed_defects.py` | nothing | one test per fixed defect; each docstring states the original failure and each section names the fixing commit |
-| full | `tests/full/` | prepared checkpoint | uses the configured precision and graph decoding. `test_accuracy.py` (exact transcripts, corpus WER budget, batching parity, determinism), `test_long_form.py` (chunking at scale, WER budget, CUDA memory bound past one full batch, no empty chunks in full batches, optional user recordings), `test_anomalies.py` (silence, noise, NaN samples, 48 kHz stereo), `test_command.py` (the real `inference.py` in a subprocess, folder CSV, FFmpeg fallback, error exit), `test_worker_process.py` (the real worker serving several requests), `test_graph_decoding_gpu.py` (captured graph bit-identical to the eager loop), `test_memory_budget_gpu.py` (the chosen budget runs under the ceiling), `test_reference_parity.py` (HF `ParakeetForTDT` on CPU, skipped without `transformers`), `test_reference_long_form.py` (opt-in labeled recordings: `PARAKEET_TEST_REFERENCE_DIR`, `PARAKEET_TEST_REFERENCE_MAX_WER`) |
+| full | `tests/full/` | prepared checkpoint | uses the configured precision and graph decoding, with "auto" batch shapes pinned to 16 rows (`FULL_TIER_BATCH_ROWS` in `conftest.py`) and float16 accumulation off, because the expected transcripts were recorded that way. `test_device_adaptation_gpu.py` (startup decides every "auto" setting on the real GPU, a batch of the chosen rows runs under the ceiling, configured numbers are kept, the doctor command passes and writes its record). `test_accuracy.py` (exact transcripts, corpus WER budget, batching parity, determinism), `test_long_form.py` (chunking at scale, WER budget, CUDA memory bound past one full batch, no empty chunks in full batches, optional user recordings), `test_anomalies.py` (silence, noise, NaN samples, 48 kHz stereo), `test_command.py` (the real `inference.py` in a subprocess, folder CSV, FFmpeg fallback, error exit), `test_worker_process.py` (the real worker serving several requests), `test_graph_decoding_gpu.py` (captured graph bit-identical to the eager loop), `test_memory_budget_gpu.py` (the chosen budget runs under the ceiling), `test_reference_parity.py` (HF `ParakeetForTDT` on CPU, skipped without `transformers`), `test_reference_long_form.py` (opt-in labeled recordings: `PARAKEET_TEST_REFERENCE_DIR`, `PARAKEET_TEST_REFERENCE_MAX_WER`) |
 
 Shared helpers live in `tests/support.py`:
 - the tiny checkpoint writer;
@@ -582,7 +595,7 @@ Shared helpers live in `tests/support.py`:
 - settings factories;
 - `ScriptedModel`, a stand-in for the model's `generate`;
 - the speech-clip loader, which checks each file's SHA-256 against `manifest.json`;
-- a WER computed one numpy row at a time (hour-long transcripts in seconds) and the reference transcript reader.
+- the WER helpers re-exported from `src/text/scoring.py` (one numpy row at a time, so hour-long transcripts score in seconds) and the reference transcript reader.
 
 Fixtures live in `tests/conftest.py`: `tiny_checkpoint_dir`, `tiny_configuration`, and the session-scoped `real_settings`, `real_model`, `speech_clips`.
 
@@ -648,7 +661,7 @@ Keep verification scripts outside the repository (a scratch directory). Report t
 
 ## 10. Performance work
 
-- **Measure first.** On the 112.6-minute `docs/` folder with the defaults: wall 11.92 s (benchmark command, 3 rounds); generation 10.1 s (mostly the encoder); media decoding about 6.5 s of batch time on four threads, hidden behind the GPU; collapse recovery about 0.7 s. The 74-minute MP3 alone: 7.9 s, of which 6.5 s is the model. Before this round of work: 19.06 s and 12.5 s; earlier float32 settings took 97.4 s for the folder.
+- **Measure first.** On the 112.6-minute `docs/` folder with the defaults ("auto" chose 23 rows on the RTX 3050 Ti): wall 11.14 s (benchmark command, 3 rounds), 11.92 s with 16 rows. Older figures with 16 rows: generation 10.1 s (mostly the encoder); media decoding about 6.5 s of batch time on four threads, hidden behind the GPU; collapse recovery about 0.7 s. The 74-minute MP3 alone: 7.9 s, of which 6.5 s is the model. Before this round of work: 19.06 s and 12.5 s; earlier float32 settings took 97.4 s for the folder.
 - **Encoder kernels** (float16, 16 full chunks, 269 ms with the defaults, 372 ms before D26 and D27): cuBLAS GEMMs about 58%, layout copies and casts about 10%, SiLU 6%, residual and bias adds about 8%, memory-efficient attention 4%, depthwise convolution 4%, LayerNorm 3%. A further step needs fused custom kernels (nvcc and MSVC build tools are present on the development machine; Triton is not), estimated at about 1 s on the 74-minute file.
 - **Encoder:** compute-bound, linear in rows. Per 15 s row on the RTX 3050 Ti Laptop: about 68 ms float32, 47 ms TF32, 24 ms float16. At 8 rows in float32, feed-forward is 50%, attention 30% (relative-position projection 6% before it was shared per batch), convolution 11%, subsampling 6%. `cudnn.benchmark` made no difference.
 - **Decoding loop:** about 46 kernel launches per step; eager 1.2 to 2.0 ms per step against 0.40 ms of GPU work. A replayed CUDA Graph takes 0.38 to 0.41 ms per step at 1 to 8 rows, so one graph sized for the largest batch serves all. cuDNN's LSTM step costs about 0.30 ms; a hand-written fused LSTM cell was slower (0.98 ms) and was dropped.
@@ -718,6 +731,9 @@ Must not, without an explicit request from the maintainer:
 | Message (excerpt) | Cause | Fix |
 |---|---|---|
 | `Out of memory during model generation for batch items [...]` | Another program took GPU memory after startup, or the headroom was too small. | Raise `memory.reserve_mib` or lower `inference.max_batch_feature_frames`. Close other GPU processes. |
+| `The installed PyTorch build has no CUDA kernels for <GPU>` | The PyTorch build does not include the GPU's architecture (for example a GeForce 10 series card on a build for compute capability 7.5 and newer). | Install a PyTorch build that supports the GPU, or a CPU build. `python -m src.commands.doctor` shows the build's architectures. |
+| `Warning: CUDA Graph decoding is off: the free GPU memory holds one chunk but not the graph decoder next to it` | Another program holds most of the GPU memory. | Nothing; transcripts are the same and slower. Close the other program to get graph decoding back. |
+| `inference settings [...] are still 'auto'` | Code built an `OfflineTranscriber` from settings that did not pass through `prepare_inference_model`. | Use `prepare_inference_model`, or replace each "auto" with a value (the full-tier `conftest.py` shows how). |
 | `One full chunk needs about N MiB but only M MiB of GPU memory is free` | The weights loaded, but no chunk fits beside them. | Close other GPU programs, or lower `inference.max_chunk_feature_frames`, or set `encoder_precision = "float16"`. |
 | `Warning: less than memory.reserve_mib of GPU memory was free` | Little free VRAM at startup; the run uses all of it. | Nothing, unless other GPU programs start later; then close them or expect an out-of-memory stop. |
 | `The checkpoint stores a torch.float16 encoder and cannot be loaded as torch.float32` | A float16 file was passed for a float32 run. | Load `model.pth` for float32 (the commands do this). |
@@ -769,6 +785,7 @@ Must not, without an explicit request from the maintainer:
 - **D28. Recovery from audio already in memory, one window at a time, inline.** Recovery still spent 2.7 s on the 74-minute file: 1.5 s re-reading (MP3 seeks) and four windows per collapsed chunk although 9 of 12 recovered with the first. Chunks are now decoded with the recovery reach on both sides, windows are tried lazily (several per chunk once few chunks are left), and full batches of them run between planned batches. Recovery dropped to 0.5 s with the same choices. Supersedes the reading part of D21.
 - **D29. NumPy downmix.** `torch.mean(dim=1)` over interleaved stereo took 1.1 s for 74 minutes; adding the two channel columns in NumPy takes 0.41 s and gives the same values. GPU downmix and resampling were measured and rejected: with the copies 4.4 s against 1.8 s on the CPU.
 - **D30. Nothing to choose, little to read.** A user installs the dependencies and runs `inference.py --transcribe`; precision, device, and batch size are already automatic. The terminal now shows the device, progress, results, warnings, and first-run steps; versions, precision, the memory budget, and stage timings go to the run log only, unless `logging.terminal_details = true` (`line_reporter(echo=False)` for details, a separate notice reporter for what must be seen). The terminal still names the device, device count, precision, and PyTorch and CUDA versions, on one `Running on:` line (`RuntimeReport.summary`), as the global ML rules require; a run slower than real time says "slower". `model.safetensors` is deleted after `model.pth` has loaded (`orchestration.remove_source_weights`) only when every link is proven: verified download, named as the conversion source, and `model.pth` matching the recorded size and SHA-256 (size alone cannot tell a same-architecture replacement). The hash runs once, since afterwards there is nothing left to delete. It stands down while `model.pth.converting` exists or once the readiness marker is no longer current (a repair in another process clears it first), and any manifest or file error is a warning, never a failed run. Only conversion ever read the file, so it was a second 2.5 GB copy. A repair downloads it again; `checkpoint.keep_safetensors = true` keeps it. The Hugging Face parity test uses `from_pretrained` on the safetensors when they are present (covering conversion too) and otherwise builds the reference from `config.json` with the `model.pth` state dict. Pure float16 everywhere was considered and rejected: the float32 parts (decoder, joint, depthwise convolutions, BatchNorm, `inv_freq`) are 2.8% of the parameters and each has a measured or numerical reason (D18, 8a).
+- **D31. Settings decided for the device in use; a doctor command to check any machine.** Only the RTX 3050 Ti was available, and its tuned numbers (16 rows, float16 accumulation on, 4 decode threads) are not right for every GPU. They are now `"auto"` and decided at startup from what the device is and measures: float16 where tensor cores exist (compute capability 7.0+); float16 accumulation only where a GEMM microbenchmark shows at least 5 percent (1.68 to 1.84 times on the RTX 3050 Ti; a GPU that already accumulates float32 at full rate gains nothing and keeps float32 sums); rows as 70 percent of the calibrated chunks that fit, at most 64 (23 here, which made the 74-minute file 7.9 to 7.5 s and the folder 11.92 to 11.14 s; 80 percent picked 31 rows earlier and ran out of memory in the second batch); decode threads from the CPU count. A GPU whose architecture the PyTorch build lacks is refused before loading. `torch.accelerator` replaced CUDA-only calls for device selection, synchronization, and memory statistics. Startup builds the CUDA Graph decoder after the budget, for the chosen rows, and pays for its measured memory. `python -m src.commands.doctor` reports all of it, checks the LibriSpeech clips against the test suite's WER budget, measures encoder throughput, and appends a JSON record, so results from GPUs the project does not own can be collected.
 
 ## 16. Open optimization items
 

@@ -14,6 +14,7 @@ them, for example ``-m "not full"`` for the fast suite.
 
 from __future__ import annotations
 
+import dataclasses
 from pathlib import Path
 
 import pytest
@@ -79,7 +80,39 @@ def real_settings() -> Settings:
             f"checkpoint not prepared in {settings.paths.weights_dir}; "
             "run `python -m src.commands.prepare_checkpoint` first"
         )
-    return settings
+    return dataclasses.replace(settings, inference=fixed_full_tier_inference(settings.inference))
+
+
+# Rows per batch for the full tier. The expected transcripts in
+# tests/data/librispeech were recorded with 16-row batches, and float16
+# results can move by a frame with the batch shape, so the tier pins the
+# shape instead of taking what "auto" picks on the machine at hand. The
+# automatic decisions have their own test (test_device_adaptation_gpu.py).
+FULL_TIER_BATCH_ROWS = 16
+
+
+def fixed_full_tier_inference(inference):
+    """The repository settings with every "auto" replaced by a fixed value."""
+
+    from src.runtime.device import default_decode_workers, encoder_dtype_for, select_device
+
+    encoder_dtype, _description = encoder_dtype_for(inference.encoder_precision, select_device())
+    rows = inference.batch_size if inference.batch_size is not None else FULL_TIER_BATCH_ROWS
+    return dataclasses.replace(
+        inference,
+        batch_size=rows,
+        max_batch_feature_frames=(
+            inference.max_batch_feature_frames
+            if inference.max_batch_feature_frames is not None
+            else rows * inference.max_chunk_feature_frames
+        ),
+        encoder_precision="float16" if encoder_dtype == torch.float16 else "float32",
+        # The expected transcripts predate float16 accumulation.
+        float16_accumulation=bool(inference.float16_accumulation),
+        decode_workers=(
+            inference.decode_workers if inference.decode_workers is not None else default_decode_workers()
+        ),
+    )
 
 
 @pytest.fixture(scope="session")

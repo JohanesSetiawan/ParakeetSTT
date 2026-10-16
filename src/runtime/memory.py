@@ -4,15 +4,24 @@ Process and accelerator memory: peak host memory and the GPU allocator cap.
 Peak process memory is reported next to accelerator memory so a run's host
 footprint (decoded audio, model staging, Python objects) is visible too.
 psutil is not a dependency, so each platform's own counter is read directly.
+
+Accelerator statistics go through ``torch.accelerator``, so they work for
+whatever accelerator the run uses. A backend that does not implement a
+statistic reports it as unavailable instead of failing the run. Capping the
+allocator is CUDA-only (``torch.cuda.set_per_process_memory_fraction``).
 """
 
 from __future__ import annotations
 
 import ctypes
+import logging
 import sys
 from dataclasses import dataclass
+from typing import Any
 
 import torch
+
+logger = logging.getLogger(__name__)
 
 
 def peak_process_memory_bytes() -> int | None:
@@ -65,6 +74,49 @@ def _windows_peak_working_set() -> int | None:
 
 
 # =============================================================================
+# Accelerator statistics
+# =============================================================================
+
+
+def reset_peak_accelerator_memory(device: torch.device) -> None:
+    """Start a new peak measurement; a no-op on the CPU or an unsupported backend."""
+
+    if device.type == "cpu":
+        return
+    try:
+        torch.accelerator.reset_peak_memory_stats(device)
+    except RuntimeError as error:
+        logger.debug("peak memory statistics unavailable on %s: %s", device, error)
+
+
+def accelerator_memory_snapshot(device: torch.device) -> dict[str, Any]:
+    """
+    Current and peak allocator statistics for a run report.
+
+    Returns:
+        ``{"available": True, "allocated_bytes", "reserved_bytes",
+        "peak_allocated_bytes", "peak_reserved_bytes"}``, or
+        ``{"available": False, "device": ...}`` on the CPU or when the
+        backend does not provide the statistics.
+    """
+
+    unavailable = {"available": False, "device": str(device)}
+    if device.type == "cpu":
+        return unavailable
+    try:
+        return {
+            "available": True,
+            "allocated_bytes": torch.accelerator.memory_allocated(device),
+            "reserved_bytes": torch.accelerator.memory_reserved(device),
+            "peak_allocated_bytes": torch.accelerator.max_memory_allocated(device),
+            "peak_reserved_bytes": torch.accelerator.max_memory_reserved(device),
+        }
+    except RuntimeError as error:
+        logger.debug("memory statistics unavailable on %s: %s", device, error)
+        return unavailable
+
+
+# =============================================================================
 # Accelerator memory ceiling
 # =============================================================================
 
@@ -91,10 +143,10 @@ def measure_accelerator_memory(device: torch.device) -> AcceleratorMemory:
     returned first and "free" is what the driver can really hand out.
     """
 
-    torch.cuda.empty_cache()
-    free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+    torch.accelerator.empty_cache()
+    free_bytes, total_bytes = torch.accelerator.get_memory_info(device)
     return AcceleratorMemory(
-        reserved=torch.cuda.memory_reserved(device),
+        reserved=torch.accelerator.memory_reserved(device),
         free=free_bytes,
         total=total_bytes,
     )

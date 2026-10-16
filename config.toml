@@ -28,20 +28,25 @@ stream_block_bytes = 1048576
 keep_safetensors = false
 
 [inference]
-# Most rows (chunks) in one batch. Short clips need many rows to fill the
-# GPU; long audio is limited by max_batch_feature_frames below.
-batch_size = 16
+# Settings set to "auto" are decided at startup for the computer in use, and
+# each decision is written to the run log with its reason (run
+# `python -m src.commands.doctor` to see them). A number or true/false
+# instead is used as written.
+#
+# Most rows (chunks) in one batch. "auto": 80 percent of the full chunks that
+# fit in the free GPU memory (measured at startup), at most 64; 16 on the CPU
+# and on Apple MPS. Larger batches were never slower on the reference GPU.
+batch_size = "auto"
 recursive = true
 output_filename = "transcriptions.csv"
 # Empty list means every file is content-probed instead of filtered by extension.
 audio_extensions = []
 max_chunk_feature_frames = 1500
 overlap_feature_frames = 50
-# Upper limit on a batch's padded size (rows x longest row). With
-# memory.auto_batch_budget it is lowered at startup to what fits in the free
-# VRAM, so it can be set for the largest card in use. Per chunk, 8 rows ran
-# 1.6 times faster than 2 with the same transcripts (RTX 3050 Ti, float32).
-max_batch_feature_frames = 24000
+# Upper limit on a batch's padded size (rows x longest row). "auto": what
+# the batch rows need. A number is lowered at startup, when needed, to what
+# fits in the free GPU memory (memory.auto_batch_budget).
+max_batch_feature_frames = "auto"
 max_padding_fraction = 0.25
 # How far apart two neighbouring chunks may place the same word in time
 # (feature frames of 10 ms). Measured drift reaches about 0.5 s, so 100 frames
@@ -65,11 +70,13 @@ progress_interval_seconds = 2.0
 # once. A long file gets several decoders (see decode_workers) only while
 # fewer files are in progress. Single-chunk files do not count.
 max_open_files = 8
-# Precision of the acoustic encoder on CUDA: "float16" or "float32". Float16
-# is about 2.8 times faster in the encoder and halves its weights; on two
-# labeled podcasts (110 minutes) the word error rate was the same as float32.
-# The decoder and joint always run in float32. CPU and MPS always use float32.
-encoder_precision = "float16"
+# Precision of the acoustic encoder: "auto", "float16", or "float32".
+# Float16 is about 2.8 times faster in the encoder and halves its weights; on
+# two labeled podcasts (110 minutes) the word error rate was the same as
+# float32. "auto": float16 on NVIDIA GPUs with tensor cores (compute
+# capability 7.0 and newer), float32 on older GPUs, the CPU, and other
+# accelerators. The decoder and joint always run in float32.
+encoder_precision = "auto"
 # CUDA only: replay each greedy decoding step as one captured CUDA Graph
 # instead of about 46 separate kernel launches. Same output, 3 to 5 times
 # faster decoding loop on the RTX 3050 Ti. Other devices ignore it.
@@ -81,25 +88,31 @@ cuda_graphs = true
 float32_matmul_precision = "highest"
 # CUDA float16 encoder only: matrix products also add in float16 (cuBLAS).
 # The encoder ran 1.17 times faster on the RTX 3050 Ti, and the word error
-# rate on the docs corpus was 6.66 percent against 6.67 without it.
-float16_accumulation = true
+# rate on the docs corpus was 6.66 percent against 6.67 without it. "auto":
+# a short benchmark at startup turns it on only where it is at least 5
+# percent faster (GeForce GPUs gain; GPUs that add in float32 at full speed
+# keep the more precise float32 sums).
+float16_accumulation = "auto"
 # Threads that decode and resample audio while the GPU runs. A long file that
 # libsndfile reads (WAV, FLAC, MP3, ...) is dealt to up to this many decoders
 # in blocks of chunks, so each batch is decoded in parallel; chunks of
 # different files in one batch are decoded in parallel too. Files decoded
 # through ffmpeg stay one decoder each. Raw MP3 decoding of a 74-minute file
-# took 4.4 s on 1 thread, 3.1 s on 2, 2.3 s on 4 and 2.5 s on 8.
-decode_workers = 4
+# took 4.4 s on 1 thread, 3.1 s on 2, 2.3 s on 4 and 2.5 s on 8, with 16
+# logical CPUs. "auto": one thread per four logical CPUs, 1 to 8.
+decode_workers = "auto"
 
 [memory]
-# GPU only (ignored on CPU and MPS). After the model loads, PyTorch is capped
-# to the VRAM that is actually free minus reserve_mib. On Windows an
+# NVIDIA GPUs only (ignored on the CPU and other accelerators). After the
+# model loads, PyTorch is capped to the VRAM that is actually free minus
+# reserve_mib. On Windows an
 # over-allocation would otherwise spill silently into shared system memory and
 # run several times slower instead of failing.
 cap_to_free_memory = true
-# Measure the memory of one and of three full chunks after loading and lower
-# inference.max_batch_feature_frames, when needed, to what fits under that
-# cap. The configured value stays the upper limit; it is never raised.
+# Measure the memory of one and of three full chunks after loading: how many
+# full chunks fit under that cap. inference.batch_size = "auto" is chosen from
+# it, and configured numbers (batch_size, max_batch_feature_frames) are
+# lowered to it when needed, never raised. false: batch_size "auto" is 16.
 auto_batch_budget = true
 # VRAM left outside the cap, measured after calibration has already loaded
 # the libraries: room for kernels loaded later and for other programs.

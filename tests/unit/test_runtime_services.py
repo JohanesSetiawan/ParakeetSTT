@@ -81,7 +81,14 @@ def test_repository_config_is_valid() -> None:
 
     assert settings.paths.weights_dir.is_absolute()
     assert settings.paths.log_dir.is_absolute()
-    assert settings.inference.max_batch_feature_frames >= settings.inference.max_chunk_feature_frames
+    # The shipped configuration adapts to the machine.
+    assert set(settings.inference.unresolved_fields()) == {
+        "batch_size",
+        "max_batch_feature_frames",
+        "encoder_precision",
+        "float16_accumulation",
+        "decode_workers",
+    }
 
 
 def test_valid_file_is_normalized(tmp_path: Path) -> None:
@@ -125,9 +132,13 @@ def test_valid_file_is_normalized(tmp_path: Path) -> None:
         ("git_timeout_seconds = 15.0", "git_timeout_seconds = 0", "git_timeout_seconds"),
         ("max_open_files = 4", "max_open_files = 0", "max_open_files"),
         ('encoder_precision = "float16"', 'encoder_precision = "bfloat16"', "encoder_precision"),
+        ("batch_size = 4", 'batch_size = "automatic"', "batch_size"),
+        ("decode_workers = 3", 'decode_workers = "Auto"', "decode_workers"),
+        ("float16_accumulation = true", 'float16_accumulation = "yes"', "float16_accumulation"),
         ("cuda_graphs = true", 'cuda_graphs = "on"', "cuda_graphs"),
         ('float32_matmul_precision = "high"', 'float32_matmul_precision = "medium"', "float32_matmul_precision"),
         ("float16_accumulation = true", "float16_accumulation = 1", "float16_accumulation"),
+        ("max_batch_feature_frames = 2000", 'max_batch_feature_frames = "max"', "max_batch_feature_frames"),
         ("decode_workers = 3", "decode_workers = 0", "decode_workers"),
         ("terminal_details = false", "terminal_details = 0", "terminal_details"),
         ("keep_safetensors = false", 'keep_safetensors = "no"', "keep_safetensors"),
@@ -250,8 +261,8 @@ def test_quiet_line_reporter_only_logs(caplog) -> None:
 def test_runtime_summary_names_everything_on_one_line() -> None:
     from src.runtime.device import RuntimeReport
 
-    cpu = RuntimeReport("cpu", "none", 1, "x86_64", "float32", "2.x", "not available", "3.13")
-    gpu = RuntimeReport("cuda:0", "CUDA", 2, "Some GPU", "float16", "2.x", "13.x", "3.13")
+    cpu = RuntimeReport("cpu", "none", 1, "x86_64", "not applicable", "float32", "2.x", "not available", "3.13")
+    gpu = RuntimeReport("cuda:0", "CUDA", 2, "Some GPU", "8.6", "float16", "2.x", "13.x", "3.13")
 
     assert cpu.summary("float32") == (
         "Running on: x86_64 (CPU, 1 device), float32, PyTorch 2.x, CUDA not available"
@@ -321,3 +332,139 @@ def test_float16_accumulation_reports_an_unsupported_build(caplog) -> None:
 
     assert state == "off (not supported by this PyTorch build)"
     assert "does not support" in caplog.text
+
+
+# =============================================================================
+# "auto" settings and device decisions
+# =============================================================================
+
+
+def test_every_auto_setting_parses_and_must_be_resolved(tmp_path: Path) -> None:
+    text = (
+        VALID_TOML.replace("batch_size = 4", 'batch_size = "auto"')
+        .replace("max_batch_feature_frames = 2000", 'max_batch_feature_frames = "auto"')
+        .replace('encoder_precision = "float16"', 'encoder_precision = "auto"')
+        .replace("float16_accumulation = true", 'float16_accumulation = "auto"')
+        .replace("decode_workers = 3", 'decode_workers = "auto"')
+    )
+    inference = load_toml(tmp_path, text).inference
+
+    assert (inference.batch_size, inference.max_batch_feature_frames) == (None, None)
+    assert (inference.float16_accumulation, inference.decode_workers) == (None, None)
+    assert inference.encoder_precision == "auto"
+    with pytest.raises(ValueError, match="batch_size.*still 'auto'"):
+        inference.require_resolved()
+
+
+def test_explicit_settings_are_resolved_as_written(tmp_path: Path) -> None:
+    inference = load_toml(tmp_path, VALID_TOML).inference
+
+    inference.require_resolved()
+    assert inference.unresolved_fields() == ()
+
+
+@pytest.mark.parametrize(("cpus", "workers"), [(1, 1), (4, 1), (8, 2), (16, 4), (64, 8), (128, 8)])
+def test_auto_decode_workers_follow_the_cpu_count(cpus: int, workers: int) -> None:
+    from src.runtime.device import default_decode_workers
+
+    assert default_decode_workers(cpus) == workers
+
+
+@pytest.mark.parametrize(
+    ("precision", "capability", "dtype", "text"),
+    [
+        ("auto", (8, 6), torch.float16, "auto: tensor cores, compute capability 8.6"),
+        ("auto", (7, 0), torch.float16, "auto: tensor cores"),
+        ("auto", (6, 1), torch.float32, "auto: no tensor cores, compute capability 6.1"),
+        ("float16", (6, 1), torch.float16, "no tensor cores"),
+        ("float16", (8, 9), torch.float16, "float16 encoder, float32 decoder and joint"),
+        ("float32", (8, 6), torch.float32, "float32"),
+    ],
+)
+def test_encoder_precision_on_cuda_follows_tensor_cores(precision, capability, dtype, text) -> None:
+    from src.runtime import device as device_module
+
+    with patch.object(device_module, "cuda_capability", return_value=capability):
+        resolved, description = device_module.encoder_dtype_for(precision, torch.device("cuda"))
+
+    assert resolved == dtype
+    assert text in description
+
+
+@pytest.mark.parametrize("precision", ["auto", "float16"])
+def test_encoder_runs_float32_off_cuda(precision: str) -> None:
+    from src.runtime.device import encoder_dtype_for
+
+    dtype, description = encoder_dtype_for(precision, torch.device("cpu"))
+
+    assert dtype == torch.float32
+    assert "float16 is used on CUDA only" in description
+
+
+@pytest.mark.parametrize(
+    ("capability", "architectures", "supported"),
+    [
+        ((8, 6), ["sm_75", "sm_80", "sm_86"], True),
+        ((8, 9), ["sm_80", "sm_86"], True),  # same major version, newer minor
+        ((9, 0), ["sm_86", "compute_86"], True),  # portable code compiles for newer GPUs
+        ((6, 1), ["sm_75", "sm_80"], False),  # Pascal on a build that dropped it
+        ((12, 0), ["sm_75", "sm_80", "sm_86", "sm_90"], False),
+    ],
+)
+def test_build_support_for_a_gpu_architecture(capability, architectures, supported) -> None:
+    from src.runtime import device as device_module
+
+    with (
+        patch.object(device_module, "cuda_capability", return_value=capability),
+        patch.object(device_module.torch.cuda, "get_arch_list", return_value=architectures),
+    ):
+        assert device_module.build_supports_device(torch.device("cuda")) is supported
+
+
+def test_build_support_is_not_a_question_off_cuda() -> None:
+    from src.runtime.device import build_supports_device
+
+    assert build_supports_device(torch.device("cpu")) is None
+
+
+@pytest.mark.parametrize(("accelerator", "expected"), [(None, "cpu"), (torch.device("mps"), "mps"), (torch.device("xpu"), "xpu")])
+def test_device_selection_follows_torch_accelerator(accelerator, expected: str) -> None:
+    from src.runtime import device as device_module
+
+    with patch.object(device_module.torch.accelerator, "current_accelerator", return_value=accelerator) as current:
+        assert device_module.select_device() == torch.device(expected)
+    current.assert_called_once_with(check_available=True)
+
+
+def test_float16_accumulation_is_not_measured_off_cuda() -> None:
+    from src.runtime.device import measure_float16_accumulation_speedup
+
+    assert measure_float16_accumulation_speedup(torch.device("cpu"), 64, 256) is None
+
+
+@pytest.mark.parametrize(
+    ("setting", "speedup", "dtype", "enabled", "reason"),
+    [
+        (True, None, torch.float16, True, ""),
+        (False, None, torch.float16, False, ""),
+        (None, None, torch.float32, False, "the encoder runs in float32"),
+        (None, 1.60, torch.float16, True, "1.60x faster"),
+        (None, 1.02, torch.float16, False, "no clear gain"),
+        (None, None, torch.float16, False, "not measurable"),
+    ],
+)
+def test_auto_float16_accumulation_needs_a_clear_measured_gain(setting, speedup, dtype, enabled, reason) -> None:
+    from types import SimpleNamespace
+
+    from src.commands import model_loading
+
+    configuration = SimpleNamespace(encoder={"hidden_size": 64, "intermediate_size": 256})
+    with patch.object(model_loading, "measure_float16_accumulation_speedup", return_value=speedup) as measure:
+        decided, why = model_loading._decide_float16_accumulation(
+            setting, torch.device("cuda"), dtype, configuration
+        )
+
+    assert decided is enabled
+    assert reason in why
+    if setting is not None or dtype != torch.float16:
+        measure.assert_not_called()

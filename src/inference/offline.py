@@ -36,6 +36,8 @@ from ..audio.media import DecodedSegment, MediaSession, inspect_media, open_medi
 from ..configuration.config import ParakeetConfig
 from ..configuration.settings import InferenceSettings
 from ..models.parakeet import GenerationResult, ParakeetTDT
+from ..runtime.device import synchronize
+from ..runtime.memory import accelerator_memory_snapshot, reset_peak_accelerator_memory
 from ..text.tokenization import BpeTokenizer
 from .merging import ChunkWords, TimedToken, group_words, merge_chunks
 from .planning import (
@@ -377,8 +379,13 @@ def enable_graph_decoding(model: ParakeetTDT, settings: InferenceSettings) -> bo
     Turn on CUDA Graph decoding when configured, sized for these settings.
 
     The static buffers hold ``batch_size`` rows of the longest chunk's encoder
-    frames. Call this before the memory budget is measured, so the budget
-    accounts for them.
+    frames, and the step is captured right away, so all of the decoder's
+    memory is allocated here: startup measures it after this call (see
+    ``commands.model_loading``) instead of discovering it at the first batch.
+
+    Args:
+        model: The loaded model.
+        settings: Resolved settings; ``batch_size`` must not be "auto".
 
     Returns:
         Whether graph decoding is active (CUDA and ``inference.cuda_graphs``).
@@ -387,10 +394,15 @@ def enable_graph_decoding(model: ParakeetTDT, settings: InferenceSettings) -> bo
     if not settings.cuda_graphs:
         model.graph_decoder = None
         return False
+    if settings.batch_size is None:
+        raise ValueError("enable_graph_decoding needs a resolved inference.batch_size, not 'auto'")
     longest_chunk = torch.tensor([settings.max_chunk_feature_frames])
     max_encoder_frames = int(model.encoder.output_length(longest_chunk).item())
     model.enable_graph_decoding(settings.batch_size, max_encoder_frames)
-    return model.graph_decoder is not None
+    if model.graph_decoder is None:
+        return False
+    model.graph_decoder.capture()
+    return True
 
 
 class OfflineTranscriber:
@@ -402,8 +414,15 @@ class OfflineTranscriber:
         configuration: ParakeetConfig,
         settings: InferenceSettings,
     ) -> None:
-        """Bind model, checkpoint processor, planner settings, and tokenizer."""
+        """
+        Bind model, checkpoint processor, planner settings, and tokenizer.
 
+        Raises:
+            ValueError: If a setting is still "auto"; startup resolves them
+                for the device first.
+        """
+
+        settings.require_resolved()
         self.model = model
         self.configuration = configuration
         self.settings = settings
@@ -533,14 +552,7 @@ class OfflineTranscriber:
     def _out_of_memory(self, stage: str, items: tuple[WorkItem, ...]) -> RuntimeError:
         """Build the stop-the-run error for an accelerator OOM."""
 
-        if self.device.type == "cuda":
-            memory = {
-                "allocated_bytes": torch.cuda.memory_allocated(self.device),
-                "reserved_bytes": torch.cuda.memory_reserved(self.device),
-                "peak_allocated_bytes": torch.cuda.max_memory_allocated(self.device),
-            }
-        else:
-            memory = {"device": str(self.device)}
+        memory = accelerator_memory_snapshot(self.device)
         message = (
             f"Out of memory during {stage} for batch items "
             f"{[f'{item.path.name}#{item.chunk_index}' for item in items]}; "
@@ -636,8 +648,7 @@ class OfflineTranscriber:
         except torch.OutOfMemoryError as error:
             raise self._out_of_memory("feature extraction", items) from error
         features_finite = torch.isfinite(features).all(dim=2).all(dim=1)  # (B,)
-        if self.device.type == "cuda":
-            torch.cuda.synchronize(self.device)
+        synchronize(self.device)
         feature_seconds = time.perf_counter() - feature_started
 
         generation_started = time.perf_counter()
@@ -645,8 +656,7 @@ class OfflineTranscriber:
             generation = self.model.generate(features, attention_mask)
         except torch.OutOfMemoryError as error:
             raise self._out_of_memory("model generation", items) from error
-        if self.device.type == "cuda":
-            torch.cuda.synchronize(self.device)
+        synchronize(self.device)
         generation_seconds = time.perf_counter() - generation_started
 
         # One device-to-host copy per tensor for the whole batch; indexing
@@ -961,8 +971,7 @@ class OfflineTranscriber:
             sum(record.duration_seconds for record in metadata_tuple),
         )
 
-        if self.device.type == "cuda":
-            torch.cuda.reset_peak_memory_stats(self.device)
+        reset_peak_accelerator_memory(self.device)
 
         file_ends = [target_frame_count(record, self.target_sample_rate) for record in metadata_tuple]
         streams = self._stream_decoders(plan, file_ends)
@@ -1056,15 +1065,8 @@ class OfflineTranscriber:
                 file_result.real_time_factor,
             )
 
-        if self.device.type == "cuda":
-            torch.cuda.synchronize(self.device)
-            peak_memory: dict[str, object] = {
-                "available": True,
-                "peak_allocated_bytes": torch.cuda.max_memory_allocated(self.device),
-                "peak_reserved_bytes": torch.cuda.max_memory_reserved(self.device),
-            }
-        else:
-            peak_memory = {"available": False, "device": str(self.device)}
+        synchronize(self.device)
+        peak_memory: dict[str, object] = accelerator_memory_snapshot(self.device)
 
         return OfflineRunResult(
             files=file_results,

@@ -18,6 +18,7 @@ Output parity with the reference implementation was verified token-for-token and
 - [Supported input](#supported-input)
 - [How long audio is processed](#how-long-audio-is-processed)
 - [Measured performance](#measured-performance)
+- [Checking a computer or GPU](#checking-a-computer-or-gpu)
 - [Benchmarking](#benchmarking)
 - [Worker for many short files](#worker-for-many-short-files)
 - [Checkpoint preparation](#checkpoint-preparation)
@@ -49,7 +50,7 @@ The diagrams below are drawn from the code. [AGENTS.md](AGENTS.md#2-architecture
 
 ### Codebase
 
-Every command reads `config.toml` and opens the dated log first. The transcribing commands (CLI, benchmark, worker) then share one model startup (`commands/model_loading.py`), plan the work, and run it batch by batch; `prepare_checkpoint` only prepares the weights.
+Every command reads `config.toml` and opens the dated log first. The transcribing commands (CLI, benchmark, worker, doctor) then share one model startup (`commands/model_loading.py`), which decides every `"auto"` setting for the device in use, plan the work, and run it batch by batch; `prepare_checkpoint` only prepares the weights.
 
 ```mermaid
 flowchart TB
@@ -57,6 +58,7 @@ flowchart TB
         cli["inference.py<br/>commands/inference.py"]
         bench["commands/benchmark.py"]
         worker["commands/worker.py<br/>JSON Lines on stdin and stdout"]
+        doctor["commands/doctor.py<br/>environment, accuracy, speed"]
         prepare["commands/prepare_checkpoint.py"]
     end
 
@@ -66,13 +68,14 @@ flowchart TB
     end
 
     subgraph startup["Model startup: commands/model_loading.py prepare_inference_model"]
-        device["runtime/device.py<br/>device, encoder precision,<br/>float16 accumulation"]
+        device["runtime/device.py<br/>torch.accelerator device,<br/>auto precision"]
         bootstrap["checkpoint/bootstrap.py<br/>readiness gate"]
         orchestration["checkpoint/orchestration.py<br/>download, verify, convert"]
         derived["checkpoint/derived.py<br/>model.encoder-float16.pth"]
         loader["models/parakeet.py load_model<br/>strict, memory-mapped,<br/>BatchNorm folded"]
-        graphs["enable_graph_decoding<br/>CUDA Graph buffers"]
-        budget["inference/budget.py<br/>VRAM cap and batch budget"]
+        accumulation["float16 accumulation<br/>auto: measured on this GPU"]
+        budget["inference/budget.py<br/>VRAM cap, chunks that fit,<br/>batch rows"]
+        graphs["enable_graph_decoding<br/>CUDA Graph for those rows"]
     end
 
     subgraph run["Transcription: inference/offline.py OfflineTranscriber"]
@@ -85,19 +88,20 @@ flowchart TB
         tokenizer["text/tokenization.py<br/>BPE decode"]
     end
 
-    output["CSV, terminal, JSON line,<br/>metrics/benchmark_DATE.jsonl"]
+    output["CSV, terminal, JSON line,<br/>metrics/benchmark_DATE.jsonl,<br/>metrics/doctor_DATE.jsonl"]
 
     cli --> settings
     bench --> settings
     worker --> settings
+    doctor --> settings
     prepare --> settings
     settings --> logs
     logs -- "prepare_checkpoint" --> orchestration
     logs -- "transcribing commands" --> device --> bootstrap
     bootstrap -- "not ready" --> orchestration
     orchestration --> derived
-    bootstrap -- "ready" --> derived --> loader --> graphs --> budget
-    budget --> planner --> media --> features --> model
+    bootstrap -- "ready" --> derived --> loader --> accumulation --> budget --> graphs
+    graphs --> planner --> media --> features --> model
     model --> recovery
     recovery -- "shifted windows" --> features
     model --> merging
@@ -306,11 +310,12 @@ On CUDA the whole step runs as one replayed CUDA Graph (`models/graphed_decoding
 ## Requirements
 
 - **Python 3.11 or newer.** The code uses `tomllib` and `enum.StrEnum`. It was developed and tested with Python 3.13.
-- **PyTorch.** Any build for your platform: CUDA, Apple MPS, or CPU. The device is chosen automatically. Development used PyTorch 2.14 with CUDA 13.2.
+- **PyTorch.** Any build for your platform: CUDA, Apple MPS, or CPU. The device is chosen automatically through `torch.accelerator`, so other accelerators PyTorch supports (Intel XPU, AMD ROCm) are picked up too, untested. Development used PyTorch 2.14 with CUDA 13.2.
+- **NVIDIA GPUs:** any GPU the installed PyTorch build has kernels for; startup refuses one it has not and says why. GPUs with tensor cores (compute capability 7.0 and newer, GeForce 20 series onward) run the encoder in float16; older ones run float32. Only the RTX 3050 Ti Laptop GPU has been measured; run the [doctor command](#checking-a-computer-or-gpu) on any other.
 - **soundfile** (libsndfile) for decoding WAV, FLAC, OGG, MP3 and the other formats libsndfile supports. It installs NumPy with it.
 - **FFmpeg (optional).** Only needed for formats libsndfile cannot read, such as M4A/AAC, Opus in MP4/WebM, or audio inside video files. `ffmpeg` and `ffprobe` are found through `PATH`, or through the `FFMPEG_BINARY` and `FFPROBE_BINARY` environment variables.
 - **Disk:** about 3.7 GB for the checkpoint directory after the first run: the 2.5 GB `model.pth` and the 1.2 GB `model.encoder-float16.pth` built from it. During the first run the 2.5 GB `model.safetensors` download is there too (6.2 GB in total); it is deleted once `model.pth` has loaded, unless `checkpoint.keep_safetensors = true`.
-- **GPU memory:** with the default float16 encoder the weights take about 1.2 GB on the device (2.4 GB in float32). Transcription peaked at about 2.0 GB with the default settings on a 4 GB laptop GPU; the batch size adapts to the free memory. See [Measured performance](#measured-performance).
+- **GPU memory:** with the default float16 encoder the weights take about 1.2 GB on the device (2.4 GB in float32). The batch size adapts to the free memory: on a 4 GB laptop GPU it picked 23 chunks per batch and peaked at about 2.4 GB allocated. See [Measured performance](#measured-performance).
 
 ## Installation
 
@@ -464,13 +469,13 @@ All settings live in `config.toml` at the repository root. Every key is required
 
 | Key | Default | Meaning |
 |---|---|---|
-| `batch_size` | `16` | Maximum chunks per micro-batch. |
+| `batch_size` | `"auto"` | Maximum chunks per micro-batch. `"auto"`: 70% of the full chunks that fit in the free GPU memory (measured at startup), at most 64; 16 on the CPU, on other accelerators, or with `memory.auto_batch_budget = false`. A number is lowered to what fits. |
 | `recursive` | `true` | Include subfolders in folder mode. |
 | `output_filename` | `"transcriptions.csv"` | CSV name inside the input folder. Must be a plain file name. |
 | `audio_extensions` | `[]` | Optional suffix allow-list such as `[".wav", ".mp3"]`. Empty means every file is probed by content. |
 | `max_chunk_feature_frames` | `1500` | Hard limit on one chunk's feature frames, including overlap. At a 10 ms hop that is 15 s of audio. |
 | `overlap_feature_frames` | `50` | Context added on each side of a chunk (0.5 s). May be 0. `max_chunk_feature_frames` must be greater than twice this value. |
-| `max_batch_feature_frames` | `24000` | Upper limit on a batch's padded size: rows times the longest row. Must be at least `max_chunk_feature_frames`. With `memory.auto_batch_budget` it is lowered at startup to what fits in the free GPU memory, never raised. |
+| `max_batch_feature_frames` | `"auto"` | Upper limit on a batch's padded size: rows times the longest row. `"auto"`: what the batch rows need. A number must be at least `max_chunk_feature_frames`; with `memory.auto_batch_budget` it is lowered at startup to what fits in the free GPU memory, never raised. |
 | `max_padding_fraction` | `0.25` | The largest share of a batch that may be padding, between 0 and 1. |
 | `merge_tolerance_feature_frames` | `100` | How far apart (1.0 s) two neighboring chunks may place the same word and still be recognized as one word at the seam. `0` disables seam alignment. |
 | `untranscribed_gap_seconds` | `4.0` | A stretch of a chunk this long with no word, and not silent, is treated as a possible decoder collapse and re-decoded. |
@@ -478,20 +483,22 @@ All settings live in `config.toml` at the repository root. Every key is required
 | `recovery_start_offsets_feature_frames` | `[-25, 25, -50, 50]` | Window-start shifts tried, in order, when re-decoding a collapsed chunk. Each must be at most `overlap_feature_frames` in size. An empty list disables recovery. |
 | `progress_interval_seconds` | `2.0` | Minimum time between two progress lines. The final line is always printed. |
 | `max_open_files` | `8` | Most decoders of multi-chunk files open at the same time, and the most such files in progress. Each decoder is a file handle (or an `ffmpeg` process) holding an overlap tail until its last chunk. A long file gets several decoders only while fewer files are in progress. Single-chunk files do not count. At least 1. |
-| `encoder_precision` | `"float16"` | `"float16"` or `"float32"`. Float16 runs the encoder about 2.8 times faster and halves its weights; the decoder and joint stay float32. Used on CUDA only; CPU and MPS run float32. |
+| `encoder_precision` | `"auto"` | `"auto"`, `"float16"`, or `"float32"`. Float16 runs the encoder about 2.8 times faster and halves its weights; the decoder and joint stay float32. `"auto"`: float16 on NVIDIA GPUs with tensor cores, float32 elsewhere. `"float16"` is used on any NVIDIA GPU; the CPU and other accelerators always run float32. |
 | `cuda_graphs` | `true` | Replay each greedy decoding step as one captured CUDA Graph instead of about 46 kernel launches. Same output; CUDA only. |
 | `float32_matmul_precision` | `"highest"` | `"highest"` (exact float32) or `"high"` (TF32 tensor cores on NVIDIA Ampere and newer). With `encoder_precision = "float32"`, `"high"` was 13% faster end to end with the same word error rate. |
-| `float16_accumulation` | `true` | With the float16 encoder on CUDA, matrix products also add in float16. The encoder ran 1.17 times faster, and corpus word error rate was 6.66% against 6.67% without it. Ignored for a float32 encoder. |
-| `decode_workers` | `4` | Threads that decode and resample audio while the GPU runs. A long file that libsndfile reads is dealt to several decoders in blocks, so each batch is decoded in parallel; chunks of different files are decoded in parallel too. Files decoded through `ffmpeg` keep one decoder each. At least 1. |
+| `float16_accumulation` | `"auto"` | With the float16 encoder on CUDA, matrix products also add in float16. The encoder ran 1.17 times faster, and corpus word error rate was 6.66% against 6.67% without it. `"auto"`: a benchmark of under a second at startup turns it on only where it is at least 5% faster (1.7 to 1.8 times on the RTX 3050 Ti); `true` or `false` sets it. Ignored for a float32 encoder. |
+| `decode_workers` | `"auto"` | Threads that decode and resample audio while the GPU runs. A long file that libsndfile reads is dealt to several decoders in blocks, so each batch is decoded in parallel; chunks of different files are decoded in parallel too. Files decoded through `ffmpeg` keep one decoder each. `"auto"`: one per four logical CPUs, 1 to 8 (4 on a 16-thread laptop CPU, the fastest measured there). |
+
+Every `"auto"` decision is written to the run log with its reason; `python -m src.commands.doctor` prints them.
 
 ### `[memory]`
 
-GPU only; CPU and MPS ignore it.
+NVIDIA GPUs only; the CPU and other accelerators ignore it.
 
 | Key | Default | Meaning |
 |---|---|---|
 | `cap_to_free_memory` | `true` | After loading, cap PyTorch's GPU allocator at the memory that is actually free. On Windows the NVIDIA driver otherwise moves allocations that do not fit in VRAM into shared system memory, and the run continues several times slower instead of failing. |
-| `auto_batch_budget` | `true` | Measure one and three full chunks at startup and lower `inference.max_batch_feature_frames` to what fits under the cap. |
+| `auto_batch_budget` | `true` | Measure one full chunk and a batch of eight (or three, when eight do not fit) at startup: how many full chunks fit under the cap. `inference.batch_size = "auto"` is chosen from it, and configured numbers are lowered to it. |
 | `reserve_mib` | `256` | GPU memory to leave free under the cap, for kernels loaded later and other programs. When less than this is free, the run uses the physically free memory and prints a warning instead of refusing. At least 0. |
 
 If not even one full chunk fits in the free GPU memory, the run stops before the first batch and says so. Close other programs that use the GPU, or lower `inference.max_chunk_feature_frames`. If a run still stops with an out-of-memory error, raise `reserve_mib` or lower `inference.max_batch_feature_frames`; the error message names these keys.
@@ -532,33 +539,58 @@ The batch budget is fitted to the free GPU memory before the first batch (see [`
 
 ## Measured performance
 
-These numbers come from one machine: an NVIDIA GeForce RTX 3050 Ti Laptop GPU with 4 GB, PyTorch 2.14 + CUDA 13.2, Windows 11, and default settings (float16 encoder, CUDA Graph decoding, automatic batch budget). They show what this hardware achieved, not a guarantee for other hardware. A laptop GPU's clock also varies with temperature by several percent between runs.
+These numbers come from one machine: an NVIDIA GeForce RTX 3050 Ti Laptop GPU with 4 GB, a 16-thread CPU, PyTorch 2.14 + CUDA 13.2, Windows 11, and the default `"auto"` settings, which there chose a float16 encoder with float16 accumulation, 23 chunks per batch, and 4 decode threads. They show what this hardware achieved, not a guarantee for other hardware; see [Checking a computer or GPU](#checking-a-computer-or-gpu). A laptop GPU's clock also varies with temperature by several percent between runs.
 
 | Workload | Audio | Wall-clock | Real-time factor | Peak VRAM allocated |
 |---|---|---|---|---|
-| One MP3, 48 kHz stereo | 36 min (2163 s) | 4.0 s | 0.0019 | 2033 MiB |
-| One MP3, 48 kHz stereo | 74 min (4420 s) | 7.9 s | 0.0018 | 2033 MiB |
-| The 36-minute recording as M4A (AAC, through FFmpeg, one decoder) | 36 min (2163 s) | 4.6 s | 0.0021 | 2033 MiB |
-| Folder: 15 short WAV + both MP3s, benchmark command, 3 rounds | 112.6 min | 11.92 s (spread 0.23 s) | 0.0018 | 2033 MiB |
+| One MP3, 48 kHz stereo | 36 min (2163 s) | 4.0 s | 0.0019 | 2374 MiB |
+| One MP3, 48 kHz stereo | 74 min (4420 s) | 7.5 s | 0.0017 | 2374 MiB |
+| The 36-minute recording as M4A (AAC, through FFmpeg, one decoder) | 36 min (2163 s) | 4.15 s | 0.0019 | 2374 MiB |
+| Folder: 15 short WAV + both MP3s, benchmark command, 3 rounds | 112.6 min | 11.14 s (spread 0.34 s) | 0.0017 | 2373 MiB |
 
-The same 112.6-minute folder took 97.4 s with the earlier float32 settings (2 chunks per batch, no CUDA Graph, no decode prefetch), and 19.06 s before parallel decoding, float16 accumulation, the leaner encoder, and in-memory collapse recovery. Word error rate against the labeled transcripts in that folder:
+The same 112.6-minute folder took 97.4 s with the earlier float32 settings (2 chunks per batch, no CUDA Graph, no decode prefetch), 19.06 s before parallel decoding, float16 accumulation, the leaner encoder, and in-memory collapse recovery, and 11.92 s with 16 chunks per batch before the automatic batch size. Word error rate against the labeled transcripts in that folder:
 
 | Settings | Corpus WER | 36-min podcast | 74-min podcast |
 |---|---|---|---|
-| Default (float16 encoder, float16 accumulation) | 6.66% | 7.39% | 6.29% |
+| Default (`"auto"`: float16 encoder, float16 accumulation, 23 chunks per batch) | 6.65% | 7.40% | 6.26% |
+| 16 chunks per batch (float16 encoder, float16 accumulation) | 6.66% | 7.39% | 6.29% |
 | Before this release's speed changes (float16 encoder) | 6.67% | 7.42% | 6.29% |
 | `encoder_precision = "float32"` | 6.63% | 7.43% | 6.22% |
 | Hugging Face `ParakeetForTDT` pipeline, 15 s chunks without overlap | | 9.94% | 8.45% |
 
 The Hugging Face pipeline's default chunking (with overlap) repeats the overlapped speech in its transcript (52% WER) and cannot run either podcast in one piece on a 4 GB card (it ran out of memory above 3 minutes).
 
-- **Where the time goes** (112.6-minute folder): generation 10.1 s, mostly the encoder (per 16-chunk batch about 0.27 s of encoder against about 0.05 s of graph-replayed decoding loop); media decoding about 6.5 s of batch time on four threads, hidden behind the GPU work; collapse recovery about 0.7 s (14 of 486 chunks re-decoded). The GPU is the limit: the 74-minute file spends 6.5 s of its 7.9 s in the model.
+- **Where the time goes** (112.6-minute folder): generation 9.2 s, mostly the encoder (per 16-chunk batch about 0.27 s of encoder against about 0.05 s of graph-replayed decoding loop); media decoding about 7.2 s of batch time on four threads, hidden behind the GPU work; collapse recovery about 0.7 s (14 of 486 chunks re-decoded). The GPU is the limit.
 - **Short files:** one `inference.py` run on a 9-second clip takes about 6 s, almost all of it startup. The [worker](#worker-for-many-short-files) answered such clips in 0.12 s each after a 5.2 s start.
 - **Model load:** about 2.1 s once the checkpoint and its float16 file are prepared and in the OS cache.
 - **Memory does not grow with length:** peak VRAM was the same for the 36- and 74-minute files.
 - **Process memory:** about 2.0 GB peak, most of it the memory-mapped checkpoint while it is copied to the GPU.
 
 CPU and Apple MPS execution is supported by the code but has not been benchmarked.
+
+## Checking a computer or GPU
+
+Performance and even float16 results depend on the GPU, and only one has been measured. On any other computer, run:
+
+```powershell
+venv\Scripts\python.exe -m src.commands.doctor
+```
+
+It prints what PyTorch sees, what startup decided for every `"auto"` setting and why, whether the five committed LibriSpeech clips transcribe within the test suite's accuracy budget (4.6% word error rate), and the encoder's speed on full 15-second chunks. It appends the same as one JSON line to `metrics/doctor_<YYYY-MM-DD>.jsonl`, and exits with 0 only when the accuracy check passed. On the RTX 3050 Ti Laptop GPU:
+
+```text
+GPU: NVIDIA GeForce RTX 3050 Ti Laptop GPU, compute capability 8.6
+Kernels for this GPU in the PyTorch build: yes (built for sm_75, sm_80, sm_86, sm_90, sm_100, sm_120)
+Tensor cores: yes
+Encoder precision: float16 encoder, float32 decoder and joint (auto: tensor cores, compute capability 8.6)
+Float16 accumulation: on (auto: matrix products 1.68x faster with it on this GPU)
+Batch rows: 23 (auto: 70% of the 34 full chunks that fit, at most 64)
+Decode workers: 4 (auto: one per four logical CPUs)
+Accuracy check: passed, word error rate 3.67 percent (budget 4.6), 5 of 5 transcripts identical to the reference GPU
+Encoder throughput: 61.7 full chunks per second (925 s of audio per second) at 23 rows
+```
+
+"Kernels for this GPU ... NO" means the installed PyTorch build does not support the GPU (for example a GeForce 10 series card on a build for compute capability 7.5 and newer); install a build that does, see [Installation](#installation). A transcript that differs from the reference GPU is not by itself an error: float16 results can move by a word between GPUs. The word error rate decides.
 
 ## Benchmarking
 
@@ -691,17 +723,17 @@ config.toml                   All runtime settings
 src/
   audio/                      Media probing and decoding (media.py), resampling (resampling.py), log-mel features (features.py)
   checkpoint/                 Download and verification, safetensors -> model.pth, readiness marker, float16 encoder file (derived.py)
-  commands/                   Entry points (inference.py, prepare_checkpoint.py, benchmark.py, worker.py), shared model startup (model_loading.py), progress reporting
+  commands/                   Entry points (inference.py, prepare_checkpoint.py, benchmark.py, worker.py, doctor.py), shared model startup and "auto" decisions (model_loading.py), progress reporting
   configuration/              Checkpoint JSON validation (config.py), config.toml settings (settings.py)
   inference/                  Chunk planning (planning.py), orchestration (offline.py), seam merging (merging.py), collapse recovery (recovery.py), memory budget (budget.py)
   models/                     Subsampling, attention, Conformer blocks, encoder, LSTM decoder, joint, TDT loop, CUDA Graph decoding (graphed_decoding.py)
-  runtime/                    Device selection and report, dated logging, atomic file writes, process and GPU memory
-  text/                       Tokenizer decoding from tokenizer.json
+  runtime/                    Device selection (torch.accelerator), GPU capability and precision decisions, dated logging, atomic file writes, process and accelerator memory
+  text/                       Tokenizer decoding from tokenizer.json, word error rate scoring (scoring.py)
 tests/
   unit/                       Fast isolated tests (tiny fixture checkpoint)
   regression/                 One test per fixed defect
   full/                       Real checkpoint and real speech, end to end
-  data/librispeech/           Five CC BY 4.0 speech clips with expected transcripts
+  data/librispeech/           Five CC BY 4.0 speech clips with expected transcripts (also used by the doctor command)
 ```
 
 [AGENTS.md](AGENTS.md) documents the architecture, invariants, and development rules in depth.
