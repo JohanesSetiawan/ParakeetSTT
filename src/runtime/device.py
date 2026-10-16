@@ -137,18 +137,24 @@ def synchronize(device: torch.device) -> None:
         torch.accelerator.synchronize(device)
 
 
+# What device_family returns for the two kinds of "cuda" device.
+NVIDIA_FAMILY = "NVIDIA"
+ROCM_FAMILY = "ROCm"
+
+
 def device_family(device: torch.device) -> str:
     """
     Short name of the device for messages.
 
-    "NVIDIA" for NVIDIA GPUs, "ROCm" for AMD GPUs (which PyTorch also calls
-    "cuda"), otherwise the device type ("cpu", "mps", "xpu", ...).
+    ``NVIDIA_FAMILY`` for NVIDIA GPUs, ``ROCM_FAMILY`` for AMD GPUs (which
+    PyTorch also calls "cuda"), otherwise the device type ("cpu", "mps",
+    "xpu", ...).
     """
 
     if is_nvidia_gpu(device):
-        return "NVIDIA"
+        return NVIDIA_FAMILY
     if device.type == "cuda":
-        return "ROCm"
+        return ROCM_FAMILY
     return device.type
 
 
@@ -403,9 +409,8 @@ def describe_runtime(device: torch.device, dtype: torch.dtype) -> RuntimeReport:
         device_count = 1
         device_name = platform.processor() or platform.machine()
     else:
-        family = device_family(device)
-        if family == "ROCm":
-            accelerator = family
+        if device_family(device) == ROCM_FAMILY:
+            accelerator = ROCM_FAMILY
         else:
             accelerator = device.type.upper()
         device_count = torch.accelerator.device_count()

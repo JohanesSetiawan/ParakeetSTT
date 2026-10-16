@@ -285,6 +285,39 @@ def test_calibration_skips_larger_batches_it_is_not_allowed(tmp_path: Path) -> N
     assert roomy == (1100 * MIB, 1800 * MIB, 8, 1000 * MIB)
 
 
+def test_capped_calibration_falls_back_to_three_rows_when_eight_run_out_of_memory(tmp_path: Path) -> None:
+    """With the cap (the default) every larger batch is tried; the one that does not fit fails and is caught."""
+
+    from src.inference import budget as budget_module
+
+    configuration = load_config(write_tiny_checkpoint(tmp_path))
+    tried: list[int] = []
+
+    def fake_peak(_model, _extractor, _waveform, rows, _rate, _device):
+        tried.append(rows)
+        if rows == 8:
+            raise torch.OutOfMemoryError("CUDA out of memory")
+        return {1: 1100 * MIB, 3: 1300 * MIB}[rows]
+
+    with (
+        patch.object(budget_module, "_peak_reserved_for_rows", side_effect=fake_peak),
+        patch.object(budget_module.torch.accelerator, "memory_reserved", return_value=1000 * MIB),
+        patch.object(budget_module.torch.accelerator, "empty_cache") as empty_cache,
+    ):
+        calibrated = budget_module._calibrate(
+            None,
+            configuration,
+            inference_settings(),
+            torch.device("cuda"),
+            larger_batch_allowed=lambda _predicted: True,
+        )
+
+    assert tried == [1, 8, 3]
+    assert calibrated == (1100 * MIB, 1300 * MIB, 3, 1000 * MIB)
+    # The failed batch's blocks are released before the next one is measured.
+    assert empty_cache.call_count >= 2
+
+
 @pytest.mark.parametrize(
     ("capped", "predicted_mib", "allowed"),
     [

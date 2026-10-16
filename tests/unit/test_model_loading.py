@@ -121,14 +121,16 @@ def test_rows_lowered_for_the_decoder_are_measured_again() -> None:
     assert enabled_rows == [10, 7, 6]
 
 
-def test_a_decoder_build_that_runs_out_of_memory_is_retried_with_one_row() -> None:
-    """Review finding: an out-of-memory capture under the cap crashed startup instead of falling back."""
+def test_a_decoder_build_that_runs_out_of_memory_is_retried_with_half_the_rows() -> None:
+    """Review findings: an out-of-memory capture crashed startup, then dropped straight to one row."""
 
-    on, resolved, warning, enabled_rows, model = run_graph_budget(measured_budget(2, per_chunk_mib=43), 2, [None, 20])
+    # 23 rows run out of memory; 11 rows build with 60 MiB (2 chunks of 29), leaving 27 >= 11.
+    on, resolved, warning, enabled_rows, model = run_graph_budget(measured_budget(29), 23, [None, 60])
 
-    assert (on, resolved.batch_size, warning) == (True, 1, "")
-    assert enabled_rows == [2, 1]
-    assert model.graph_decoder == "decoder for 1"
+    assert (on, resolved.batch_size, warning) == (True, 11, "")
+    assert resolved.max_batch_feature_frames == 11 * CHUNK
+    assert enabled_rows == [23, 11]
+    assert model.graph_decoder == "decoder for 11"
 
 
 def test_graph_decoding_is_turned_off_when_even_the_one_row_build_runs_out_of_memory() -> None:
