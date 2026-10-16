@@ -39,7 +39,7 @@ MIB = 2**20
 # chosen from it ran out of memory. Measured growth per row on the reference
 # GPU (float16 encoder): 53 MiB from 1 to 3 rows, 55 from 1 to 8, 59 from 8 to
 # 16, 63 from 16 to 24. It still grows a little with the batch (larger
-# allocator blocks), which AUTO_BATCH_MEMORY_SHARE leaves room for.
+# allocator blocks), which memory.auto_batch_memory_share leaves room for.
 CALIBRATION_ONE_ROW = 1
 CALIBRATION_MORE_ROWS = (8, 3)
 
@@ -47,24 +47,6 @@ CALIBRATION_MORE_ROWS = (8, 3)
 # decoding loop runs a realistic number of steps.
 CALIBRATION_AMPLITUDE = 0.05
 
-# batch_size = "auto" uses this share of the full chunks that fit. The rest
-# covers what the calibration cannot see: memory per row grows a little with
-# the batch (55 MiB per row measured from 1 to 8 rows, about 60 from 16 to 31),
-# and allocator fragmentation across batches. On the reference 4 GB GPU 34
-# chunks fit by the calibration, and "auto" picks 23. 31 rows ran out of
-# memory there in the second batch of a long file.
-AUTO_BATCH_MEMORY_SHARE = 0.7
-
-# Most rows "auto" picks on large GPUs. 64 full chunks are about 12 000
-# encoder frames per matrix product, beyond what tensor cores need to run at
-# full speed, while the decoded audio and decoding buffers held per batch
-# keep growing with the rows.
-AUTO_BATCH_ROWS_LIMIT = 64
-
-# Rows for batch_size = "auto" when nothing was measured: CPU, Apple MPS and
-# other accelerators, or [memory] auto_batch_budget = false. 16 was the
-# default batch size on the reference GPU.
-UNMEASURED_BATCH_ROWS = 16
 
 
 @dataclass(frozen=True)
@@ -240,7 +222,13 @@ def resolve_memory_budget(
     # Calibrate under the physical limit so the measurement cannot spill.
     if memory.cap_to_free_memory:
         cap_allocator(device, before.ceiling(0), before.total)
-    peak_one, peak_more, calibration_rows, baseline = _calibrate(model, configuration, inference, device)
+    peak_one, peak_more, calibration_rows, baseline = _calibrate(
+        model,
+        configuration,
+        inference,
+        device,
+        physical_limit=before.ceiling(0),
+    )
 
     # Loading kernels and library workspaces during calibration grew the CUDA
     # context outside the allocator, so measure the free memory again.
@@ -295,9 +283,17 @@ def _calibrate(
     configuration: ParakeetConfig,
     inference: InferenceSettings,
     device: torch.device,
+    *,
+    physical_limit: int,
 ) -> tuple[int, int, int, int]:
     """
     Peak reserved memory for one and for several full-length chunks.
+
+    A larger batch is tried only when the one-row cost, charged per row,
+    predicts that it stays within ``physical_limit`` (the memory PyTorch
+    could reserve without exceeding the free VRAM). Without the allocator
+    cap (``memory.cap_to_free_memory = false``) an oversized batch would not
+    fail on Windows but spill into system memory and measure as if it fit.
 
     Returns:
         ``(peak with one row, peak with more rows, rows of the second run,
@@ -324,7 +320,10 @@ def _calibrate(
             ) from error
         # Too tight for every larger batch: one row is the budget.
         peak_more, calibration_rows = peak_one, CALIBRATION_ONE_ROW
+        one_row_cost = max(1, peak_one - baseline)
         for rows in CALIBRATION_MORE_ROWS:
+            if peak_one + (rows - 1) * one_row_cost > physical_limit:
+                continue
             try:
                 peak_more = _peak_reserved_for_rows(model, extractor, waveform, rows, sample_rate, device)
             except torch.OutOfMemoryError:
@@ -371,17 +370,17 @@ def _rows_under_ceiling(
 # =============================================================================
 
 
-def batch_rows_for(inference: InferenceSettings, budget: MemoryBudget) -> int:
+def batch_rows_for(inference: InferenceSettings, budget: MemoryBudget, memory: MemorySettings) -> int:
     """
     Rows per batch for this run.
 
     A configured ``batch_size`` is kept, lowered to the full chunks that fit
-    when that was measured. ``"auto"`` takes ``AUTO_BATCH_MEMORY_SHARE`` of
-    the chunks that fit, at most ``AUTO_BATCH_ROWS_LIMIT``; without a
-    measurement it is ``UNMEASURED_BATCH_ROWS``. Larger batches were never
-    slower on the reference GPU (8, 16, and 24 rows: 8.9, 8.0, and 7.8 s for
-    a 74-minute file), because the decoding loop's per-batch cost is shared
-    by more chunks.
+    when that was measured. ``"auto"`` takes ``memory.auto_batch_memory_share``
+    of the chunks that fit, at most ``memory.auto_batch_max_rows``; without a
+    measurement it is ``memory.unmeasured_batch_rows``. Larger batches were
+    never slower on the reference GPU (8, 16, and 24 rows: 8.9, 8.0, and
+    7.8 s for a 74-minute file), because the decoding loop's per-batch cost
+    is shared by more chunks.
 
     Returns:
         At least one row.
@@ -393,8 +392,9 @@ def batch_rows_for(inference: InferenceSettings, budget: MemoryBudget) -> int:
             return inference.batch_size
         return max(1, min(inference.batch_size, fit))
     if fit is None:
-        return UNMEASURED_BATCH_ROWS
-    return max(1, min(AUTO_BATCH_ROWS_LIMIT, math.floor(fit * AUTO_BATCH_MEMORY_SHARE)))
+        return memory.unmeasured_batch_rows
+    share_of_fit = math.floor(fit * memory.auto_batch_memory_share)
+    return max(1, min(memory.auto_batch_max_rows, share_of_fit))
 
 
 def rows_after_reserving(budget: MemoryBudget, rows: int, reserved_bytes: int) -> int:

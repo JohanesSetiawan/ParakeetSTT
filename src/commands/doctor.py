@@ -43,6 +43,7 @@ from ..runtime.device import (
     build_supports_device,
     cuda_capability,
     has_tensor_cores,
+    is_nvidia_gpu,
     select_device,
     synchronize,
 )
@@ -56,11 +57,6 @@ from .reporting import line_reporter
 logger = logging.getLogger("src.commands.doctor")
 
 CLIPS_MANIFEST = PROJECT_ROOT / "tests" / "data" / "librispeech" / "manifest.json"
-
-# The corpus word error rate the full test tier allows on these clips
-# (tests/full/test_accuracy.py): 3.67 percent measured, room for one more
-# wrong word.
-ACCURACY_WER_BUDGET = 0.046
 
 # Encoder throughput measurement: one warm-up batch, then this many timed
 # batches. The CPU gets a small batch so the check stays quick there.
@@ -92,19 +88,26 @@ def environment_facts() -> dict[str, Any]:
         "accelerator": device.type,
     }
     if device.type == "cuda":
-        capability = cuda_capability(device)
         free_bytes, total_bytes = torch.accelerator.get_memory_info(device)
         facts.update(
             {
                 "device_name": torch.cuda.get_device_name(device),
-                "compute_capability": f"{capability[0]}.{capability[1]}",
                 "build_architectures": torch.cuda.get_arch_list(),
-                "build_supports_device": build_supports_device(device),
-                "tensor_cores": has_tensor_cores(device),
                 "memory_total_mib": round(total_bytes / MIB),
                 "memory_free_mib": round(free_bytes / MIB),
             }
         )
+    if is_nvidia_gpu(device):
+        capability = cuda_capability(device)
+        facts.update(
+            {
+                "compute_capability": f"{capability[0]}.{capability[1]}",
+                "build_supports_device": build_supports_device(device),
+                "tensor_cores": has_tensor_cores(device),
+            }
+        )
+    elif device.type == "cuda":
+        facts["rocm"] = torch.version.hip
     return facts
 
 
@@ -117,15 +120,21 @@ def environment_lines(facts: dict[str, Any]) -> list[str]:
         f"PyTorch: {facts['pytorch']}, CUDA runtime: {facts['cuda_runtime'] or 'not available'}",
         f"Accelerator: {facts['accelerator']}",
     ]
-    if facts["accelerator"] == "cuda":
+    if "compute_capability" in facts:
         supported = "yes" if facts["build_supports_device"] else "NO"
         lines += [
             f"GPU: {facts['device_name']}, compute capability {facts['compute_capability']}",
             f"Kernels for this GPU in the PyTorch build: {supported} "
             f"(built for {', '.join(facts['build_architectures'])})",
             f"Tensor cores: {'yes' if facts['tensor_cores'] else 'no'}",
-            f"GPU memory: {facts['memory_free_mib']} MiB free of {facts['memory_total_mib']} MiB",
         ]
+    elif "rocm" in facts:
+        lines += [
+            f"GPU: {facts['device_name']} (ROCm {facts['rocm']})",
+            f"Architectures in the PyTorch build: {', '.join(facts['build_architectures'])}",
+        ]
+    if "memory_total_mib" in facts:
+        lines.append(f"GPU memory: {facts['memory_free_mib']} MiB free of {facts['memory_total_mib']} MiB")
     return lines
 
 
@@ -154,6 +163,8 @@ def check_accuracy(prepared: PreparedModel, report: Callable[[str], None]) -> di
         return {"passed": False, "reason": f"missing {CLIPS_MANIFEST}"}
 
     manifest = json.loads(CLIPS_MANIFEST.read_text(encoding="utf-8"))
+    # The same budget the full test tier applies (tests/full/test_accuracy.py).
+    budget = float(manifest["corpus_wer_budget"])
     clips = manifest["clips"]
     paths = [CLIPS_MANIFEST.parent / clip["file"] for clip in clips]
     for clip, path in zip(clips, paths, strict=True):
@@ -190,10 +201,10 @@ def check_accuracy(prepared: PreparedModel, report: Callable[[str], None]) -> di
         [by_name[clip["file"]].transcript for clip in clips],
     )
     all_ok = all(by_name[clip["file"]].status is FileStatus.OK for clip in clips)
-    passed = all_ok and wer <= ACCURACY_WER_BUDGET
+    passed = all_ok and wer <= budget
     report(
         f"Accuracy check: {'passed' if passed else 'FAILED'}, word error rate {100 * wer:.2f} percent "
-        f"(budget {100 * ACCURACY_WER_BUDGET:.1f}), {sum(entry['same_as_reference_gpu'] for entry in per_clip)} "
+        f"(budget {100 * budget:.1f}), {sum(entry['same_as_reference_gpu'] for entry in per_clip)} "
         f"of {len(clips)} transcripts identical to the reference GPU"
     )
     audio_seconds = sum(clip["duration_seconds"] for clip in clips)
@@ -201,7 +212,7 @@ def check_accuracy(prepared: PreparedModel, report: Callable[[str], None]) -> di
     return {
         "passed": passed,
         "word_error_rate": wer,
-        "budget": ACCURACY_WER_BUDGET,
+        "budget": budget,
         "clips": per_clip,
         "audio_seconds": audio_seconds,
         "processing_seconds": seconds,

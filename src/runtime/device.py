@@ -16,6 +16,7 @@ from __future__ import annotations
 import logging
 import os
 import platform
+import re
 import statistics
 import time
 from dataclasses import dataclass
@@ -30,12 +31,20 @@ logger = logging.getLogger(__name__)
 # at all, so "auto" keeps them in float32.
 TENSOR_CORE_CAPABILITY = (7, 0)
 
+# The Turing chips TU116 and TU117 have no tensor cores but the same compute
+# capability (7.5) as the RTX 20 series, which has them; only the product
+# name tells them apart: GeForce GTX 16xx, GeForce MX450 and MX550, and the
+# T400, T600, T1000, T1200, and T2000 workstation cards.
+TURING_CAPABILITY = (7, 5)
+TURING_WITHOUT_TENSOR_CORES = re.compile(r"GTX 16\d\d|\bMX[45]50\b|\bT(?:400|600|1000|1200|2000)\b")
+
 # float16 accumulation is turned on by "auto" only when it makes the
-# encoder's matrix products at least this much faster on the GPU in use. On
-# GeForce GPUs it measured 1.42 to 1.84 times; GPUs whose tensor cores
-# already accumulate float32 at full rate gain nothing, and then the more
-# precise float32 accumulation is kept.
-FLOAT16_ACCUMULATION_MIN_SPEEDUP = 1.05
+# encoder's matrix products at least this much faster on the GPU in use. The
+# RTX 3050 Ti measured 1.68 to 1.84 times across runs; a GPU that already
+# accumulates float32 at full rate is expected near 1.0. A threshold far from
+# both keeps the decision, and with it the transcripts, the same from run to
+# run on one GPU instead of flipping with clock speed.
+FLOAT16_ACCUMULATION_MIN_SPEEDUP = 1.25
 
 # Rows of the float16 accumulation microbenchmark: 16 full chunks of 188
 # encoder frames, the encoder's largest matrix products at the default batch.
@@ -128,19 +137,34 @@ def synchronize(device: torch.device) -> None:
         torch.accelerator.synchronize(device)
 
 
-def cuda_capability(device: torch.device) -> tuple[int, int] | None:
-    """The CUDA compute capability, or None for any other device."""
+def is_nvidia_gpu(device: torch.device) -> bool:
+    """
+    Whether the device is an NVIDIA GPU.
 
-    if device.type != "cuda":
+    ROCm builds of PyTorch present AMD GPUs as "cuda" devices too; their
+    compute capability and architecture names mean something else.
+    """
+
+    return device.type == "cuda" and torch.version.hip is None
+
+
+def cuda_capability(device: torch.device) -> tuple[int, int] | None:
+    """The NVIDIA compute capability, or None for any other device."""
+
+    if not is_nvidia_gpu(device):
         return None
     return torch.cuda.get_device_capability(device)
 
 
 def has_tensor_cores(device: torch.device) -> bool:
-    """Whether the device is a CUDA GPU with tensor cores (fast float16)."""
+    """Whether the device is an NVIDIA GPU with tensor cores (fast float16)."""
 
     capability = cuda_capability(device)
-    return capability is not None and capability >= TENSOR_CORE_CAPABILITY
+    if capability is None or capability < TENSOR_CORE_CAPABILITY:
+        return False
+    if capability == TURING_CAPABILITY and TURING_WITHOUT_TENSOR_CORES.search(torch.cuda.get_device_name(device)):
+        return False
+    return True
 
 
 def build_supports_device(device: torch.device) -> bool | None:
@@ -152,7 +176,8 @@ def build_supports_device(device: torch.device) -> bool | None:
     A GPU older than every entry is not supported by the build at all.
 
     Returns:
-        True or False for a CUDA device, None for other devices.
+        True or False for an NVIDIA GPU, None for other devices (ROCm builds
+        list AMD architecture names, which this check does not interpret).
     """
 
     capability = cuda_capability(device)
@@ -185,11 +210,11 @@ def encoder_dtype_for(precision: str, device: torch.device) -> tuple[torch.dtype
     """
     Resolve the configured encoder precision for the selected device.
 
-    "auto" uses float16 on CUDA GPUs with tensor cores and float32 everywhere
-    else. An explicit "float16" is used on any CUDA GPU (with a warning when
-    it has no tensor cores); other devices run float32, because CPUs lack
-    fast float16 kernels and MPS and other accelerators have not been
-    verified.
+    "auto" uses float16 on NVIDIA GPUs with tensor cores and float32
+    everywhere else. An explicit "float16" is used on any CUDA device (with a
+    warning on an NVIDIA GPU without tensor cores); other devices run
+    float32, because CPUs lack fast float16 kernels and MPS and other
+    accelerators have not been verified.
 
     Returns:
         The dtype and a one-line explanation for the terminal and log.
@@ -201,12 +226,14 @@ def encoder_dtype_for(precision: str, device: torch.device) -> tuple[torch.dtype
     if precision == "auto":
         if has_tensor_cores(device):
             return torch.float16, f"float16 encoder, float32 decoder and joint (auto: tensor cores, {capability_text})"
-        if device.type == "cuda":
+        if is_nvidia_gpu(device):
             return torch.float32, f"float32 (auto: no tensor cores, {capability_text})"
+        if device.type == "cuda":
+            return torch.float32, "float32 (auto: float16 is chosen on NVIDIA GPUs only, this is ROCm)"
         return torch.float32, f"float32 (auto: float16 is used on CUDA only, this is {device.type})"
 
     if precision == "float16" and device.type == "cuda":
-        if not has_tensor_cores(device):
+        if is_nvidia_gpu(device) and not has_tensor_cores(device):
             logger.warning("encoder_precision float16 on a GPU without tensor cores (%s)", capability_text)
             return torch.float16, f"float16 encoder, float32 decoder and joint (no tensor cores, {capability_text})"
         return torch.float16, "float16 encoder, float32 decoder and joint"
@@ -363,7 +390,12 @@ def describe_runtime(device: torch.device, dtype: torch.dtype) -> RuntimeReport:
         device_count = 1
         device_name = platform.processor() or platform.machine()
     else:
-        accelerator = "MPS" if device.type == "mps" else device.type.upper()
+        if device.type == "mps":
+            accelerator = "MPS"
+        elif device.type == "cuda" and not is_nvidia_gpu(device):
+            accelerator = "ROCm"
+        else:
+            accelerator = device.type.upper()
         device_count = torch.accelerator.device_count()
         device_name = _accelerator_device_name(device)
 

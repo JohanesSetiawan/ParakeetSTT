@@ -69,6 +69,8 @@ def test_auto_settings_are_decided_for_this_gpu_and_fit(real_model, restored_ses
     assert inference.max_batch_feature_frames == inference.batch_size * inference.max_chunk_feature_frames
     assert prepared.graph_decoding and prepared.model.graph_decoder.rows == inference.batch_size
     assert prepared.model.graph_decoder.graph is not None  # captured at startup
+    # Captured in inference mode: no autograd state in the decoder's buffers.
+    assert not prepared.model.graph_decoder.hidden_state.requires_grad
     assert inference.encoder_precision == "float16"
     assert any(line.startswith("Batch rows:") and "auto" in line for line in prepared.decisions)
     assert any(line.startswith("Float16 accumulation:") and "auto" in line for line in prepared.decisions)
@@ -135,3 +137,29 @@ def test_doctor_passes_and_records_the_machine(real_model, restored_session_mode
     assert any(line.startswith("Kernels for this GPU in the PyTorch build: yes") for line in lines)
     stored = [json.loads(line) for line in output_path.read_text(encoding="utf-8").splitlines()]
     assert [entry["run_id"] for entry in stored] == ["doctor-test"]
+
+
+@pytest.mark.cuda
+def test_a_decoder_captured_at_startup_matches_the_eager_loop(real_settings, real_model, speech_clips) -> None:
+    """Capturing on a placeholder batch at startup must replay exactly what the eager loop computes."""
+
+    import soundfile
+
+    model, configuration = real_model
+    device = next(model.parameters()).device
+    waveforms = [torch.from_numpy(soundfile.read(str(clip.path), dtype="float32")[0]) for clip in speech_clips]
+    features, mask = ParakeetFeatureExtractor(configuration)(waveforms, [16000] * len(waveforms), device)
+
+    graph_decoder = model.graph_decoder
+    assert graph_decoder is not None and graph_decoder.graph is not None
+    with torch.inference_mode():
+        graphed = model.generate(features, mask)
+        model.graph_decoder = None
+        try:
+            eager = model.generate(features, mask)
+        finally:
+            model.graph_decoder = graph_decoder
+
+    assert torch.equal(graphed.sequences, eager.sequences)
+    assert torch.equal(graphed.durations, eager.durations)
+    assert torch.equal(graphed.frame_starts, eager.frame_starts)

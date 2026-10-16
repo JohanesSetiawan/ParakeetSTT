@@ -135,7 +135,7 @@ def test_budget_is_not_applied_off_cuda(tmp_path: Path) -> None:
     configuration = load_config(write_tiny_checkpoint(tmp_path))
     model = ParakeetTDT(configuration).eval()
     settings = inference_settings(max_batch_feature_frames=300)
-    memory = MemorySettings(cap_to_free_memory=True, auto_batch_budget=True, reserve_mib=512)
+    memory = MemorySettings(cap_to_free_memory=True, auto_batch_budget=True, reserve_mib=512, auto_batch_memory_share=0.7, auto_batch_max_rows=64, unmeasured_batch_rows=16)
 
     resolved, budget = resolve_memory_budget(model, configuration, settings, memory)
 
@@ -171,6 +171,19 @@ def test_report_lines_name_the_used_and_configured_budget() -> None:
 # =============================================================================
 
 
+def memory_knobs(share: float = 0.7, max_rows: int = 64, unmeasured: int = 16) -> MemorySettings:
+    """The repository's [memory] defaults, or other values for the auto-batch knobs."""
+
+    return MemorySettings(
+        cap_to_free_memory=True,
+        auto_batch_budget=True,
+        reserve_mib=256,
+        auto_batch_memory_share=share,
+        auto_batch_max_rows=max_rows,
+        unmeasured_batch_rows=unmeasured,
+    )
+
+
 def budget_with_fit(chunks: int | None, per_chunk_mib: int = 56) -> MemoryBudget:
     return MemoryBudget(
         chunks is not None,
@@ -200,7 +213,18 @@ def test_batch_rows_follow_the_setting_and_the_measurement(batch_size, fit, expe
 
     settings = inference_settings(batch_size=batch_size, max_batch_feature_frames=None)
 
-    assert batch_rows_for(settings, budget_with_fit(fit)) == expected
+    assert batch_rows_for(settings, budget_with_fit(fit), memory_knobs()) == expected
+
+
+def test_batch_rows_use_the_configured_knobs() -> None:
+    from src.inference.budget import batch_rows_for
+
+    settings = inference_settings(batch_size=None, max_batch_feature_frames=None)
+    knobs = memory_knobs(share=0.5, max_rows=10, unmeasured=4)
+
+    assert batch_rows_for(settings, budget_with_fit(14), knobs) == 7
+    assert batch_rows_for(settings, budget_with_fit(100), knobs) == 10
+    assert batch_rows_for(settings, budget_with_fit(None), knobs) == 4
 
 
 @pytest.mark.parametrize(
@@ -234,3 +258,34 @@ def test_snapshot_reports_unavailable_statistics_instead_of_failing() -> None:
         snapshot = memory_module.accelerator_memory_snapshot(torch.device("mps"))
 
     assert snapshot == {"available": False, "device": "mps"}
+
+
+def test_calibration_skips_batches_predicted_beyond_the_free_memory(tmp_path: Path) -> None:
+    """Review finding: without the cap, an oversized calibration batch would spill instead of failing."""
+
+    from src.inference import budget as budget_module
+
+    configuration = load_config(write_tiny_checkpoint(tmp_path))
+    peaks = {1: 1100 * MIB, 3: 1300 * MIB, 8: 1800 * MIB}
+    tried: list[int] = []
+
+    def fake_peak(_model, _extractor, _waveform, rows, _rate, _device):
+        tried.append(rows)
+        return peaks[rows]
+
+    with (
+        patch.object(budget_module, "_peak_reserved_for_rows", side_effect=fake_peak),
+        patch.object(budget_module.torch.accelerator, "memory_reserved", return_value=1000 * MIB),
+        patch.object(budget_module.torch.accelerator, "empty_cache"),
+    ):
+        # One row costs 100 MiB: 8 rows are predicted at 1800 MiB, 3 at 1300.
+        tight = budget_module._calibrate(
+            None, configuration, inference_settings(), torch.device("cuda"), physical_limit=1500 * MIB
+        )
+        roomy = budget_module._calibrate(
+            None, configuration, inference_settings(), torch.device("cuda"), physical_limit=4000 * MIB
+        )
+
+    assert tried == [1, 3, 1, 8]
+    assert tight == (1100 * MIB, 1300 * MIB, 3, 1000 * MIB)
+    assert roomy == (1100 * MIB, 1800 * MIB, 8, 1000 * MIB)

@@ -129,11 +129,20 @@ class InferenceSettings:
 
 @dataclass(frozen=True)
 class MemorySettings:
-    """Accelerator memory policy: spill protection and the automatic batch budget."""
+    """
+    Accelerator memory policy: spill protection and the automatic batch budget.
+
+    ``auto_batch_memory_share``, ``auto_batch_max_rows``, and
+    ``unmeasured_batch_rows`` set how ``inference.batch_size = "auto"`` turns
+    the measured chunks that fit into rows per batch.
+    """
 
     cap_to_free_memory: bool
     auto_batch_budget: bool
     reserve_mib: int
+    auto_batch_memory_share: float
+    auto_batch_max_rows: int
+    unmeasured_batch_rows: int
 
 
 @dataclass(frozen=True)
@@ -399,10 +408,16 @@ def _parse_inference(document: dict[str, Any]) -> InferenceSettings:
 
 def _parse_memory(document: dict[str, Any]) -> MemorySettings:
     section = _section(document, "memory")
+    share = _number(section, "memory", "auto_batch_memory_share", minimum=0.0, maximum=1.0)
+    if share == 0.0:
+        raise ValueError("memory.auto_batch_memory_share must be greater than zero")
     return MemorySettings(
         cap_to_free_memory=_boolean(section, "memory", "cap_to_free_memory"),
         auto_batch_budget=_boolean(section, "memory", "auto_batch_budget"),
         reserve_mib=_integer(section, "memory", "reserve_mib", minimum=0),
+        auto_batch_memory_share=share,
+        auto_batch_max_rows=_integer(section, "memory", "auto_batch_max_rows", minimum=1),
+        unmeasured_batch_rows=_integer(section, "memory", "unmeasured_batch_rows", minimum=1),
     )
 
 

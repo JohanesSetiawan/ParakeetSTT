@@ -9,8 +9,18 @@ import pytest
 import torch
 
 from src.commands import model_loading
+from src.configuration.settings import MemorySettings
 from src.inference.budget import MemoryBudget
 from support import inference_settings
+
+KNOBS = MemorySettings(
+    cap_to_free_memory=True,
+    auto_batch_budget=True,
+    reserve_mib=256,
+    auto_batch_memory_share=0.7,
+    auto_batch_max_rows=64,
+    unmeasured_batch_rows=16,
+)
 
 MIB = 2**20
 CHUNK = 100  # max_chunk_feature_frames in the tiny settings
@@ -29,7 +39,7 @@ def cuda_model() -> SimpleNamespace:
     )
 
 
-def run_graph_budget(budget: MemoryBudget, rows: int, reserved_mib: int):
+def run_graph_budget(budget: MemoryBudget, rows: int, reserved_mib: int, one_row_reserved_mib: int | None = None):
     model = cuda_model()
     settings = inference_settings(batch_size=rows, max_batch_feature_frames=rows * CHUNK, cuda_graphs=True)
     enabled_rows: list[int] = []
@@ -39,13 +49,12 @@ def run_graph_budget(budget: MemoryBudget, rows: int, reserved_mib: int):
         target.graph_decoder = f"decoder for {resolved.batch_size}"
         return True
 
+    readings = [1000 * MIB, (1000 + reserved_mib) * MIB]
+    if one_row_reserved_mib is not None:
+        readings += [1000 * MIB, (1000 + one_row_reserved_mib) * MIB]
     with (
         patch.object(model_loading, "enable_graph_decoding", side_effect=fake_enable),
-        patch.object(
-            model_loading.torch.accelerator,
-            "memory_reserved",
-            side_effect=[1000 * MIB, (1000 + reserved_mib) * MIB],
-        ),
+        patch.object(model_loading.torch.accelerator, "memory_reserved", side_effect=readings),
         patch.object(model_loading.torch.accelerator, "empty_cache"),
     ):
         on, resolved, warning = model_loading._enable_graph_decoding_within_budget(model, settings, budget)
@@ -79,6 +88,21 @@ def test_graph_decoding_is_turned_off_when_no_chunk_fits_next_to_it() -> None:
     assert warning.startswith("Warning: CUDA Graph decoding is off")
     assert enabled_rows == [1]
     assert model.graph_decoder is None
+
+
+def test_a_one_row_decoder_is_tried_before_turning_graph_decoding_off() -> None:
+    """Review finding: graph decoding was turned off although a smaller decoder fit."""
+
+    # Two chunks fit; the two-row decoder takes 100 MiB (3 chunks), the
+    # one-row decoder 20 MiB (1 chunk), which leaves room for one row.
+    on, resolved, warning, enabled_rows, model = run_graph_budget(
+        measured_budget(2, per_chunk_mib=43), 2, 100, one_row_reserved_mib=20
+    )
+
+    assert (on, resolved.batch_size, warning) == (True, 1, "")
+    assert resolved.max_batch_feature_frames == CHUNK
+    assert enabled_rows == [2, 1]
+    assert model.graph_decoder == "decoder for 1"
 
 
 def test_unmeasured_budget_keeps_the_decoder_as_built() -> None:
@@ -125,16 +149,25 @@ def test_resolved_settings_replace_every_auto(configured_frames, rows, expected_
 
 
 @pytest.mark.parametrize(
-    ("configured_rows", "fit", "rows", "expected"),
+    ("configured_rows", "fit", "budget_rows", "rows", "expected"),
     [
-        (None, 34, 23, "Batch rows: 23 (auto: 70% of the 34 full chunks that fit, at most 64)"),
-        (None, None, 16, "Batch rows: 16 (auto: memory not measured on this device)"),
-        (16, 9, 9, "Batch rows: 9 (configured 16)"),
+        (None, 34, 23, 23, "Batch rows: 23 (auto: 70% of the 34 full chunks that fit, at most 64)"),
+        (None, None, 16, 16, "Batch rows: 16 (auto: memory not measured on this device)"),
+        (16, 29, 16, 16, "Batch rows: 16 (configured 16)"),
+        (16, 9, 9, 9, "Batch rows: 9 (configured 16, 9 full chunks fit)"),
+        (
+            None,
+            34,
+            23,
+            18,
+            "Batch rows: 18 (auto: 70% of the 34 full chunks that fit, at most 64, "
+            "lowered from 23 for the CUDA Graph decoder)",
+        ),
     ],
 )
-def test_batch_rows_line_names_the_reason(configured_rows, fit, rows, expected) -> None:
+def test_batch_rows_line_names_the_reason(configured_rows, fit, budget_rows, rows, expected) -> None:
     configured = inference_settings(batch_size=configured_rows)
     resolved = inference_settings(batch_size=rows)
     budget = MemoryBudget(fit is not None, "", None, None, fit, None, None)
 
-    assert model_loading._batch_rows_line(configured, resolved, budget) == expected
+    assert model_loading._batch_rows_line(configured, resolved, budget, KNOBS, budget_rows=budget_rows) == expected

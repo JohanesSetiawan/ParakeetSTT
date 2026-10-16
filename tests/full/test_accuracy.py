@@ -12,15 +12,16 @@ import pytest
 import torch
 
 from src.inference.offline import FileStatus, OfflineTranscriber
-from support import SpeechClip, word_error_rate
+from support import SpeechClip, load_corpus_wer_budget, word_error_rate
 
 PAD_TOKEN_ID = 2
 
 # Measured corpus WER over the five clips is 3.67 percent (4 errors in 109
 # words, titles normalized), all from the model itself on LibriSpeech text.
-# The budget leaves room for one extra word error; anything worse is a real
+# The budget, kept in the clips' manifest so the doctor command uses the same
+# number, leaves room for one extra word error; anything worse is a real
 # regression.
-CORPUS_WER_BUDGET = 0.046
+CORPUS_WER_BUDGET = load_corpus_wer_budget()
 
 # The chunked clip differs from the unchunked reference by one word ("and"
 # for "an", 1.49 percent), a context effect rather than a seam artifact.

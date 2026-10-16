@@ -139,11 +139,15 @@ class GraphedGreedyDecoder:
 
         if not self.use_cuda_graph or self.graph is not None:
             return
-        placeholder_states = torch.zeros_like(self.encoder_states)
-        no_frames = torch.zeros_like(self.valid_lengths)
-        finite = torch.ones(self.rows, dtype=torch.bool, device=self.device)
-        self._load(placeholder_states, no_frames, finite)
-        self._capture(placeholder_states, no_frames, finite)
+        # The same mode as a capture inside generate(): without it autograd
+        # would record the decoder (the parameters require grad), keep saved
+        # activations in the graph's pool, and capture different kernels.
+        with torch.inference_mode():
+            placeholder_states = torch.zeros_like(self.encoder_states)
+            no_frames = torch.zeros_like(self.valid_lengths)
+            finite = torch.ones(self.rows, dtype=torch.bool, device=self.device)
+            self._load(placeholder_states, no_frames, finite)
+            self._capture(placeholder_states, no_frames, finite)
 
     def accepts(self, encoder_states: torch.Tensor) -> bool:
         """Whether a batch fits the static buffers."""

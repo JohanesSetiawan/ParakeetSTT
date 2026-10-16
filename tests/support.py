@@ -200,6 +200,13 @@ class SpeechClip:
     full_context_transcript: str
 
 
+def load_corpus_wer_budget() -> float:
+    """The corpus word error rate the clips may reach, from ``manifest.json``."""
+
+    manifest = json.loads((SPEECH_DIR / "manifest.json").read_text(encoding="utf-8"))
+    return float(manifest["corpus_wer_budget"])
+
+
 def load_speech_clips() -> tuple[SpeechClip, ...]:
     """
     Read manifest.json and verify every audio file against its SHA-256.

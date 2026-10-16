@@ -26,10 +26,8 @@ import torch
 from ..checkpoint.bootstrap import ensure_first_run_ready
 from ..checkpoint.derived import HALF_ENCODER_FILENAME, ensure_half_encoder_checkpoint
 from ..configuration.config import ParakeetConfig
-from ..configuration.settings import InferenceSettings, Settings
+from ..configuration.settings import InferenceSettings, MemorySettings, Settings
 from ..inference.budget import (
-    AUTO_BATCH_MEMORY_SHARE,
-    AUTO_BATCH_ROWS_LIMIT,
     MemoryBudget,
     batch_rows_for,
     resolve_memory_budget,
@@ -222,7 +220,7 @@ def prepare_inference_model(
     report(f"Model load seconds: {load_seconds:.3f}")
 
     budgeted, memory_budget = resolve_memory_budget(model, configuration, configured, settings.memory)
-    rows = batch_rows_for(configured, memory_budget)
+    rows = batch_rows_for(configured, memory_budget, settings.memory)
     resolved = _resolved_settings(
         budgeted,
         rows=rows,
@@ -242,7 +240,7 @@ def prepare_inference_model(
         report(line)
     for line in memory_budget.warnings():
         notice(line)
-    rows_line = _batch_rows_line(configured, resolved, memory_budget)
+    rows_line = _batch_rows_line(configured, resolved, memory_budget, settings.memory, budget_rows=rows)
     report(rows_line)
     report(workers_line)
 
@@ -352,6 +350,35 @@ def _resolved_settings(
     )
 
 
+def _graph_decoder_bytes(model: ParakeetTDT, settings: InferenceSettings) -> tuple[bool, int]:
+    """
+    Build and capture the graph decoder for ``settings``; return whether it is on and what it holds.
+
+    The cache is emptied before and after, so cached but free blocks (left by
+    earlier work, or by the capture's warm-up) do not count as the decoder's.
+    """
+
+    device = next(model.parameters()).device
+    torch.accelerator.empty_cache()
+    before = torch.accelerator.memory_reserved(device)
+    enabled = enable_graph_decoding(model, settings)
+    torch.accelerator.empty_cache()
+    return enabled, torch.accelerator.memory_reserved(device) - before
+
+
+def _drop_graph_decoder(model: ParakeetTDT) -> None:
+    model.graph_decoder = None
+    torch.accelerator.empty_cache()
+
+
+def _with_rows(settings: InferenceSettings, rows: int) -> InferenceSettings:
+    return dataclasses.replace(
+        settings,
+        batch_size=rows,
+        max_batch_feature_frames=min(settings.max_batch_feature_frames, rows * settings.max_chunk_feature_frames),
+    )
+
+
 def _enable_graph_decoding_within_budget(
     model: ParakeetTDT,
     resolved: InferenceSettings,
@@ -360,14 +387,17 @@ def _enable_graph_decoding_within_budget(
     """
     Build the CUDA Graph decoder for the chosen rows, then pay for its memory.
 
-    The decoder's static buffers and capture pool (58 MiB at one row in a
+    The decoder's static buffers and capture pool (60 MiB for 23 rows in a
     measured run on the reference GPU) stay allocated for the whole run,
-    outside what the budget measured. They are measured here.
-    When they leave too little room for the chosen rows, the rows are
-    lowered and the decoder rebuilt for them. When not even one full chunk
-    would fit next to them, graph decoding is turned off instead: the
-    step-by-step loop gives the same output, only slower, and the budget
-    was measured with it.
+    outside what the budget measured. They are measured here:
+
+    - when they fit next to the chosen rows, nothing changes;
+    - when they leave room for fewer rows, the rows are lowered and the
+      decoder rebuilt for them;
+    - when not even one chunk fits next to them, a one-row decoder is tried,
+      and if that does not fit either, graph decoding is turned off: the
+      step-by-step loop gives the same output, only slower, and the budget
+      was measured with it.
 
     Returns:
         Whether graph decoding is on, the settings to run with, and a
@@ -376,44 +406,67 @@ def _enable_graph_decoding_within_budget(
 
     device = next(model.parameters()).device
     measured = budget.applied and budget.chunks_that_fit is not None and device.type == "cuda"
-    before = torch.accelerator.memory_reserved(device) if measured else 0
-    graph_decoding = enable_graph_decoding(model, resolved)
-    if not (graph_decoding and measured):
-        return graph_decoding, resolved, ""
+    if not measured:
+        return enable_graph_decoding(model, resolved), resolved, ""
 
-    reserved = torch.accelerator.memory_reserved(device) - before
+    enabled, reserved = _graph_decoder_bytes(model, resolved)
+    if not enabled:
+        return False, resolved, ""
     rows = rows_after_reserving(budget, resolved.batch_size, reserved)
     logger.info("graph decoder reserved_mib=%.1f rows=%d of %d", reserved / 2**20, rows, resolved.batch_size)
     if rows == resolved.batch_size:
-        return graph_decoding, resolved, ""
+        return True, resolved, ""
 
-    model.graph_decoder = None
-    torch.accelerator.empty_cache()
-    if rows < 1:
-        warning = (
-            "Warning: CUDA Graph decoding is off: the free GPU memory holds one chunk but not "
-            "the graph decoder next to it. Transcripts are the same, decoding is slower; "
-            "close other programs that use the GPU to get it back."
-        )
-        logger.warning(warning)
-        return False, resolved, warning
-    lowered = dataclasses.replace(
-        resolved,
-        batch_size=rows,
-        max_batch_feature_frames=min(resolved.max_batch_feature_frames, rows * resolved.max_chunk_feature_frames),
+    _drop_graph_decoder(model)
+    if rows >= 1:
+        lowered = _with_rows(resolved, rows)
+        return enable_graph_decoding(model, lowered), lowered, ""
+
+    if resolved.batch_size > 1:
+        one_row = _with_rows(resolved, 1)
+        enabled, reserved = _graph_decoder_bytes(model, one_row)
+        logger.info("one-row graph decoder reserved_mib=%.1f", reserved / 2**20)
+        if enabled and rows_after_reserving(budget, 1, reserved) >= 1:
+            return True, one_row, ""
+        _drop_graph_decoder(model)
+
+    warning = (
+        "Warning: CUDA Graph decoding is off: the free GPU memory holds one chunk but not "
+        "the graph decoder next to it. Transcripts are the same, decoding is slower; "
+        "close other programs that use the GPU to get it back."
     )
-    return enable_graph_decoding(model, lowered), lowered, ""
+    logger.warning(warning)
+    return False, resolved, warning
 
 
-def _batch_rows_line(configured: InferenceSettings, resolved: InferenceSettings, budget: MemoryBudget) -> str:
-    """The rows decision and its reason, for the report."""
+def _batch_rows_line(
+    configured: InferenceSettings,
+    resolved: InferenceSettings,
+    budget: MemoryBudget,
+    memory: MemorySettings,
+    *,
+    budget_rows: int,
+) -> str:
+    """
+    The rows decision and its reason, for the report.
+
+    Args:
+        budget_rows: Rows chosen from the budget, before the graph decoder's
+            memory was taken off; the report says when that lowered them.
+    """
 
     rows = resolved.batch_size
     if configured.batch_size is not None:
-        return f"Batch rows: {rows} (configured {configured.batch_size})"
-    if budget.chunks_that_fit is None:
-        return f"Batch rows: {rows} (auto: memory not measured on this device)"
-    return (
-        f"Batch rows: {rows} (auto: {AUTO_BATCH_MEMORY_SHARE:.0%} of the {budget.chunks_that_fit} "
-        f"full chunks that fit, at most {AUTO_BATCH_ROWS_LIMIT})"
-    )
+        reason = f"configured {configured.batch_size}"
+        if budget.chunks_that_fit is not None and budget.chunks_that_fit < configured.batch_size:
+            reason += f", {budget.chunks_that_fit} full chunks fit"
+    elif budget.chunks_that_fit is None:
+        reason = "auto: memory not measured on this device"
+    else:
+        reason = (
+            f"auto: {memory.auto_batch_memory_share:.0%} of the {budget.chunks_that_fit} "
+            f"full chunks that fit, at most {memory.auto_batch_max_rows}"
+        )
+    if rows < budget_rows:
+        reason += f", lowered from {budget_rows} for the CUDA Graph decoder"
+    return f"Batch rows: {rows} ({reason})"

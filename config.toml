@@ -33,9 +33,10 @@ keep_safetensors = false
 # `python -m src.commands.doctor` to see them). A number or true/false
 # instead is used as written.
 #
-# Most rows (chunks) in one batch. "auto": 80 percent of the full chunks that
-# fit in the free GPU memory (measured at startup), at most 64; 16 on the CPU
-# and on Apple MPS. Larger batches were never slower on the reference GPU.
+# Most rows (chunks) in one batch. "auto": a share of the full chunks that
+# fit in the free GPU memory, measured at startup (see [memory]
+# auto_batch_memory_share, auto_batch_max_rows, unmeasured_batch_rows).
+# Larger batches were never slower on the reference GPU.
 batch_size = "auto"
 recursive = true
 output_filename = "transcriptions.csv"
@@ -89,9 +90,10 @@ float32_matmul_precision = "highest"
 # CUDA float16 encoder only: matrix products also add in float16 (cuBLAS).
 # The encoder ran 1.17 times faster on the RTX 3050 Ti, and the word error
 # rate on the docs corpus was 6.66 percent against 6.67 without it. "auto":
-# a short benchmark at startup turns it on only where it is at least 5
-# percent faster (GeForce GPUs gain; GPUs that add in float32 at full speed
-# keep the more precise float32 sums).
+# a short benchmark at startup turns it on only where it is at least 25
+# percent faster (1.68 to 1.84 times on the RTX 3050 Ti; a GPU that adds in
+# float32 at full speed keeps the more precise float32 sums). The margin keeps
+# the decision, and the transcripts, the same from run to run.
 float16_accumulation = "auto"
 # Threads that decode and resample audio while the GPU runs. A long file that
 # libsndfile reads (WAV, FLAC, MP3, ...) is dealt to up to this many decoders
@@ -117,6 +119,20 @@ auto_batch_budget = true
 # VRAM left outside the cap, measured after calibration has already loaded
 # the libraries: room for kernels loaded later and for other programs.
 reserve_mib = 256
+# inference.batch_size = "auto" uses this share of the full chunks that fit
+# (0 to 1). The rest covers what the calibration cannot see: memory per row
+# grows a little with the batch (55 MiB from 1 to 8 rows, about 60 from 16 to
+# 31 on the reference GPU) and fragmentation across batches. 34 chunks fit
+# there and 0.7 gives 23 rows; 31 rows ran out of memory in the second batch
+# of a long file. Lower it if a run stops with an out-of-memory error.
+auto_batch_memory_share = 0.7
+# Most rows "auto" picks on large GPUs: 64 full chunks are about 12 000
+# encoder frames per matrix product, while the audio and decoding buffers
+# held per batch keep growing with the rows.
+auto_batch_max_rows = 64
+# Rows for batch_size = "auto" when nothing was measured: the CPU, Apple MPS
+# and other accelerators, or auto_batch_budget = false.
+unmeasured_batch_rows = 16
 
 [benchmark]
 # Development benchmark: rounds run and discarded before measuring (CUDA

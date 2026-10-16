@@ -57,6 +57,9 @@ decode_workers = 3
 cap_to_free_memory = true
 auto_batch_budget = true
 reserve_mib = 256
+auto_batch_memory_share = 0.7
+auto_batch_max_rows = 64
+unmeasured_batch_rows = 16
 
 [benchmark]
 warmup_rounds = 0
@@ -143,6 +146,10 @@ def test_valid_file_is_normalized(tmp_path: Path) -> None:
         ("terminal_details = false", "terminal_details = 0", "terminal_details"),
         ("keep_safetensors = false", 'keep_safetensors = "no"', "keep_safetensors"),
         ("reserve_mib = 256", "reserve_mib = -1", "reserve_mib"),
+        ("auto_batch_memory_share = 0.7", "auto_batch_memory_share = 0", "auto_batch_memory_share"),
+        ("auto_batch_memory_share = 0.7", "auto_batch_memory_share = 1.5", "auto_batch_memory_share"),
+        ("auto_batch_max_rows = 64", "auto_batch_max_rows = 0", "auto_batch_max_rows"),
+        ("unmeasured_batch_rows = 16", 'unmeasured_batch_rows = "auto"', "unmeasured_batch_rows"),
         ("auto_batch_budget = true", "auto_batch_budget = 1", "auto_batch_budget"),
         ("cap_to_free_memory = true", 'cap_to_free_memory = "yes"', "cap_to_free_memory"),
     ],
@@ -450,6 +457,7 @@ def test_float16_accumulation_is_not_measured_off_cuda() -> None:
         (None, None, torch.float32, False, "the encoder runs in float32"),
         (None, 1.60, torch.float16, True, "1.60x faster"),
         (None, 1.02, torch.float16, False, "no clear gain"),
+        (None, 1.10, torch.float16, False, "no clear gain"),  # below the 25 percent margin
         (None, None, torch.float16, False, "not measurable"),
     ],
 )
@@ -468,3 +476,47 @@ def test_auto_float16_accumulation_needs_a_clear_measured_gain(setting, speedup,
     assert reason in why
     if setting is not None or dtype != torch.float16:
         measure.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("name", "tensor_cores"),
+    [
+        ("NVIDIA GeForce RTX 2060", True),
+        ("Tesla T4", True),
+        ("NVIDIA GeForce GTX 1650", False),
+        ("NVIDIA GeForce GTX 1660 Ti", False),
+        ("NVIDIA GeForce MX450", False),
+        ("Quadro T2000 with Max-Q Design", False),
+        ("NVIDIA T400 4GB", False),
+    ],
+)
+def test_turing_cards_without_tensor_cores_are_recognized(name: str, tensor_cores: bool) -> None:
+    """Review finding: compute capability 7.5 also covers TU116/TU117 cards without tensor cores."""
+
+    from src.runtime import device as device_module
+
+    with (
+        patch.object(device_module, "cuda_capability", return_value=(7, 5)),
+        patch.object(device_module.torch.cuda, "get_device_name", return_value=name),
+    ):
+        assert device_module.has_tensor_cores(torch.device("cuda")) is tensor_cores
+        dtype, _description = device_module.encoder_dtype_for("auto", torch.device("cuda"))
+
+    assert dtype == (torch.float16 if tensor_cores else torch.float32)
+
+
+def test_rocm_gpus_are_not_judged_by_nvidia_rules() -> None:
+    """Review finding: ROCm builds list gfx architectures, which made every AMD GPU look unsupported."""
+
+    from src.runtime import device as device_module
+
+    with patch.object(device_module.torch.version, "hip", "6.2"):
+        rocm = torch.device("cuda")
+        assert device_module.is_nvidia_gpu(rocm) is False
+        assert device_module.cuda_capability(rocm) is None
+        assert device_module.build_supports_device(rocm) is None
+        assert device_module.has_tensor_cores(rocm) is False
+        dtype, description = device_module.encoder_dtype_for("auto", rocm)
+
+    assert dtype == torch.float32
+    assert "NVIDIA GPUs only" in description

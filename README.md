@@ -311,7 +311,7 @@ On CUDA the whole step runs as one replayed CUDA Graph (`models/graphed_decoding
 
 - **Python 3.11 or newer.** The code uses `tomllib` and `enum.StrEnum`. It was developed and tested with Python 3.13.
 - **PyTorch.** Any build for your platform: CUDA, Apple MPS, or CPU. The device is chosen automatically through `torch.accelerator`, so other accelerators PyTorch supports (Intel XPU, AMD ROCm) are picked up too, untested. Development used PyTorch 2.14 with CUDA 13.2.
-- **NVIDIA GPUs:** any GPU the installed PyTorch build has kernels for; startup refuses one it has not and says why. GPUs with tensor cores (compute capability 7.0 and newer, GeForce 20 series onward) run the encoder in float16; older ones run float32. Only the RTX 3050 Ti Laptop GPU has been measured; run the [doctor command](#checking-a-computer-or-gpu) on any other.
+- **NVIDIA GPUs:** any GPU the installed PyTorch build has kernels for; startup refuses one it has not and says why. GPUs with tensor cores (compute capability 7.0 and newer, GeForce RTX 20 series onward) run the encoder in float16; older ones, and the Turing cards without tensor cores (GeForce GTX 16 series, MX450, MX550, T400 to T2000), run float32. Only the RTX 3050 Ti Laptop GPU has been measured; run the [doctor command](#checking-a-computer-or-gpu) on any other.
 - **soundfile** (libsndfile) for decoding WAV, FLAC, OGG, MP3 and the other formats libsndfile supports. It installs NumPy with it.
 - **FFmpeg (optional).** Only needed for formats libsndfile cannot read, such as M4A/AAC, Opus in MP4/WebM, or audio inside video files. `ffmpeg` and `ffprobe` are found through `PATH`, or through the `FFMPEG_BINARY` and `FFPROBE_BINARY` environment variables.
 - **Disk:** about 3.7 GB for the checkpoint directory after the first run: the 2.5 GB `model.pth` and the 1.2 GB `model.encoder-float16.pth` built from it. During the first run the 2.5 GB `model.safetensors` download is there too (6.2 GB in total); it is deleted once `model.pth` has loaded, unless `checkpoint.keep_safetensors = true`.
@@ -469,7 +469,7 @@ All settings live in `config.toml` at the repository root. Every key is required
 
 | Key | Default | Meaning |
 |---|---|---|
-| `batch_size` | `"auto"` | Maximum chunks per micro-batch. `"auto"`: 70% of the full chunks that fit in the free GPU memory (measured at startup), at most 64; 16 on the CPU, on other accelerators, or with `memory.auto_batch_budget = false`. A number is lowered to what fits. |
+| `batch_size` | `"auto"` | Maximum chunks per micro-batch. `"auto"`: `memory.auto_batch_memory_share` (0.7) of the full chunks that fit in the free GPU memory (measured at startup), at most `memory.auto_batch_max_rows` (64); `memory.unmeasured_batch_rows` (16) on the CPU, on other accelerators, or with `memory.auto_batch_budget = false`. A number is lowered to what fits. |
 | `recursive` | `true` | Include subfolders in folder mode. |
 | `output_filename` | `"transcriptions.csv"` | CSV name inside the input folder. Must be a plain file name. |
 | `audio_extensions` | `[]` | Optional suffix allow-list such as `[".wav", ".mp3"]`. Empty means every file is probed by content. |
@@ -486,7 +486,7 @@ All settings live in `config.toml` at the repository root. Every key is required
 | `encoder_precision` | `"auto"` | `"auto"`, `"float16"`, or `"float32"`. Float16 runs the encoder about 2.8 times faster and halves its weights; the decoder and joint stay float32. `"auto"`: float16 on NVIDIA GPUs with tensor cores, float32 elsewhere. `"float16"` is used on any NVIDIA GPU; the CPU and other accelerators always run float32. |
 | `cuda_graphs` | `true` | Replay each greedy decoding step as one captured CUDA Graph instead of about 46 kernel launches. Same output; CUDA only. |
 | `float32_matmul_precision` | `"highest"` | `"highest"` (exact float32) or `"high"` (TF32 tensor cores on NVIDIA Ampere and newer). With `encoder_precision = "float32"`, `"high"` was 13% faster end to end with the same word error rate. |
-| `float16_accumulation` | `"auto"` | With the float16 encoder on CUDA, matrix products also add in float16. The encoder ran 1.17 times faster, and corpus word error rate was 6.66% against 6.67% without it. `"auto"`: a benchmark of under a second at startup turns it on only where it is at least 5% faster (1.7 to 1.8 times on the RTX 3050 Ti); `true` or `false` sets it. Ignored for a float32 encoder. |
+| `float16_accumulation` | `"auto"` | With the float16 encoder on CUDA, matrix products also add in float16. The encoder ran 1.17 times faster, and corpus word error rate was 6.66% against 6.67% without it. `"auto"`: a benchmark of under a second at startup turns it on only where it is at least 25% faster (1.7 to 1.8 times on the RTX 3050 Ti), a margin that keeps the decision the same from run to run; `true` or `false` sets it. Ignored for a float32 encoder. |
 | `decode_workers` | `"auto"` | Threads that decode and resample audio while the GPU runs. A long file that libsndfile reads is dealt to several decoders in blocks, so each batch is decoded in parallel; chunks of different files are decoded in parallel too. Files decoded through `ffmpeg` keep one decoder each. `"auto"`: one per four logical CPUs, 1 to 8 (4 on a 16-thread laptop CPU, the fastest measured there). |
 
 Every `"auto"` decision is written to the run log with its reason; `python -m src.commands.doctor` prints them.
@@ -500,6 +500,9 @@ NVIDIA GPUs only; the CPU and other accelerators ignore it.
 | `cap_to_free_memory` | `true` | After loading, cap PyTorch's GPU allocator at the memory that is actually free. On Windows the NVIDIA driver otherwise moves allocations that do not fit in VRAM into shared system memory, and the run continues several times slower instead of failing. |
 | `auto_batch_budget` | `true` | Measure one full chunk and a batch of eight (or three, when eight do not fit) at startup: how many full chunks fit under the cap. `inference.batch_size = "auto"` is chosen from it, and configured numbers are lowered to it. |
 | `reserve_mib` | `256` | GPU memory to leave free under the cap, for kernels loaded later and other programs. When less than this is free, the run uses the physically free memory and prints a warning instead of refusing. At least 0. |
+| `auto_batch_memory_share` | `0.7` | Share of the full chunks that fit used by `inference.batch_size = "auto"`, greater than 0 and at most 1. The rest covers memory per row growing with the batch and fragmentation; 31 of 34 rows ran out of memory on the reference GPU. Lower it if a run stops with an out-of-memory error. |
+| `auto_batch_max_rows` | `64` | Most rows `"auto"` picks, for large GPUs. At least 1. |
+| `unmeasured_batch_rows` | `16` | Rows for `"auto"` when nothing was measured: the CPU, other accelerators, or `auto_batch_budget = false`. At least 1. |
 
 If not even one full chunk fits in the free GPU memory, the run stops before the first batch and says so. Close other programs that use the GPU, or lower `inference.max_chunk_feature_frames`. If a run still stops with an out-of-memory error, raise `reserve_mib` or lower `inference.max_batch_feature_frames`; the error message names these keys.
 
@@ -583,11 +586,11 @@ GPU: NVIDIA GeForce RTX 3050 Ti Laptop GPU, compute capability 8.6
 Kernels for this GPU in the PyTorch build: yes (built for sm_75, sm_80, sm_86, sm_90, sm_100, sm_120)
 Tensor cores: yes
 Encoder precision: float16 encoder, float32 decoder and joint (auto: tensor cores, compute capability 8.6)
-Float16 accumulation: on (auto: matrix products 1.68x faster with it on this GPU)
+Float16 accumulation: on (auto: matrix products 1.73x faster with it on this GPU)
 Batch rows: 23 (auto: 70% of the 34 full chunks that fit, at most 64)
 Decode workers: 4 (auto: one per four logical CPUs)
 Accuracy check: passed, word error rate 3.67 percent (budget 4.6), 5 of 5 transcripts identical to the reference GPU
-Encoder throughput: 61.7 full chunks per second (925 s of audio per second) at 23 rows
+Encoder throughput: 62.1 full chunks per second (930 s of audio per second) at 23 rows
 ```
 
 "Kernels for this GPU ... NO" means the installed PyTorch build does not support the GPU (for example a GeForce 10 series card on a build for compute capability 7.5 and newer); install a build that does, see [Installation](#installation). A transcript that differs from the reference GPU is not by itself an error: float16 results can move by a word between GPUs. The word error rate decides.
