@@ -137,6 +137,21 @@ def synchronize(device: torch.device) -> None:
         torch.accelerator.synchronize(device)
 
 
+def device_family(device: torch.device) -> str:
+    """
+    Short name of the device for messages.
+
+    "NVIDIA" for NVIDIA GPUs, "ROCm" for AMD GPUs (which PyTorch also calls
+    "cuda"), otherwise the device type ("cpu", "mps", "xpu", ...).
+    """
+
+    if is_nvidia_gpu(device):
+        return "NVIDIA"
+    if device.type == "cuda":
+        return "ROCm"
+    return device.type
+
+
 def is_nvidia_gpu(device: torch.device) -> bool:
     """
     Whether the device is an NVIDIA GPU.
@@ -228,9 +243,7 @@ def encoder_dtype_for(precision: str, device: torch.device) -> tuple[torch.dtype
             return torch.float16, f"float16 encoder, float32 decoder and joint (auto: tensor cores, {capability_text})"
         if is_nvidia_gpu(device):
             return torch.float32, f"float32 (auto: no tensor cores, {capability_text})"
-        if device.type == "cuda":
-            return torch.float32, "float32 (auto: float16 is chosen on NVIDIA GPUs only, this is ROCm)"
-        return torch.float32, f"float32 (auto: float16 is used on NVIDIA GPUs only, this is {device.type})"
+        return torch.float32, f"float32 (auto: float16 is used on NVIDIA GPUs only, this is {device_family(device)})"
 
     if precision == "float16" and is_nvidia_gpu(device):
         if not has_tensor_cores(device):
@@ -238,8 +251,7 @@ def encoder_dtype_for(precision: str, device: torch.device) -> tuple[torch.dtype
             return torch.float16, f"float16 encoder, float32 decoder and joint (no tensor cores, {capability_text})"
         return torch.float16, "float16 encoder, float32 decoder and joint"
     if precision == "float16":
-        place = "ROCm" if device.type == "cuda" else device.type
-        return torch.float32, f"float32 (float16 is used on NVIDIA GPUs only, this is {place})"
+        return torch.float32, f"float32 (float16 is used on NVIDIA GPUs only, this is {device_family(device)})"
     return torch.float32, "float32"
 
 
@@ -391,10 +403,9 @@ def describe_runtime(device: torch.device, dtype: torch.dtype) -> RuntimeReport:
         device_count = 1
         device_name = platform.processor() or platform.machine()
     else:
-        if device.type == "mps":
-            accelerator = "MPS"
-        elif device.type == "cuda" and not is_nvidia_gpu(device):
-            accelerator = "ROCm"
+        family = device_family(device)
+        if family == "ROCm":
+            accelerator = family
         else:
             accelerator = device.type.upper()
         device_count = torch.accelerator.device_count()

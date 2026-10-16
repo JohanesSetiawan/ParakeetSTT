@@ -15,6 +15,7 @@ memory, halfway through a run.
 from __future__ import annotations
 
 import dataclasses
+import functools
 import logging
 import math
 from dataclasses import dataclass
@@ -26,7 +27,7 @@ from ..audio.features import ParakeetFeatureExtractor
 from ..configuration.config import ParakeetConfig
 from ..configuration.settings import InferenceSettings, MemorySettings
 from ..models.parakeet import ParakeetTDT
-from ..runtime.device import is_nvidia_gpu
+from ..runtime.device import device_family, is_nvidia_gpu
 from ..runtime.memory import AcceleratorMemory, cap_allocator, measure_accelerator_memory
 
 logger = logging.getLogger(__name__)
@@ -195,8 +196,7 @@ def resolve_memory_budget(
         return inference, budget
 
     if not is_nvidia_gpu(device):
-        place = "ROCm" if device.type == "cuda" else device.type
-        return unchanged(f"{place} device, measured on NVIDIA GPUs only")
+        return unchanged(f"{device_family(device)} device, measured on NVIDIA GPUs only")
     if not memory.cap_to_free_memory and not memory.auto_batch_budget:
         return unchanged("disabled in [memory]")
 
@@ -225,17 +225,17 @@ def resolve_memory_budget(
     # Calibrate under the physical limit so the measurement cannot spill.
     if memory.cap_to_free_memory:
         cap_allocator(device, before.ceiling(0), before.total)
-    # With the cap, a calibration batch that does not fit fails with an
-    # out-of-memory error. Without it, Windows would spill it into system
-    # memory and it would measure as if it fit, so the free memory is checked
-    # before each larger batch instead.
-    physical_limit = None if memory.cap_to_free_memory else (lambda: measure_accelerator_memory(device).ceiling(0))
+    larger_batch_allowed = functools.partial(
+        _allow_larger_calibration_batch,
+        device,
+        memory.cap_to_free_memory,
+    )
     peak_one, peak_more, calibration_rows, baseline = _calibrate(
         model,
         configuration,
         inference,
         device,
-        physical_limit=physical_limit,
+        larger_batch_allowed=larger_batch_allowed,
     )
 
     # Loading kernels and library workspaces during calibration grew the CUDA
@@ -286,27 +286,54 @@ def resolve_memory_budget(
     return dataclasses.replace(inference, max_batch_feature_frames=batch_frames), budget
 
 
+def _allow_larger_calibration_batch(device: torch.device, capped: bool, predicted_peak: int) -> bool:
+    """
+    Make a larger calibration batch safe to try, or say it is not.
+
+    On Windows a batch beyond the free VRAM does not fail but spills into
+    system memory and measures as if it fit. The one-row run grew the CUDA
+    context outside the allocator (kernels, library workspaces), so the free
+    memory is read again here, just before the batch.
+
+    Args:
+        device: The NVIDIA GPU being calibrated.
+        capped: Whether ``[memory] cap_to_free_memory`` is on. Then the cap is
+            lowered to the memory free now and the batch is always tried: one
+            that does not fit fails with an out-of-memory error, which the
+            caller catches.
+        predicted_peak: Without the cap, the batch's predicted peak reserved
+            memory; it is tried only when that fits in the memory free now.
+
+    Side effects:
+        Empties PyTorch's cache to measure; with ``capped`` it re-caps the
+        allocator, which ``resolve_memory_budget`` replaces afterwards.
+    """
+
+    now = measure_accelerator_memory(device)
+    physical_ceiling = now.ceiling(0)
+    if capped:
+        cap_allocator(device, physical_ceiling, now.total)
+        return True
+    return predicted_peak <= physical_ceiling
+
+
 def _calibrate(
     model: ParakeetTDT,
     configuration: ParakeetConfig,
     inference: InferenceSettings,
     device: torch.device,
     *,
-    physical_limit: Callable[[], int] | None,
+    larger_batch_allowed: Callable[[int], bool],
 ) -> tuple[int, int, int, int]:
     """
     Peak reserved memory for one and for several full-length chunks.
 
     Args:
-        physical_limit: None when the allocator is capped (an oversized
-            batch then fails with an out-of-memory error, which is caught).
-            Otherwise it returns, at the moment it is called, the most memory
-            PyTorch can reserve without exceeding the free VRAM; a larger
-            batch is tried only when the one-row cost, charged per row
-            (overhead included, so the estimate is on the safe side),
-            predicts it stays within that. Without the cap, an oversized
-            batch would not fail on Windows but spill into system memory and
-            measure as if it fit.
+        larger_batch_allowed: Called with the predicted peak before each
+            larger batch (see ``_allow_larger_calibration_batch``); the
+            batch is skipped when it returns False. The prediction charges
+            the one-row cost, overhead included, per row, so it is on the
+            safe side.
 
     Returns:
         ``(peak with one row, peak with more rows, rows of the second run,
@@ -335,7 +362,8 @@ def _calibrate(
         peak_more, calibration_rows = peak_one, CALIBRATION_ONE_ROW
         one_row_cost = max(1, peak_one - baseline)
         for rows in CALIBRATION_MORE_ROWS:
-            if physical_limit is not None and peak_one + (rows - 1) * one_row_cost > physical_limit():
+            predicted_peak = peak_one + (rows - 1) * one_row_cost
+            if not larger_batch_allowed(predicted_peak):
                 continue
             try:
                 peak_more = _peak_reserved_for_rows(model, extractor, waveform, rows, sample_rate, device)

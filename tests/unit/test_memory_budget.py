@@ -246,8 +246,8 @@ def test_snapshot_reports_unavailable_statistics_instead_of_failing() -> None:
     assert snapshot == {"available": False, "device": "mps"}
 
 
-def test_calibration_skips_batches_predicted_beyond_the_free_memory(tmp_path: Path) -> None:
-    """Review finding: without the cap, an oversized calibration batch would spill instead of failing."""
+def test_calibration_skips_larger_batches_it_is_not_allowed(tmp_path: Path) -> None:
+    """Each larger batch is checked first, with its predicted peak, and skipped when refused."""
 
     from src.inference import budget as budget_module
 
@@ -266,20 +266,52 @@ def test_calibration_skips_batches_predicted_beyond_the_free_memory(tmp_path: Pa
     ):
         # One row costs 100 MiB: 8 rows are predicted at 1800 MiB, 3 at 1300.
         tight = budget_module._calibrate(
-            None, configuration, inference_settings(), torch.device("cuda"), physical_limit=lambda: 1500 * MIB
+            None,
+            configuration,
+            inference_settings(),
+            torch.device("cuda"),
+            larger_batch_allowed=lambda predicted: predicted <= 1500 * MIB,
         )
         roomy = budget_module._calibrate(
-            None, configuration, inference_settings(), torch.device("cuda"), physical_limit=lambda: 4000 * MIB
-        )
-        # With the allocator capped nothing is predicted: an oversized batch fails and is caught.
-        capped = budget_module._calibrate(
-            None, configuration, inference_settings(), torch.device("cuda"), physical_limit=None
+            None,
+            configuration,
+            inference_settings(),
+            torch.device("cuda"),
+            larger_batch_allowed=lambda predicted: predicted <= 4000 * MIB,
         )
 
-    assert tried == [1, 3, 1, 8, 1, 8]
+    assert tried == [1, 3, 1, 8]
     assert tight == (1100 * MIB, 1300 * MIB, 3, 1000 * MIB)
     assert roomy == (1100 * MIB, 1800 * MIB, 8, 1000 * MIB)
-    assert capped == roomy
+
+
+@pytest.mark.parametrize(
+    ("capped", "predicted_mib", "allowed"),
+    [
+        (True, 5000, True),  # capped: always tried, an oversized batch fails and is caught
+        (False, 1900, True),
+        (False, 2100, False),  # would spill past the 2000 MiB free now
+    ],
+)
+def test_a_larger_calibration_batch_is_checked_against_the_memory_free_now(capped, predicted_mib, allowed) -> None:
+    """Review finding: the cap set before calibration could exceed what the grown CUDA context left free."""
+
+    from src.inference import budget as budget_module
+    from src.runtime.memory import AcceleratorMemory
+
+    device = torch.device("cuda")
+    now = AcceleratorMemory(reserved=1200 * MIB, free=800 * MIB, total=4096 * MIB)
+    with (
+        patch.object(budget_module, "measure_accelerator_memory", return_value=now),
+        patch.object(budget_module, "cap_allocator") as cap,
+    ):
+        result = budget_module._allow_larger_calibration_batch(device, capped, predicted_mib * MIB)
+
+    assert result is allowed
+    if capped:
+        cap.assert_called_once_with(device, 2000 * MIB, 4096 * MIB)
+    else:
+        cap.assert_not_called()
 
 
 def test_budget_is_not_measured_on_rocm(tmp_path: Path) -> None:

@@ -139,7 +139,14 @@ def write_float_wav(path: Path, waveform: torch.Tensor, sample_rate: int) -> Non
 
 
 def memory_settings(**overrides: object) -> MemorySettings:
-    """The repository's [memory] defaults; override any field by keyword."""
+    """
+    Fixed ``[memory]`` values for tests; override any field by keyword.
+
+    They are the values config.toml shipped with when the tests were
+    written, copied on purpose rather than read: expected row counts in the
+    tests are computed from them, so a config.toml edit must not change
+    what a test checks.
+    """
 
     values: dict[str, object] = {
         "cap_to_free_memory": True,

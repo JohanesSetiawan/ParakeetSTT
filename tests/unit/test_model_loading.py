@@ -31,23 +31,33 @@ def cuda_model() -> SimpleNamespace:
     )
 
 
-def run_graph_budget(budget: MemoryBudget, rows: int, reserved_mib_per_build: list[int]):
-    """Run the graph budget with a CUDA-looking model; each decoder build reserves the next amount."""
+def run_graph_budget(budget: MemoryBudget, rows: int, reserved_mib_per_build: list[int | None]):
+    """
+    Run the graph budget with a CUDA-looking model.
+
+    Each decoder build reserves the next amount; None makes that build run
+    out of memory instead.
+    """
 
     model = cuda_model()
     settings = inference_settings(batch_size=rows, max_batch_feature_frames=rows * CHUNK, cuda_graphs=True)
     enabled_rows: list[int] = []
 
     def fake_enable(target, resolved):
+        build = len(enabled_rows)
         enabled_rows.append(resolved.batch_size)
         target.graph_decoder = f"decoder for {resolved.batch_size}"
+        if reserved_mib_per_build[build] is None:
+            raise torch.OutOfMemoryError("CUDA out of memory while capturing")
         return True
 
+    # Reserved memory read before each build, and after the ones that finish.
     readings = []
     for reserved_mib in reserved_mib_per_build:
-        readings += [1000 * MIB, (1000 + reserved_mib) * MIB]
+        readings.append(1000 * MIB)
+        if reserved_mib is not None:
+            readings.append((1000 + reserved_mib) * MIB)
     with (
-        patch.object(model_loading, "is_nvidia_gpu", return_value=True),
         patch.object(model_loading, "enable_graph_decoding", side_effect=fake_enable),
         patch.object(model_loading.torch.accelerator, "memory_reserved", side_effect=readings),
         patch.object(model_loading.torch.accelerator, "empty_cache"),
@@ -111,6 +121,25 @@ def test_rows_lowered_for_the_decoder_are_measured_again() -> None:
     assert enabled_rows == [10, 7, 6]
 
 
+def test_a_decoder_build_that_runs_out_of_memory_is_retried_with_one_row() -> None:
+    """Review finding: an out-of-memory capture under the cap crashed startup instead of falling back."""
+
+    on, resolved, warning, enabled_rows, model = run_graph_budget(measured_budget(2, per_chunk_mib=43), 2, [None, 20])
+
+    assert (on, resolved.batch_size, warning) == (True, 1, "")
+    assert enabled_rows == [2, 1]
+    assert model.graph_decoder == "decoder for 1"
+
+
+def test_graph_decoding_is_turned_off_when_even_the_one_row_build_runs_out_of_memory() -> None:
+    on, resolved, warning, enabled_rows, model = run_graph_budget(measured_budget(1), 1, [None])
+
+    assert (on, resolved.batch_size) == (False, 1)
+    assert warning.startswith("Warning: CUDA Graph decoding is off")
+    assert enabled_rows == [1]
+    assert model.graph_decoder is None
+
+
 def test_unmeasured_budget_keeps_the_decoder_as_built() -> None:
     model = cuda_model()
     budget = MemoryBudget(False, "cpu device", None, None, None, None, None)
@@ -121,6 +150,27 @@ def test_unmeasured_budget_keeps_the_decoder_as_built() -> None:
 
     assert (on, resolved, warning) == (True, settings, "")
     enable.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    ("setting", "dtype", "warned"),
+    [
+        ("float16", torch.float32, True),  # ROCm, MPS, CPU: the setting is overridden
+        ("float16", torch.float16, False),
+        ("auto", torch.float32, False),  # "auto" choosing float32 is a decision, not an override
+        ("float32", torch.float32, False),
+    ],
+)
+def test_an_overridden_float16_setting_is_warned_about(setting, dtype, warned) -> None:
+    """Review finding: an explicit float16 on ROCm turned into float32 with no visible warning."""
+
+    description = "float32 (float16 is used on NVIDIA GPUs only, this is ROCm)"
+
+    warning = model_loading._ignored_precision_warning(setting, dtype, description)
+
+    assert bool(warning) is warned
+    if warned:
+        assert warning.startswith("Warning:") and "this is ROCm" in warning
 
 
 @pytest.mark.parametrize(

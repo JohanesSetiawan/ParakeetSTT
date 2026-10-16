@@ -38,7 +38,6 @@ from ..models.parakeet import ParakeetTDT, load_model
 from ..runtime.device import (
     FLOAT16_ACCUMULATION_MIN_SPEEDUP,
     RuntimeReport,
-    is_nvidia_gpu,
     apply_float16_accumulation,
     apply_float32_matmul_precision,
     build_supports_device,
@@ -183,6 +182,9 @@ def prepare_inference_model(
     _require_supported_gpu(device)
     apply_float32_matmul_precision(configured.float32_matmul_precision)
     encoder_dtype, precision = encoder_dtype_for(configured.encoder_precision, device)
+    precision_warning = _ignored_precision_warning(configured.encoder_precision, encoder_dtype, precision)
+    if precision_warning:
+        notice(precision_warning)
 
     load_started = time.perf_counter()
     bootstrap, (model, configuration, _metadata) = ensure_first_run_ready(
@@ -291,6 +293,19 @@ def _require_supported_gpu(device: torch.device) -> None:
     )
 
 
+def _ignored_precision_warning(setting: str, encoder_dtype: torch.dtype, precision: str) -> str:
+    """
+    A warning when ``encoder_precision = "float16"`` was set but cannot be used here ("" otherwise).
+
+    The precision line is a detail the terminal may hide; a setting the
+    user chose and the device overrides must be seen.
+    """
+
+    if setting == "float16" and encoder_dtype != torch.float16:
+        return f'Warning: encoder_precision = "float16" is not used on this device: {precision}'
+    return ""
+
+
 def _decide_float16_accumulation(
     setting: bool | None,
     device: torch.device,
@@ -373,6 +388,26 @@ def _graph_decoder_bytes(model: ParakeetTDT, settings: InferenceSettings) -> tup
     return enabled, torch.accelerator.memory_reserved(device) - before
 
 
+def _rows_next_to_graph_decoder(model: ParakeetTDT, settings: InferenceSettings, budget: MemoryBudget) -> int | None:
+    """
+    Build the graph decoder for ``settings``; return the rows that still fit next to it.
+
+    None when graph decoding is off (in config.toml, or on this device). A
+    build that runs out of memory under the allocator cap leaves no room: 0.
+    """
+
+    try:
+        enabled, reserved = _graph_decoder_bytes(model, settings)
+    except torch.OutOfMemoryError:
+        logger.warning("graph decoder for %d rows ran out of memory while being built", settings.batch_size)
+        return 0
+    if not enabled:
+        return None
+    rows = rows_after_reserving(budget, settings.batch_size, reserved)
+    logger.info("graph decoder reserved_mib=%.1f rows=%d of %d", reserved / 2**20, rows, settings.batch_size)
+    return rows
+
+
 def _drop_graph_decoder(model: ParakeetTDT) -> None:
     model.graph_decoder = None
     torch.accelerator.empty_cache()
@@ -391,27 +426,26 @@ def _enable_graph_decoding_within_budget(
     outside what the budget measured. The decoder is built, its memory
     measured, and the rows that still fit computed; while that is fewer than
     it was built for, it is rebuilt for those rows and measured again (rows
-    only go down, so this ends). When not even one chunk fits next to a
-    one-row decoder, graph decoding is turned off: the step-by-step loop
-    gives the same output, only slower, and the budget was measured with it.
+    only go down, so this ends). A build that runs out of memory counts as
+    leaving no room. When not even one chunk fits next to a one-row decoder,
+    graph decoding is turned off: the step-by-step loop gives the same
+    output, only slower, and the budget was measured with it.
 
     Returns:
         Whether graph decoding is on, the settings to run with, and a
         warning for the user ("" when there is none).
     """
 
-    device = next(model.parameters()).device
-    measured = budget.applied and budget.chunks_that_fit is not None and is_nvidia_gpu(device)
+    # The budget is measured on NVIDIA GPUs only, the only ones with graph decoding.
+    measured = budget.applied and budget.chunks_that_fit is not None
     if not measured:
         return enable_graph_decoding(model, resolved), resolved, ""
 
     candidate = resolved
     while True:
-        enabled, reserved = _graph_decoder_bytes(model, candidate)
-        if not enabled:
+        rows = _rows_next_to_graph_decoder(model, candidate, budget)
+        if rows is None:
             return False, candidate, ""
-        rows = rows_after_reserving(budget, candidate.batch_size, reserved)
-        logger.info("graph decoder reserved_mib=%.1f rows=%d of %d", reserved / 2**20, rows, candidate.batch_size)
         if rows == candidate.batch_size:
             return True, candidate, ""
         _drop_graph_decoder(model)

@@ -533,13 +533,36 @@ def test_rocm_gpus_are_not_judged_by_nvidia_rules() -> None:
     assert speedup is None
 
 
-def test_graph_decoding_is_nvidia_only(tmp_path: Path) -> None:
+@pytest.mark.parametrize(("hip", "built"), [("6.2", False), (None, True)])
+def test_graph_decoding_is_built_on_nvidia_gpus_only(tmp_path: Path, hip, built: bool) -> None:
+    """Review finding: ROCm devices are type "cuda" too; the device type alone let them build a decoder."""
+
+    from types import SimpleNamespace
+
     from src.configuration.config import load_config
+    from src.models import graphed_decoding
     from src.models import parakeet as parakeet_module
     from support import write_tiny_checkpoint
 
     model = parakeet_module.ParakeetTDT(load_config(write_tiny_checkpoint(tmp_path)))
-    with patch.object(parakeet_module, "is_nvidia_gpu", return_value=False):
+    gpu_parameter = SimpleNamespace(device=torch.device("cuda"))
+    with (
+        patch.object(parakeet_module.torch.version, "hip", hip),
+        patch.object(model, "parameters", lambda: iter([gpu_parameter])),
+        patch.object(graphed_decoding, "GraphedGreedyDecoder", return_value="graph decoder") as decoder_class,
+    ):
         model.enable_graph_decoding(4, 10)
 
-    assert model.graph_decoder is None
+    assert decoder_class.called is built
+    assert model.graph_decoder == ("graph decoder" if built else None)
+
+
+@pytest.mark.parametrize(
+    ("device_type", "hip", "family"),
+    [("cuda", None, "NVIDIA"), ("cuda", "6.2", "ROCm"), ("cpu", None, "cpu"), ("mps", None, "mps")],
+)
+def test_device_family_names_rocm_apart_from_nvidia(device_type: str, hip, family: str) -> None:
+    from src.runtime import device as device_module
+
+    with patch.object(device_module.torch.version, "hip", hip):
+        assert device_module.device_family(torch.device(device_type)) == family
