@@ -9,11 +9,10 @@ import pytest
 import torch
 
 from src.configuration.config import load_config
-from src.configuration.settings import MemorySettings
 from src.inference.budget import MemoryBudget, _rows_under_ceiling, chunks_that_fit, resolve_memory_budget
 from src.models.parakeet import ParakeetTDT
 from src.runtime import memory as memory_module
-from support import inference_settings, write_tiny_checkpoint
+from support import inference_settings, memory_settings, write_tiny_checkpoint
 
 MIB = 2**20
 
@@ -135,7 +134,7 @@ def test_budget_is_not_applied_off_cuda(tmp_path: Path) -> None:
     configuration = load_config(write_tiny_checkpoint(tmp_path))
     model = ParakeetTDT(configuration).eval()
     settings = inference_settings(max_batch_feature_frames=300)
-    memory = MemorySettings(cap_to_free_memory=True, auto_batch_budget=True, reserve_mib=512, auto_batch_memory_share=0.7, auto_batch_max_rows=64, unmeasured_batch_rows=16)
+    memory = memory_settings(reserve_mib=512)
 
     resolved, budget = resolve_memory_budget(model, configuration, settings, memory)
 
@@ -171,19 +170,6 @@ def test_report_lines_name_the_used_and_configured_budget() -> None:
 # =============================================================================
 
 
-def memory_knobs(share: float = 0.7, max_rows: int = 64, unmeasured: int = 16) -> MemorySettings:
-    """The repository's [memory] defaults, or other values for the auto-batch knobs."""
-
-    return MemorySettings(
-        cap_to_free_memory=True,
-        auto_batch_budget=True,
-        reserve_mib=256,
-        auto_batch_memory_share=share,
-        auto_batch_max_rows=max_rows,
-        unmeasured_batch_rows=unmeasured,
-    )
-
-
 def budget_with_fit(chunks: int | None, per_chunk_mib: int = 56) -> MemoryBudget:
     return MemoryBudget(
         chunks is not None,
@@ -213,14 +199,14 @@ def test_batch_rows_follow_the_setting_and_the_measurement(batch_size, fit, expe
 
     settings = inference_settings(batch_size=batch_size, max_batch_feature_frames=None)
 
-    assert batch_rows_for(settings, budget_with_fit(fit), memory_knobs()) == expected
+    assert batch_rows_for(settings, budget_with_fit(fit), memory_settings()) == expected
 
 
 def test_batch_rows_use_the_configured_knobs() -> None:
     from src.inference.budget import batch_rows_for
 
     settings = inference_settings(batch_size=None, max_batch_feature_frames=None)
-    knobs = memory_knobs(share=0.5, max_rows=10, unmeasured=4)
+    knobs = memory_settings(auto_batch_memory_share=0.5, auto_batch_max_rows=10, unmeasured_batch_rows=4)
 
     assert batch_rows_for(settings, budget_with_fit(14), knobs) == 7
     assert batch_rows_for(settings, budget_with_fit(100), knobs) == 10
@@ -280,12 +266,39 @@ def test_calibration_skips_batches_predicted_beyond_the_free_memory(tmp_path: Pa
     ):
         # One row costs 100 MiB: 8 rows are predicted at 1800 MiB, 3 at 1300.
         tight = budget_module._calibrate(
-            None, configuration, inference_settings(), torch.device("cuda"), physical_limit=1500 * MIB
+            None, configuration, inference_settings(), torch.device("cuda"), physical_limit=lambda: 1500 * MIB
         )
         roomy = budget_module._calibrate(
-            None, configuration, inference_settings(), torch.device("cuda"), physical_limit=4000 * MIB
+            None, configuration, inference_settings(), torch.device("cuda"), physical_limit=lambda: 4000 * MIB
+        )
+        # With the allocator capped nothing is predicted: an oversized batch fails and is caught.
+        capped = budget_module._calibrate(
+            None, configuration, inference_settings(), torch.device("cuda"), physical_limit=None
         )
 
-    assert tried == [1, 3, 1, 8]
+    assert tried == [1, 3, 1, 8, 1, 8]
     assert tight == (1100 * MIB, 1300 * MIB, 3, 1000 * MIB)
     assert roomy == (1100 * MIB, 1800 * MIB, 8, 1000 * MIB)
+    assert capped == roomy
+
+
+def test_budget_is_not_measured_on_rocm(tmp_path: Path) -> None:
+    """Review finding: AMD GPUs are "cuda" devices too; the budget is verified on NVIDIA only."""
+
+    from types import SimpleNamespace
+
+    from src.inference import budget as budget_module
+
+    configuration = load_config(write_tiny_checkpoint(tmp_path))
+    rocm_model = SimpleNamespace(parameters=lambda: iter([SimpleNamespace(device=torch.device("cuda"))]))
+    settings = inference_settings()
+    with (
+        patch.object(budget_module.torch.version, "hip", "6.2"),
+        patch.object(budget_module, "cap_allocator") as cap,
+    ):
+        resolved, budget = budget_module.resolve_memory_budget(rocm_model, configuration, settings, memory_settings())
+
+    assert resolved == settings
+    assert budget.applied is False
+    assert budget.reason == "ROCm device, measured on NVIDIA GPUs only"
+    cap.assert_not_called()

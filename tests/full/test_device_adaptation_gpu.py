@@ -141,19 +141,33 @@ def test_doctor_passes_and_records_the_machine(real_model, restored_session_mode
 
 @pytest.mark.cuda
 def test_a_decoder_captured_at_startup_matches_the_eager_loop(real_settings, real_model, speech_clips) -> None:
-    """Capturing on a placeholder batch at startup must replay exactly what the eager loop computes."""
+    """
+    Capturing on a placeholder batch at startup must replay exactly what the eager loop computes.
+
+    Only single-chunk clips are used: a longer clip makes the batch longer
+    than the decoder's static buffers, and generate() would then take the
+    eager loop for both runs.
+    """
 
     import soundfile
 
     model, configuration = real_model
     device = next(model.parameters()).device
-    waveforms = [torch.from_numpy(soundfile.read(str(clip.path), dtype="float32")[0]) for clip in speech_clips]
+    single_chunk = [clip for clip in speech_clips if clip.chunks == 1]
+    assert len(single_chunk) >= 2
+    waveforms = [torch.from_numpy(soundfile.read(str(clip.path), dtype="float32")[0]) for clip in single_chunk]
     features, mask = ParakeetFeatureExtractor(configuration)(waveforms, [16000] * len(waveforms), device)
 
     graph_decoder = model.graph_decoder
     assert graph_decoder is not None and graph_decoder.graph is not None
     with torch.inference_mode():
-        graphed = model.generate(features, mask)
+        encoder_states, _encoder_mask = model.encode(features, mask)
+        assert graph_decoder.accepts(encoder_states)
+
+        with patch.object(graph_decoder, "decode", wraps=graph_decoder.decode) as graph_decode:
+            graphed = model.generate(features, mask)
+        graph_decode.assert_called_once()
+
         model.graph_decoder = None
         try:
             eager = model.generate(features, mask)

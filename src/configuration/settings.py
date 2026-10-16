@@ -10,6 +10,7 @@ back to a default.
 
 from __future__ import annotations
 
+import math
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
@@ -201,6 +202,9 @@ def _number(
     if not isinstance(value, (int, float)) or isinstance(value, bool):
         raise ValueError(f"{section_name}.{key} must be a number, got {value!r}")
     number = float(value)
+    # TOML accepts nan and inf, which pass every comparison below.
+    if not math.isfinite(number):
+        raise ValueError(f"{section_name}.{key} must be a finite number, got {value!r}")
     if number < minimum or (maximum is not None and number > maximum):
         upper = "" if maximum is None else f" and <= {maximum}"
         raise ValueError(f"{section_name}.{key} must be >= {minimum}{upper}, got {value!r}")

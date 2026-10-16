@@ -9,18 +9,10 @@ import pytest
 import torch
 
 from src.commands import model_loading
-from src.configuration.settings import MemorySettings
 from src.inference.budget import MemoryBudget
-from support import inference_settings
+from support import inference_settings, memory_settings
 
-KNOBS = MemorySettings(
-    cap_to_free_memory=True,
-    auto_batch_budget=True,
-    reserve_mib=256,
-    auto_batch_memory_share=0.7,
-    auto_batch_max_rows=64,
-    unmeasured_batch_rows=16,
-)
+KNOBS = memory_settings()
 
 MIB = 2**20
 CHUNK = 100  # max_chunk_feature_frames in the tiny settings
@@ -39,7 +31,9 @@ def cuda_model() -> SimpleNamespace:
     )
 
 
-def run_graph_budget(budget: MemoryBudget, rows: int, reserved_mib: int, one_row_reserved_mib: int | None = None):
+def run_graph_budget(budget: MemoryBudget, rows: int, reserved_mib_per_build: list[int]):
+    """Run the graph budget with a CUDA-looking model; each decoder build reserves the next amount."""
+
     model = cuda_model()
     settings = inference_settings(batch_size=rows, max_batch_feature_frames=rows * CHUNK, cuda_graphs=True)
     enabled_rows: list[int] = []
@@ -49,10 +43,11 @@ def run_graph_budget(budget: MemoryBudget, rows: int, reserved_mib: int, one_row
         target.graph_decoder = f"decoder for {resolved.batch_size}"
         return True
 
-    readings = [1000 * MIB, (1000 + reserved_mib) * MIB]
-    if one_row_reserved_mib is not None:
-        readings += [1000 * MIB, (1000 + one_row_reserved_mib) * MIB]
+    readings = []
+    for reserved_mib in reserved_mib_per_build:
+        readings += [1000 * MIB, (1000 + reserved_mib) * MIB]
     with (
+        patch.object(model_loading, "is_nvidia_gpu", return_value=True),
         patch.object(model_loading, "enable_graph_decoding", side_effect=fake_enable),
         patch.object(model_loading.torch.accelerator, "memory_reserved", side_effect=readings),
         patch.object(model_loading.torch.accelerator, "empty_cache"),
@@ -62,16 +57,17 @@ def run_graph_budget(budget: MemoryBudget, rows: int, reserved_mib: int, one_row
 
 
 def test_graph_memory_that_fits_keeps_the_rows() -> None:
-    on, resolved, warning, enabled_rows, _model = run_graph_budget(measured_budget(29), 23, 58)
+    on, resolved, warning, enabled_rows, _model = run_graph_budget(measured_budget(29), 23, [60])
 
     assert (on, resolved.batch_size, warning) == (True, 23, "")
     assert enabled_rows == [23]
 
 
 def test_graph_memory_lowers_the_rows_and_rebuilds_the_decoder() -> None:
-    on, resolved, warning, enabled_rows, model = run_graph_budget(measured_budget(10), 10, 120)
+    on, resolved, warning, enabled_rows, model = run_graph_budget(measured_budget(10), 10, [120, 100])
 
-    # ceil(120 / 56) = 3 chunks of the 10 that fit go to the decoder.
+    # ceil(120 / 56) = 3 of the 10 chunks go to the 10-row decoder; the 7-row
+    # decoder, measured again, takes 2, which still leaves 8 >= 7.
     assert (on, resolved.batch_size, warning) == (True, 7, "")
     assert resolved.max_batch_feature_frames == 7 * CHUNK
     assert enabled_rows == [10, 7]
@@ -81,7 +77,7 @@ def test_graph_memory_lowers_the_rows_and_rebuilds_the_decoder() -> None:
 def test_graph_decoding_is_turned_off_when_no_chunk_fits_next_to_it() -> None:
     """A tight GPU (another process held most of it in the full tier): fall back, do not fail."""
 
-    on, resolved, warning, enabled_rows, model = run_graph_budget(measured_budget(1, per_chunk_mib=43), 1, 58)
+    on, resolved, warning, enabled_rows, model = run_graph_budget(measured_budget(1, per_chunk_mib=43), 1, [58])
 
     assert on is False
     assert resolved.batch_size == 1
@@ -95,14 +91,24 @@ def test_a_one_row_decoder_is_tried_before_turning_graph_decoding_off() -> None:
 
     # Two chunks fit; the two-row decoder takes 100 MiB (3 chunks), the
     # one-row decoder 20 MiB (1 chunk), which leaves room for one row.
-    on, resolved, warning, enabled_rows, model = run_graph_budget(
-        measured_budget(2, per_chunk_mib=43), 2, 100, one_row_reserved_mib=20
-    )
+    on, resolved, warning, enabled_rows, model = run_graph_budget(measured_budget(2, per_chunk_mib=43), 2, [100, 20])
 
     assert (on, resolved.batch_size, warning) == (True, 1, "")
     assert resolved.max_batch_feature_frames == CHUNK
     assert enabled_rows == [2, 1]
     assert model.graph_decoder == "decoder for 1"
+
+
+def test_rows_lowered_for_the_decoder_are_measured_again() -> None:
+    """Review finding: rows were lowered once from the larger decoder's cost and never checked."""
+
+    # 10 chunks fit. The 10-row decoder takes 3 (rows 7); the 7-row decoder,
+    # measured at 200 MiB, takes 4 (rows 6); the 6-row decoder takes 2, and
+    # the 8 chunks left hold 6 rows.
+    on, resolved, _warning, enabled_rows, _model = run_graph_budget(measured_budget(10), 10, [120, 200, 60])
+
+    assert (on, resolved.batch_size) == (True, 6)
+    assert enabled_rows == [10, 7, 6]
 
 
 def test_unmeasured_budget_keeps_the_decoder_as_built() -> None:

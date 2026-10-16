@@ -38,6 +38,7 @@ from ..models.parakeet import ParakeetTDT, load_model
 from ..runtime.device import (
     FLOAT16_ACCUMULATION_MIN_SPEEDUP,
     RuntimeReport,
+    is_nvidia_gpu,
     apply_float16_accumulation,
     apply_float32_matmul_precision,
     build_supports_device,
@@ -328,26 +329,32 @@ def _resolved_settings(
     decode_workers: int,
 ) -> InferenceSettings:
     """
-    The settings with every "auto" replaced by its decision.
-
-    The batch budget never needs to exceed ``rows`` full chunks, because no
-    batch has more rows; an "auto" budget that nothing measured becomes
-    exactly that.
+    The settings with every "auto" replaced by its decision (see ``_with_rows``
+    for the batch budget).
     """
 
-    full_rows_frames = rows * budgeted.max_chunk_feature_frames
-    if budgeted.max_batch_feature_frames is None:
-        batch_frames = full_rows_frames
-    else:
-        batch_frames = min(budgeted.max_batch_feature_frames, full_rows_frames)
     return dataclasses.replace(
-        budgeted,
-        batch_size=rows,
-        max_batch_feature_frames=batch_frames,
+        _with_rows(budgeted, rows),
         encoder_precision="float16" if encoder_dtype == torch.float16 else "float32",
         float16_accumulation=float16_accumulation,
         decode_workers=decode_workers,
     )
+
+
+def _with_rows(settings: InferenceSettings, rows: int) -> InferenceSettings:
+    """
+    ``settings`` with ``rows`` per batch and a batch budget that fits them.
+
+    The budget never needs more than ``rows`` full chunks, because no batch
+    has more rows; an "auto" budget becomes exactly that.
+    """
+
+    full_rows_frames = rows * settings.max_chunk_feature_frames
+    if settings.max_batch_feature_frames is None:
+        batch_frames = full_rows_frames
+    else:
+        batch_frames = min(settings.max_batch_feature_frames, full_rows_frames)
+    return dataclasses.replace(settings, batch_size=rows, max_batch_feature_frames=batch_frames)
 
 
 def _graph_decoder_bytes(model: ParakeetTDT, settings: InferenceSettings) -> tuple[bool, int]:
@@ -371,14 +378,6 @@ def _drop_graph_decoder(model: ParakeetTDT) -> None:
     torch.accelerator.empty_cache()
 
 
-def _with_rows(settings: InferenceSettings, rows: int) -> InferenceSettings:
-    return dataclasses.replace(
-        settings,
-        batch_size=rows,
-        max_batch_feature_frames=min(settings.max_batch_feature_frames, rows * settings.max_chunk_feature_frames),
-    )
-
-
 def _enable_graph_decoding_within_budget(
     model: ParakeetTDT,
     resolved: InferenceSettings,
@@ -389,15 +388,12 @@ def _enable_graph_decoding_within_budget(
 
     The decoder's static buffers and capture pool (60 MiB for 23 rows in a
     measured run on the reference GPU) stay allocated for the whole run,
-    outside what the budget measured. They are measured here:
-
-    - when they fit next to the chosen rows, nothing changes;
-    - when they leave room for fewer rows, the rows are lowered and the
-      decoder rebuilt for them;
-    - when not even one chunk fits next to them, a one-row decoder is tried,
-      and if that does not fit either, graph decoding is turned off: the
-      step-by-step loop gives the same output, only slower, and the budget
-      was measured with it.
+    outside what the budget measured. The decoder is built, its memory
+    measured, and the rows that still fit computed; while that is fewer than
+    it was built for, it is rebuilt for those rows and measured again (rows
+    only go down, so this ends). When not even one chunk fits next to a
+    one-row decoder, graph decoding is turned off: the step-by-step loop
+    gives the same output, only slower, and the budget was measured with it.
 
     Returns:
         Whether graph decoding is on, the settings to run with, and a
@@ -405,30 +401,26 @@ def _enable_graph_decoding_within_budget(
     """
 
     device = next(model.parameters()).device
-    measured = budget.applied and budget.chunks_that_fit is not None and device.type == "cuda"
+    measured = budget.applied and budget.chunks_that_fit is not None and is_nvidia_gpu(device)
     if not measured:
         return enable_graph_decoding(model, resolved), resolved, ""
 
-    enabled, reserved = _graph_decoder_bytes(model, resolved)
-    if not enabled:
-        return False, resolved, ""
-    rows = rows_after_reserving(budget, resolved.batch_size, reserved)
-    logger.info("graph decoder reserved_mib=%.1f rows=%d of %d", reserved / 2**20, rows, resolved.batch_size)
-    if rows == resolved.batch_size:
-        return True, resolved, ""
-
-    _drop_graph_decoder(model)
-    if rows >= 1:
-        lowered = _with_rows(resolved, rows)
-        return enable_graph_decoding(model, lowered), lowered, ""
-
-    if resolved.batch_size > 1:
-        one_row = _with_rows(resolved, 1)
-        enabled, reserved = _graph_decoder_bytes(model, one_row)
-        logger.info("one-row graph decoder reserved_mib=%.1f", reserved / 2**20)
-        if enabled and rows_after_reserving(budget, 1, reserved) >= 1:
-            return True, one_row, ""
+    candidate = resolved
+    while True:
+        enabled, reserved = _graph_decoder_bytes(model, candidate)
+        if not enabled:
+            return False, candidate, ""
+        rows = rows_after_reserving(budget, candidate.batch_size, reserved)
+        logger.info("graph decoder reserved_mib=%.1f rows=%d of %d", reserved / 2**20, rows, candidate.batch_size)
+        if rows == candidate.batch_size:
+            return True, candidate, ""
         _drop_graph_decoder(model)
+        if rows >= 1:
+            candidate = _with_rows(candidate, rows)
+        elif candidate.batch_size > 1:
+            candidate = _with_rows(candidate, 1)
+        else:
+            break
 
     warning = (
         "Warning: CUDA Graph decoding is off: the free GPU memory holds one chunk but not "

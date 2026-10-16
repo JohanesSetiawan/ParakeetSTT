@@ -24,7 +24,7 @@ from pathlib import Path
 import torch
 from torch import nn
 
-from src.configuration.settings import CheckpointSettings, InferenceSettings
+from src.configuration.settings import CheckpointSettings, InferenceSettings, MemorySettings
 from src.models.parakeet import GenerationResult
 # Scoring lives in the runtime (the doctor command uses it); re-exported for the tests.
 from src.text.scoring import SPELLED_TITLES, normalize_words, word_error_rate, word_errors  # noqa: F401
@@ -136,6 +136,21 @@ def write_float_wav(path: Path, waveform: torch.Tensor, sample_rate: int) -> Non
     body = b"WAVE" + b"fmt " + struct.pack("<I", len(fmt)) + fmt
     body += b"data" + struct.pack("<I", len(payload)) + payload
     path.write_bytes(b"RIFF" + struct.pack("<I", len(body)) + body)
+
+
+def memory_settings(**overrides: object) -> MemorySettings:
+    """The repository's [memory] defaults; override any field by keyword."""
+
+    values: dict[str, object] = {
+        "cap_to_free_memory": True,
+        "auto_batch_budget": True,
+        "reserve_mib": 256,
+        "auto_batch_memory_share": 0.7,
+        "auto_batch_max_rows": 64,
+        "unmeasured_batch_rows": 16,
+    }
+    values.update(overrides)
+    return MemorySettings(**values)  # type: ignore[arg-type]
 
 
 def checkpoint_settings() -> CheckpointSettings:

@@ -78,7 +78,7 @@ max_open_files = 8
 # capability 7.0 and newer), float32 on older GPUs, the CPU, and other
 # accelerators. The decoder and joint always run in float32.
 encoder_precision = "auto"
-# CUDA only: replay each greedy decoding step as one captured CUDA Graph
+# NVIDIA GPUs only: replay each greedy decoding step as one captured CUDA Graph
 # instead of about 46 separate kernel launches. Same output, 3 to 5 times
 # faster decoding loop on the RTX 3050 Ti. Other devices ignore it.
 cuda_graphs = true

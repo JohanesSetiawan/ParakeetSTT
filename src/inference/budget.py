@@ -18,6 +18,7 @@ import dataclasses
 import logging
 import math
 from dataclasses import dataclass
+from typing import Callable
 
 import torch
 
@@ -25,6 +26,7 @@ from ..audio.features import ParakeetFeatureExtractor
 from ..configuration.config import ParakeetConfig
 from ..configuration.settings import InferenceSettings, MemorySettings
 from ..models.parakeet import ParakeetTDT
+from ..runtime.device import is_nvidia_gpu
 from ..runtime.memory import AcceleratorMemory, cap_allocator, measure_accelerator_memory
 
 logger = logging.getLogger(__name__)
@@ -55,7 +57,7 @@ class MemoryBudget:
     Outcome of the automatic budget, for the terminal and the run log.
 
     Attributes:
-        applied: Whether a ceiling and/or calibration ran (CUDA only).
+        applied: Whether a ceiling and/or calibration ran (NVIDIA GPUs only).
         reason: Why nothing was applied, when ``applied`` is False.
         ceiling_bytes: Allocator ceiling after calibration, if one was set.
         bytes_per_chunk: Measured growth of reserved memory per extra row of
@@ -192,8 +194,9 @@ def resolve_memory_budget(
         budget = MemoryBudget(False, reason, None, None, None, configured_frames, configured_frames)
         return inference, budget
 
-    if device.type != "cuda":
-        return unchanged(f"{device.type} device")
+    if not is_nvidia_gpu(device):
+        place = "ROCm" if device.type == "cuda" else device.type
+        return unchanged(f"{place} device, measured on NVIDIA GPUs only")
     if not memory.cap_to_free_memory and not memory.auto_batch_budget:
         return unchanged("disabled in [memory]")
 
@@ -222,12 +225,17 @@ def resolve_memory_budget(
     # Calibrate under the physical limit so the measurement cannot spill.
     if memory.cap_to_free_memory:
         cap_allocator(device, before.ceiling(0), before.total)
+    # With the cap, a calibration batch that does not fit fails with an
+    # out-of-memory error. Without it, Windows would spill it into system
+    # memory and it would measure as if it fit, so the free memory is checked
+    # before each larger batch instead.
+    physical_limit = None if memory.cap_to_free_memory else (lambda: measure_accelerator_memory(device).ceiling(0))
     peak_one, peak_more, calibration_rows, baseline = _calibrate(
         model,
         configuration,
         inference,
         device,
-        physical_limit=before.ceiling(0),
+        physical_limit=physical_limit,
     )
 
     # Loading kernels and library workspaces during calibration grew the CUDA
@@ -284,16 +292,21 @@ def _calibrate(
     inference: InferenceSettings,
     device: torch.device,
     *,
-    physical_limit: int,
+    physical_limit: Callable[[], int] | None,
 ) -> tuple[int, int, int, int]:
     """
     Peak reserved memory for one and for several full-length chunks.
 
-    A larger batch is tried only when the one-row cost, charged per row,
-    predicts that it stays within ``physical_limit`` (the memory PyTorch
-    could reserve without exceeding the free VRAM). Without the allocator
-    cap (``memory.cap_to_free_memory = false``) an oversized batch would not
-    fail on Windows but spill into system memory and measure as if it fit.
+    Args:
+        physical_limit: None when the allocator is capped (an oversized
+            batch then fails with an out-of-memory error, which is caught).
+            Otherwise it returns, at the moment it is called, the most memory
+            PyTorch can reserve without exceeding the free VRAM; a larger
+            batch is tried only when the one-row cost, charged per row
+            (overhead included, so the estimate is on the safe side),
+            predicts it stays within that. Without the cap, an oversized
+            batch would not fail on Windows but spill into system memory and
+            measure as if it fit.
 
     Returns:
         ``(peak with one row, peak with more rows, rows of the second run,
@@ -322,7 +335,7 @@ def _calibrate(
         peak_more, calibration_rows = peak_one, CALIBRATION_ONE_ROW
         one_row_cost = max(1, peak_one - baseline)
         for rows in CALIBRATION_MORE_ROWS:
-            if peak_one + (rows - 1) * one_row_cost > physical_limit:
+            if physical_limit is not None and peak_one + (rows - 1) * one_row_cost > physical_limit():
                 continue
             try:
                 peak_more = _peak_reserved_for_rows(model, extractor, waveform, rows, sample_rate, device)

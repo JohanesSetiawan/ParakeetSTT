@@ -34,9 +34,9 @@ TENSOR_CORE_CAPABILITY = (7, 0)
 # The Turing chips TU116 and TU117 have no tensor cores but the same compute
 # capability (7.5) as the RTX 20 series, which has them; only the product
 # name tells them apart: GeForce GTX 16xx, GeForce MX450 and MX550, and the
-# T400, T600, T1000, T1200, and T2000 workstation cards.
+# T400, T500, T550, T600, T1000, T1200, and T2000 workstation cards.
 TURING_CAPABILITY = (7, 5)
-TURING_WITHOUT_TENSOR_CORES = re.compile(r"GTX 16\d\d|\bMX[45]50\b|\bT(?:400|600|1000|1200|2000)\b")
+TURING_WITHOUT_TENSOR_CORES = re.compile(r"GTX 16\d\d|\bMX[45]50\b|\bT(?:400|500|550|600|1000|1200|2000)\b")
 
 # float16 accumulation is turned on by "auto" only when it makes the
 # encoder's matrix products at least this much faster on the GPU in use. The
@@ -211,9 +211,9 @@ def encoder_dtype_for(precision: str, device: torch.device) -> tuple[torch.dtype
     Resolve the configured encoder precision for the selected device.
 
     "auto" uses float16 on NVIDIA GPUs with tensor cores and float32
-    everywhere else. An explicit "float16" is used on any CUDA device (with a
-    warning on an NVIDIA GPU without tensor cores); other devices run
-    float32, because CPUs lack fast float16 kernels and MPS and other
+    everywhere else. An explicit "float16" is used on any NVIDIA GPU (with a
+    warning when it has no tensor cores); other devices run float32, because
+    CPUs lack fast float16 kernels and AMD (ROCm), MPS, and other
     accelerators have not been verified.
 
     Returns:
@@ -230,15 +230,16 @@ def encoder_dtype_for(precision: str, device: torch.device) -> tuple[torch.dtype
             return torch.float32, f"float32 (auto: no tensor cores, {capability_text})"
         if device.type == "cuda":
             return torch.float32, "float32 (auto: float16 is chosen on NVIDIA GPUs only, this is ROCm)"
-        return torch.float32, f"float32 (auto: float16 is used on CUDA only, this is {device.type})"
+        return torch.float32, f"float32 (auto: float16 is used on NVIDIA GPUs only, this is {device.type})"
 
-    if precision == "float16" and device.type == "cuda":
-        if is_nvidia_gpu(device) and not has_tensor_cores(device):
+    if precision == "float16" and is_nvidia_gpu(device):
+        if not has_tensor_cores(device):
             logger.warning("encoder_precision float16 on a GPU without tensor cores (%s)", capability_text)
             return torch.float16, f"float16 encoder, float32 decoder and joint (no tensor cores, {capability_text})"
         return torch.float16, "float16 encoder, float32 decoder and joint"
     if precision == "float16":
-        return torch.float32, f"float32 (float16 is used on CUDA only, this is {device.type})"
+        place = "ROCm" if device.type == "cuda" else device.type
+        return torch.float32, f"float32 (float16 is used on NVIDIA GPUs only, this is {place})"
     return torch.float32, "float32"
 
 
@@ -306,11 +307,11 @@ def measure_float16_accumulation_speedup(
 
     Returns:
         Time with float32 accumulation divided by time with float16
-        accumulation, or None when it cannot be measured (not a CUDA device,
+        accumulation, or None when it cannot be measured (not an NVIDIA GPU,
         or a build without the switch).
     """
 
-    if device.type != "cuda" or not float16_accumulation_supported():
+    if not is_nvidia_gpu(device) or not float16_accumulation_supported():
         return None
 
     matmul_backend = torch.backends.cuda.matmul

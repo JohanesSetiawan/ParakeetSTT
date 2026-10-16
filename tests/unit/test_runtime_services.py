@@ -148,6 +148,8 @@ def test_valid_file_is_normalized(tmp_path: Path) -> None:
         ("reserve_mib = 256", "reserve_mib = -1", "reserve_mib"),
         ("auto_batch_memory_share = 0.7", "auto_batch_memory_share = 0", "auto_batch_memory_share"),
         ("auto_batch_memory_share = 0.7", "auto_batch_memory_share = 1.5", "auto_batch_memory_share"),
+        ("auto_batch_memory_share = 0.7", "auto_batch_memory_share = nan", "finite"),
+        ("gap_silence_rms = 0.001", "gap_silence_rms = inf", "finite"),
         ("auto_batch_max_rows = 64", "auto_batch_max_rows = 0", "auto_batch_max_rows"),
         ("unmeasured_batch_rows = 16", 'unmeasured_batch_rows = "auto"', "unmeasured_batch_rows"),
         ("auto_batch_budget = true", "auto_batch_budget = 1", "auto_batch_budget"),
@@ -399,13 +401,13 @@ def test_encoder_precision_on_cuda_follows_tensor_cores(precision, capability, d
 
 
 @pytest.mark.parametrize("precision", ["auto", "float16"])
-def test_encoder_runs_float32_off_cuda(precision: str) -> None:
+def test_encoder_runs_float32_off_nvidia_gpus(precision: str) -> None:
     from src.runtime.device import encoder_dtype_for
 
     dtype, description = encoder_dtype_for(precision, torch.device("cpu"))
 
     assert dtype == torch.float32
-    assert "float16 is used on CUDA only" in description
+    assert "float16 is used on NVIDIA GPUs only, this is cpu" in description
 
 
 @pytest.mark.parametrize(
@@ -488,6 +490,8 @@ def test_auto_float16_accumulation_needs_a_clear_measured_gain(setting, speedup,
         ("NVIDIA GeForce MX450", False),
         ("Quadro T2000 with Max-Q Design", False),
         ("NVIDIA T400 4GB", False),
+        ("NVIDIA T500", False),
+        ("NVIDIA T550 Laptop GPU", False),
     ],
 )
 def test_turing_cards_without_tensor_cores_are_recognized(name: str, tensor_cores: bool) -> None:
@@ -520,3 +524,22 @@ def test_rocm_gpus_are_not_judged_by_nvidia_rules() -> None:
 
     assert dtype == torch.float32
     assert "NVIDIA GPUs only" in description
+
+    with patch.object(device_module.torch.version, "hip", "6.2"):
+        explicit, explicit_description = device_module.encoder_dtype_for("float16", torch.device("cuda"))
+        speedup = device_module.measure_float16_accumulation_speedup(torch.device("cuda"), 64, 256)
+
+    assert explicit == torch.float32 and "this is ROCm" in explicit_description
+    assert speedup is None
+
+
+def test_graph_decoding_is_nvidia_only(tmp_path: Path) -> None:
+    from src.configuration.config import load_config
+    from src.models import parakeet as parakeet_module
+    from support import write_tiny_checkpoint
+
+    model = parakeet_module.ParakeetTDT(load_config(write_tiny_checkpoint(tmp_path)))
+    with patch.object(parakeet_module, "is_nvidia_gpu", return_value=False):
+        model.enable_graph_decoding(4, 10)
+
+    assert model.graph_decoder is None
