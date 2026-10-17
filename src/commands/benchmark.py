@@ -27,11 +27,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-import torch
-
 from ..configuration.config import PROJECT_ROOT
 from ..configuration.settings import Settings, load_settings
 from ..inference.offline import OfflineRunResult, OfflineTranscriber
+from ..runtime.device import synchronize
 from ..runtime.logging_setup import configure_run_logging
 from ..runtime.memory import peak_process_memory_bytes
 from .inference import discover_audio_files
@@ -155,8 +154,7 @@ def run_benchmark(input_path: Path, settings: Settings, run_id: str) -> tuple[di
     transcriber = OfflineTranscriber(prepared.model, prepared.configuration, inference_settings)
 
     def timed_round() -> tuple[OfflineRunResult, float]:
-        if parameter.device.type == "cuda":
-            torch.cuda.synchronize(parameter.device)
+        synchronize(parameter.device)
         started = time.perf_counter()
         result = transcriber.transcribe(paths, metadata=discovered.audio)
         return result, time.perf_counter() - started

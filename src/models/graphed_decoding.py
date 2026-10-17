@@ -127,6 +127,28 @@ class GraphedGreedyDecoder:
     # Public interface
     # -------------------------------------------------------------------------
 
+    def capture(self) -> None:
+        """
+        Capture the step now instead of at the first batch.
+
+        The capture runs on an all-finished placeholder batch: a captured step
+        reads whatever the static buffers hold at replay time, so the batch
+        it was captured with does not matter. Capturing at startup allocates
+        the graph's memory pool before the run, where it can be measured.
+        """
+
+        if not self.use_cuda_graph or self.graph is not None:
+            return
+        # The same mode as a capture inside generate(): without it autograd
+        # would record the decoder (the parameters require grad), keep saved
+        # activations in the graph's pool, and capture different kernels.
+        with torch.inference_mode():
+            placeholder_states = torch.zeros_like(self.encoder_states)
+            no_frames = torch.zeros_like(self.valid_lengths)
+            finite = torch.ones(self.rows, dtype=torch.bool, device=self.device)
+            self._load(placeholder_states, no_frames, finite)
+            self._capture(placeholder_states, no_frames, finite)
+
     def accepts(self, encoder_states: torch.Tensor) -> bool:
         """Whether a batch fits the static buffers."""
 

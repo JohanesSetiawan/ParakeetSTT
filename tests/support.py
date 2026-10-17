@@ -17,17 +17,17 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
 import struct
 from dataclasses import dataclass
 from pathlib import Path
 
-import numpy as np
 import torch
 from torch import nn
 
-from src.configuration.settings import CheckpointSettings, InferenceSettings
+from src.configuration.settings import CheckpointSettings, InferenceSettings, MemorySettings
 from src.models.parakeet import GenerationResult
+# Scoring lives in the runtime (the doctor command uses it); re-exported for the tests.
+from src.text.scoring import SPELLED_TITLES, normalize_words, word_error_rate, word_errors  # noqa: F401
 
 TINY_VOCAB_SIZE = 12
 TINY_BLANK_ID = TINY_VOCAB_SIZE - 1
@@ -138,6 +138,28 @@ def write_float_wav(path: Path, waveform: torch.Tensor, sample_rate: int) -> Non
     path.write_bytes(b"RIFF" + struct.pack("<I", len(body)) + body)
 
 
+def memory_settings(**overrides: object) -> MemorySettings:
+    """
+    Fixed ``[memory]`` values for tests; override any field by keyword.
+
+    They are the values config.toml shipped with when the tests were
+    written, copied on purpose rather than read: expected row counts in the
+    tests are computed from them, so a config.toml edit must not change
+    what a test checks.
+    """
+
+    values: dict[str, object] = {
+        "cap_to_free_memory": True,
+        "auto_batch_budget": True,
+        "reserve_mib": 256,
+        "auto_batch_memory_share": 0.7,
+        "auto_batch_max_rows": 64,
+        "unmeasured_batch_rows": 16,
+    }
+    values.update(overrides)
+    return MemorySettings(**values)  # type: ignore[arg-type]
+
+
 def checkpoint_settings() -> CheckpointSettings:
     """Fast network policy for local-server download tests."""
 
@@ -200,6 +222,13 @@ class SpeechClip:
     full_context_transcript: str
 
 
+def load_corpus_wer_budget() -> float:
+    """The corpus word error rate the clips may reach, from ``manifest.json``."""
+
+    manifest = json.loads((SPEECH_DIR / "manifest.json").read_text(encoding="utf-8"))
+    return float(manifest["corpus_wer_budget"])
+
+
 def load_speech_clips() -> tuple[SpeechClip, ...]:
     """
     Read manifest.json and verify every audio file against its SHA-256.
@@ -232,65 +261,8 @@ def load_speech_clips() -> tuple[SpeechClip, ...]:
 
 
 # =============================================================================
-# Word error rate
+# Reference transcripts
 # =============================================================================
-
-
-# LibriSpeech spells titles out ("MISTER"); the model writes either "mister"
-# or "Mr". Mapping both to one form keeps a spelling choice from counting as
-# a recognition error. This mirrors the title handling of common English ASR
-# normalizers and is limited to titles LibriSpeech actually spells out.
-SPELLED_TITLES = {"mr": "mister", "mrs": "missus", "dr": "doctor"}
-
-
-def normalize_words(text: str) -> list[str]:
-    """
-    Lowercase, drop punctuation except apostrophes, spell out titles, split.
-
-    LibriSpeech references are uppercase without punctuation, while the model
-    writes cased, punctuated text; both must meet in the same form.
-    """
-
-    lowered = text.lower().replace("-", " ")
-    letters_only = re.sub(r"[^a-z0-9' ]+", " ", lowered)
-    return [SPELLED_TITLES.get(word, word) for word in letters_only.split()]
-
-
-def word_errors(reference: list[str], hypothesis: list[str]) -> int:
-    """
-    Return substitutions + deletions + insertions (Levenshtein on words).
-
-    One numpy row per reference word, so hour-long transcripts (tens of
-    thousands of words) score in seconds instead of minutes.
-    """
-
-    vocabulary = {word: index for index, word in enumerate(set(reference) | set(hypothesis))}
-    hypothesis_ids = np.array([vocabulary[word] for word in hypothesis], dtype=np.int64)
-    columns = np.arange(len(hypothesis) + 1, dtype=np.int64)
-    previous_row = columns.copy()
-    for reference_index, reference_word in enumerate(reference, start=1):
-        substitution = previous_row[:-1] + (hypothesis_ids != vocabulary[reference_word])
-        deletion = previous_row[1:] + 1
-        current_row = np.empty_like(previous_row)
-        current_row[0] = reference_index
-        current_row[1:] = np.minimum(substitution, deletion)
-        # Insertions chain left to right: current[j] = min(current[j],
-        # current[j - 1] + 1), which is a running minimum of current[j] - j.
-        current_row = np.minimum.accumulate(current_row - columns) + columns
-        previous_row = current_row
-    return int(previous_row[-1])
-
-
-def word_error_rate(references: list[str], hypotheses: list[str]) -> float:
-    """Corpus WER: total word errors divided by total reference words."""
-
-    total_errors = 0
-    total_words = 0
-    for reference, hypothesis in zip(references, hypotheses, strict=True):
-        reference_words = normalize_words(reference)
-        total_errors += word_errors(reference_words, normalize_words(hypothesis))
-        total_words += len(reference_words)
-    return total_errors / total_words
 
 
 def load_reference_transcripts(path: Path) -> dict[str, str]:

@@ -1,20 +1,25 @@
 """
 Automatic batch budget from the accelerator memory that is actually free.
 
-``inference.max_batch_feature_frames`` is a fixed number, but how much fits
-depends on the GPU and on what else is using it. After the model loads, the
-memory of one and of three full-length chunks is measured with a real
-forward pass, and the batch budget is lowered (never raised) to what fits
-under the allocator ceiling from ``runtime.memory``. A setting that would
-overflow therefore shrinks before the first batch instead of failing, or on
-Windows silently spilling into system memory, halfway through a run.
+How much fits depends on the GPU and on what else is using it. After the
+model loads, the memory of one and of three full-length chunks is measured
+with a real forward pass, which gives how many full chunks fit under the
+allocator ceiling from ``runtime.memory``. A configured
+``inference.max_batch_feature_frames`` is lowered (never raised) to that;
+with ``"auto"`` the budget is what fits. ``batch_rows_for`` then picks the
+rows per batch. A setting that would overflow therefore shrinks before the
+first batch instead of failing, or on Windows silently spilling into system
+memory, halfway through a run.
 """
 
 from __future__ import annotations
 
 import dataclasses
+import functools
 import logging
+import math
 from dataclasses import dataclass
+from typing import Callable
 
 import torch
 
@@ -22,22 +27,29 @@ from ..audio.features import ParakeetFeatureExtractor
 from ..configuration.config import ParakeetConfig
 from ..configuration.settings import InferenceSettings, MemorySettings
 from ..models.parakeet import ParakeetTDT
+from ..runtime.device import device_family, is_nvidia_gpu
 from ..runtime.memory import AcceleratorMemory, cap_allocator, measure_accelerator_memory
 
 logger = logging.getLogger(__name__)
 
 MIB = 2**20
 
-# Rows of the two calibration batches. Three instead of two: from one to two
-# rows the allocator still reuses cached blocks, so the per-row growth it
-# shows is lower than at larger batches (measured 84 MiB from 1 to 2 rows,
-# about 100 MiB per row from 1 to 3 and 103 MiB per row up to 8 on the
-# reference GPU).
-CALIBRATION_ROWS = (1, 3)
+# Rows of the calibration batches: one row, then the first of these larger
+# batches that fits. The growth per row is the difference divided by the rows
+# between them, so far-apart points keep noise in the one-row peak small. With
+# 1 and 3 rows, 20 MiB that earlier work had left in the allocator's cache
+# raised the one-row peak and turned 53 MiB per row into 43, and the batch
+# chosen from it ran out of memory. Measured growth per row on the reference
+# GPU (float16 encoder): 53 MiB from 1 to 3 rows, 55 from 1 to 8, 59 from 8 to
+# 16, 63 from 16 to 24. It still grows a little with the batch (larger
+# allocator blocks), which memory.auto_batch_memory_share leaves room for.
+CALIBRATION_ONE_ROW = 1
+CALIBRATION_MORE_ROWS = (8, 3)
 
 # Amplitude of the deterministic calibration noise: speech-like level, so the
 # decoding loop runs a realistic number of steps.
 CALIBRATION_AMPLITUDE = 0.05
+
 
 
 @dataclass(frozen=True)
@@ -46,14 +58,16 @@ class MemoryBudget:
     Outcome of the automatic budget, for the terminal and the run log.
 
     Attributes:
-        applied: Whether a ceiling and/or calibration ran (CUDA only).
+        applied: Whether a ceiling and/or calibration ran (NVIDIA GPUs only).
         reason: Why nothing was applied, when ``applied`` is False.
         ceiling_bytes: Allocator ceiling after calibration, if one was set.
         bytes_per_chunk: Measured growth of reserved memory per extra row of
             a full-length chunk.
         chunks_that_fit: Full-length rows that fit under the ceiling.
-        configured_batch_feature_frames: The value from config.toml.
-        batch_feature_frames: The value the run uses.
+        configured_batch_feature_frames: The value from config.toml, or None
+            for "auto".
+        batch_feature_frames: The value the run uses, or None while it is
+            still "auto" (nothing was measured).
         headroom_reduced: Less than ``memory.reserve_mib`` could be kept free;
             the ceiling is the physically free memory instead.
     """
@@ -63,8 +77,8 @@ class MemoryBudget:
     ceiling_bytes: int | None
     bytes_per_chunk: int | None
     chunks_that_fit: int | None
-    configured_batch_feature_frames: int
-    batch_feature_frames: int
+    configured_batch_feature_frames: int | None
+    batch_feature_frames: int | None
     headroom_reduced: bool = False
 
     def lines(self) -> tuple[str, ...]:
@@ -80,9 +94,10 @@ class MemoryBudget:
                 f"Memory per full chunk: {self.bytes_per_chunk / MIB:.0f} MiB, "
                 f"full chunks that fit: {self.chunks_that_fit}"
             )
+        configured = self.configured_batch_feature_frames
         lines.append(
             f"Batch feature frames: {self.batch_feature_frames} "
-            f"(configured {self.configured_batch_feature_frames})"
+            f"(configured {configured if configured is not None else 'auto'})"
         )
         return tuple(lines)
 
@@ -139,13 +154,13 @@ def _peak_reserved_for_rows(
 ) -> int:
     """Run features and generation on ``rows`` copies; return peak reserved bytes."""
 
-    torch.cuda.empty_cache()
-    torch.cuda.reset_peak_memory_stats(device)
+    torch.accelerator.empty_cache()
+    torch.accelerator.reset_peak_memory_stats(device)
     features, mask = extractor([waveform] * rows, [sample_rate] * rows, device)
     model.generate(features, mask)
-    torch.cuda.synchronize(device)
+    torch.accelerator.synchronize(device)
     del features, mask
-    return torch.cuda.max_memory_reserved(device)
+    return torch.accelerator.max_memory_reserved(device)
 
 
 def resolve_memory_budget(
@@ -164,8 +179,9 @@ def resolve_memory_budget(
         memory: The ``[memory]`` policy.
 
     Returns:
-        Settings to run with (``max_batch_feature_frames`` possibly lowered)
-        and a report of what was decided.
+        Settings to run with (``max_batch_feature_frames`` lowered to what
+        fits, or set from what fits when it was "auto") and a report of what
+        was decided. Without a measurement an "auto" budget stays None.
 
     Raises:
         RuntimeError: If not even one full-length chunk fits in the free
@@ -179,8 +195,8 @@ def resolve_memory_budget(
         budget = MemoryBudget(False, reason, None, None, None, configured_frames, configured_frames)
         return inference, budget
 
-    if device.type != "cuda":
-        return unchanged(f"{device.type} device")
+    if not is_nvidia_gpu(device):
+        return unchanged(f"{device_family(device)} device, measured on NVIDIA GPUs only")
     if not memory.cap_to_free_memory and not memory.auto_batch_budget:
         return unchanged("disabled in [memory]")
 
@@ -209,7 +225,18 @@ def resolve_memory_budget(
     # Calibrate under the physical limit so the measurement cannot spill.
     if memory.cap_to_free_memory:
         cap_allocator(device, before.ceiling(0), before.total)
-    peak_one, peak_more, calibration_rows, baseline = _calibrate(model, configuration, inference, device)
+    larger_batch_allowed = functools.partial(
+        _allow_larger_calibration_batch,
+        device,
+        memory.cap_to_free_memory,
+    )
+    peak_one, peak_more, calibration_rows, baseline = _calibrate(
+        model,
+        configuration,
+        inference,
+        device,
+        larger_batch_allowed=larger_batch_allowed,
+    )
 
     # Loading kernels and library workspaces during calibration grew the CUDA
     # context outside the allocator, so measure the free memory again.
@@ -232,10 +259,13 @@ def resolve_memory_budget(
         cap_allocator(device, ceiling, after.total)
 
     fitting_frames = rows * inference.max_chunk_feature_frames
-    batch_frames = min(configured_frames, fitting_frames)
+    if configured_frames is None:
+        batch_frames = fitting_frames
+    else:
+        batch_frames = min(configured_frames, fitting_frames)
     logger.info(
         "memory budget ceiling_mib=%.0f baseline_mib=%.0f per_chunk_mib=%.0f "
-        "chunks_that_fit=%d batch_feature_frames=%d configured=%d",
+        "chunks_that_fit=%d batch_feature_frames=%d configured=%s",
         ceiling / MIB,
         baseline / MIB,
         per_row / MIB,
@@ -256,19 +286,59 @@ def resolve_memory_budget(
     return dataclasses.replace(inference, max_batch_feature_frames=batch_frames), budget
 
 
+def _allow_larger_calibration_batch(device: torch.device, capped: bool, predicted_peak: int) -> bool:
+    """
+    Make a larger calibration batch safe to try, or say it is not.
+
+    On Windows a batch beyond the free VRAM does not fail but spills into
+    system memory and measures as if it fit. The one-row run grew the CUDA
+    context outside the allocator (kernels, library workspaces), so the free
+    memory is read again here, just before the batch.
+
+    Args:
+        device: The NVIDIA GPU being calibrated.
+        capped: Whether ``[memory] cap_to_free_memory`` is on. Then the cap is
+            lowered to the memory free now and the batch is always tried: one
+            that does not fit fails with an out-of-memory error, which the
+            caller catches.
+        predicted_peak: Without the cap, the batch's predicted peak reserved
+            memory; it is tried only when that fits in the memory free now.
+
+    Side effects:
+        Empties PyTorch's cache to measure; with ``capped`` it re-caps the
+        allocator, which ``resolve_memory_budget`` replaces afterwards.
+    """
+
+    now = measure_accelerator_memory(device)
+    physical_ceiling = now.ceiling(0)
+    if capped:
+        cap_allocator(device, physical_ceiling, now.total)
+        return True
+    return predicted_peak <= physical_ceiling
+
+
 def _calibrate(
     model: ParakeetTDT,
     configuration: ParakeetConfig,
     inference: InferenceSettings,
     device: torch.device,
+    *,
+    larger_batch_allowed: Callable[[int], bool],
 ) -> tuple[int, int, int, int]:
     """
     Peak reserved memory for one and for several full-length chunks.
 
+    Args:
+        larger_batch_allowed: Called with the predicted peak before each
+            larger batch (see ``_allow_larger_calibration_batch``); the
+            batch is skipped when it returns False. The prediction charges
+            the one-row cost, overhead included, per row, so it is on the
+            safe side.
+
     Returns:
         ``(peak with one row, peak with more rows, rows of the second run,
-        reserved memory before calibration)``. When the larger batch does
-        not fit, the second run is the one-row run again.
+        reserved memory before calibration)``. When no larger batch fits,
+        the second run is the one-row run again.
     """
 
     extractor = ParakeetFeatureExtractor(configuration)
@@ -279,23 +349,30 @@ def _calibrate(
     generator = torch.Generator().manual_seed(0)
     waveform = torch.randn(samples, generator=generator) * CALIBRATION_AMPLITUDE
 
-    baseline = torch.cuda.memory_reserved(device)
-    one_row, more_rows = CALIBRATION_ROWS
+    baseline = torch.accelerator.memory_reserved(device)
     with torch.inference_mode():
         try:
-            peak_one = _peak_reserved_for_rows(model, extractor, waveform, one_row, sample_rate, device)
+            peak_one = _peak_reserved_for_rows(model, extractor, waveform, CALIBRATION_ONE_ROW, sample_rate, device)
         except torch.OutOfMemoryError as error:
             raise RuntimeError(
                 "Not even one full chunk fits in the free GPU memory. Close other programs "
                 "that use the GPU, or lower inference.max_chunk_feature_frames."
             ) from error
-        try:
-            peak_more = _peak_reserved_for_rows(model, extractor, waveform, more_rows, sample_rate, device)
-            calibration_rows = more_rows
-        except torch.OutOfMemoryError:
-            # Too tight for the larger calibration batch: one row is the budget.
-            peak_more, calibration_rows = peak_one, one_row
-    torch.cuda.empty_cache()
+        # Too tight for every larger batch: one row is the budget.
+        peak_more, calibration_rows = peak_one, CALIBRATION_ONE_ROW
+        one_row_cost = max(1, peak_one - baseline)
+        for rows in CALIBRATION_MORE_ROWS:
+            predicted_peak = peak_one + (rows - 1) * one_row_cost
+            if not larger_batch_allowed(predicted_peak):
+                continue
+            try:
+                peak_more = _peak_reserved_for_rows(model, extractor, waveform, rows, sample_rate, device)
+            except torch.OutOfMemoryError:
+                torch.accelerator.empty_cache()
+                continue
+            calibration_rows = rows
+            break
+    torch.accelerator.empty_cache()
     return peak_one, peak_more, calibration_rows, baseline
 
 
@@ -327,3 +404,55 @@ def _rows_under_ceiling(
     physical_ceiling = memory.ceiling(0)
     rows, per_row = fit(physical_ceiling)
     return rows, per_row, physical_ceiling, True
+
+
+# =============================================================================
+# Rows per batch
+# =============================================================================
+
+
+def batch_rows_for(inference: InferenceSettings, budget: MemoryBudget, memory: MemorySettings) -> int:
+    """
+    Rows per batch for this run.
+
+    A configured ``batch_size`` is kept, lowered to the full chunks that fit
+    when that was measured. ``"auto"`` takes ``memory.auto_batch_memory_share``
+    of the chunks that fit, at most ``memory.auto_batch_max_rows``; without a
+    measurement it is ``memory.unmeasured_batch_rows``. Larger batches were
+    never slower on the reference GPU (8, 16, and 24 rows: 8.9, 8.0, and
+    7.8 s for a 74-minute file), because the decoding loop's per-batch cost
+    is shared by more chunks.
+
+    Returns:
+        At least one row.
+    """
+
+    fit = budget.chunks_that_fit
+    if inference.batch_size is not None:
+        if fit is None:
+            return inference.batch_size
+        return max(1, min(inference.batch_size, fit))
+    if fit is None:
+        return memory.unmeasured_batch_rows
+    share_of_fit = math.floor(fit * memory.auto_batch_memory_share)
+    return max(1, min(memory.auto_batch_max_rows, share_of_fit))
+
+
+def rows_after_reserving(budget: MemoryBudget, rows: int, reserved_bytes: int) -> int:
+    """
+    Rows that still fit once ``reserved_bytes`` more stay allocated.
+
+    The CUDA Graph decoder is built after the budget is measured, sized for
+    the chosen rows, and keeps its static buffers and capture pool for the
+    whole run. Each full chunk needs ``bytes_per_chunk``, so that much less
+    room costs ``ceil(reserved / bytes_per_chunk)`` chunks of the measured
+    capacity.
+
+    Returns:
+        ``rows``, lowered when the capacity left is smaller; at least zero.
+    """
+
+    if budget.chunks_that_fit is None or not budget.bytes_per_chunk or reserved_bytes <= 0:
+        return rows
+    lost_chunks = math.ceil(reserved_bytes / budget.bytes_per_chunk)
+    return max(0, min(rows, budget.chunks_that_fit - lost_chunks))

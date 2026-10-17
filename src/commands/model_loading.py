@@ -4,10 +4,17 @@ Model startup shared by the commands: device, precision, load, and budget.
 A float16 encoder is read from the derived ``model.encoder-float16.pth``
 (built once from ``model.pth``), which halves the bytes read and the peak
 host memory of the load; float32 reads ``model.pth`` directly.
+
+Every ``"auto"`` setting is decided here for the device in use, from what
+the device is (compute capability, CPU count) and what it measures (a float16
+accumulation microbenchmark, the memory of real chunks). The settings that
+leave this module are fully resolved, and each decision is reported with its
+reason.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import time
 from dataclasses import dataclass
@@ -19,16 +26,26 @@ import torch
 from ..checkpoint.bootstrap import ensure_first_run_ready
 from ..checkpoint.derived import HALF_ENCODER_FILENAME, ensure_half_encoder_checkpoint
 from ..configuration.config import ParakeetConfig
-from ..configuration.settings import InferenceSettings, Settings
-from ..inference.budget import MemoryBudget, resolve_memory_budget
+from ..configuration.settings import InferenceSettings, MemorySettings, Settings
+from ..inference.budget import (
+    MemoryBudget,
+    batch_rows_for,
+    resolve_memory_budget,
+    rows_after_reserving,
+)
 from ..inference.offline import enable_graph_decoding
 from ..models.parakeet import ParakeetTDT, load_model
 from ..runtime.device import (
+    FLOAT16_ACCUMULATION_MIN_SPEEDUP,
     RuntimeReport,
     apply_float16_accumulation,
     apply_float32_matmul_precision,
+    build_supports_device,
+    cuda_capability,
+    default_decode_workers,
     describe_runtime,
     encoder_dtype_for,
+    measure_float16_accumulation_speedup,
     select_device,
 )
 
@@ -114,6 +131,7 @@ class PreparedModel:
         float16_accumulation: State of float16 accumulation ("on", "off ...").
         graph_decoding: Whether CUDA Graph decoding is on.
         memory_budget: The memory ceiling and batch budget decision.
+        decisions: One line per setting decided at startup, with its reason.
     """
 
     model: ParakeetTDT
@@ -126,6 +144,7 @@ class PreparedModel:
     float16_accumulation: str
     graph_decoding: bool
     memory_budget: MemoryBudget
+    decisions: tuple[str, ...] = ()
 
 
 def prepare_inference_model(
@@ -134,10 +153,12 @@ def prepare_inference_model(
     notice: Callable[[str], None] | None = None,
 ) -> PreparedModel:
     """
-    Load the model for inference and report each decision as it is made.
+    Load the model for inference, decide every "auto" setting, and report each decision.
 
-    Order matters: graph decoding allocates its static buffers before the
-    memory budget is measured, so the budget accounts for them.
+    Order matters: the memory budget is measured on the loaded model before
+    the CUDA Graph decoder exists, the rows per batch follow from it, and the
+    graph decoder is then built for those rows; its memory is measured and,
+    if needed, taken off the rows.
 
     Args:
         settings: Validated application settings.
@@ -148,13 +169,23 @@ def prepare_inference_model(
             Defaults to ``report``.
 
     Returns:
-        The prepared model and the decisions behind it.
+        The prepared model, fully resolved settings, and the decisions.
+
+    Raises:
+        RuntimeError: If the installed PyTorch build has no kernels for the
+            GPU, or not even one full chunk fits in its free memory.
     """
 
     notice = notice or report
+    configured = settings.inference
     device = select_device()
-    apply_float32_matmul_precision(settings.inference.float32_matmul_precision)
-    encoder_dtype, precision = encoder_dtype_for(settings.inference.encoder_precision, device)
+    _require_supported_gpu(device)
+    apply_float32_matmul_precision(configured.float32_matmul_precision)
+    encoder_dtype, precision = encoder_dtype_for(configured.encoder_precision, device)
+    precision_warning = _ignored_precision_warning(configured.encoder_precision, encoder_dtype, precision)
+    if precision_warning:
+        logger.warning(precision_warning)
+        notice(precision_warning)
 
     load_started = time.perf_counter()
     bootstrap, (model, configuration, _metadata) = ensure_first_run_ready(
@@ -167,35 +198,67 @@ def prepare_inference_model(
     report(f"Weights: {bootstrap.action}")
 
     parameter = next(model.parameters())
-    runtime = describe_runtime(parameter.device, parameter.dtype)
+    model_device = parameter.device
+    runtime = describe_runtime(model_device, parameter.dtype)
     for line in runtime.lines():
         report(line)
     report(f"Encoder precision: {precision}")
-    float16_accumulation = apply_float16_accumulation(
-        settings.inference.float16_accumulation,
+
+    accumulation_enabled, accumulation_reason = _decide_float16_accumulation(
+        configured.float16_accumulation,
+        model_device,
         encoder_dtype,
+        configuration,
     )
+    float16_accumulation = apply_float16_accumulation(accumulation_enabled, encoder_dtype)
+    if accumulation_reason:
+        float16_accumulation = f"{float16_accumulation} ({accumulation_reason})"
     report(f"Float16 accumulation: {float16_accumulation}")
+
+    if configured.decode_workers is None:
+        decode_workers = default_decode_workers()
+        workers_line = f"Decode workers: {decode_workers} (auto: one per four logical CPUs)"
+    else:
+        decode_workers = configured.decode_workers
+        workers_line = f"Decode workers: {decode_workers}"
     report(f"Model load seconds: {load_seconds:.3f}")
 
-    graph_decoding = enable_graph_decoding(model, settings.inference)
-    report(f"CUDA Graph decoding: {'on' if graph_decoding else 'off'}")
-
-    inference, memory_budget = resolve_memory_budget(
-        model,
-        configuration,
-        settings.inference,
-        settings.memory,
+    budgeted, memory_budget = resolve_memory_budget(model, configuration, configured, settings.memory)
+    rows = batch_rows_for(configured, memory_budget, settings.memory)
+    resolved = _resolved_settings(
+        budgeted,
+        rows=rows,
+        encoder_dtype=encoder_dtype,
+        float16_accumulation=accumulation_enabled,
+        decode_workers=decode_workers,
     )
+
+    graph_decoding, resolved, graph_warning = _enable_graph_decoding_within_budget(model, resolved, memory_budget)
+    report(f"CUDA Graph decoding: {'on' if graph_decoding else 'off'}")
+    if graph_warning:
+        notice(graph_warning)
+    # The report shows the budget the run uses, not the most that would fit.
+    memory_budget = dataclasses.replace(memory_budget, batch_feature_frames=resolved.max_batch_feature_frames)
+
     for line in memory_budget.lines():
         report(line)
     for line in memory_budget.warnings():
         notice(line)
+    rows_line = _batch_rows_line(configured, resolved, memory_budget, settings.memory, budget_rows=rows)
+    report(rows_line)
+    report(workers_line)
 
+    decisions = (
+        f"Encoder precision: {precision}",
+        f"Float16 accumulation: {float16_accumulation}",
+        rows_line,
+        workers_line,
+        f"CUDA Graph decoding: {'on' if graph_decoding else 'off'}",
+    )
     return PreparedModel(
         model=model,
         configuration=configuration,
-        inference=inference,
+        inference=resolved,
         weights_action=bootstrap.action,
         load_seconds=load_seconds,
         runtime=runtime,
@@ -203,4 +266,235 @@ def prepare_inference_model(
         float16_accumulation=float16_accumulation,
         graph_decoding=graph_decoding,
         memory_budget=memory_budget,
+        decisions=decisions,
     )
+
+
+# =============================================================================
+# Decisions
+# =============================================================================
+
+
+def _require_supported_gpu(device: torch.device) -> None:
+    """
+    Stop before loading when the PyTorch build cannot run on this GPU.
+
+    Otherwise the first kernel launch fails deep inside the model with "no
+    kernel image is available", after seconds of loading.
+    """
+
+    if build_supports_device(device) is not False:
+        return
+    capability = cuda_capability(device)
+    raise RuntimeError(
+        f"The installed PyTorch build has no CUDA kernels for {torch.cuda.get_device_name(device)} "
+        f"(compute capability {capability[0]}.{capability[1]}); it was built for "
+        f"{', '.join(torch.cuda.get_arch_list())}. Install a PyTorch build that supports this GPU "
+        "(see README, Installation), or a CPU build."
+    )
+
+
+def _ignored_precision_warning(setting: str, encoder_dtype: torch.dtype, precision: str) -> str:
+    """
+    A warning when ``encoder_precision = "float16"`` was set but cannot be used here ("" otherwise).
+
+    The precision line is a detail the terminal may hide; a setting the
+    user chose and the device overrides must be seen.
+    """
+
+    if setting == "float16" and encoder_dtype != torch.float16:
+        return f'Warning: encoder_precision = "float16" is not used on this device: {precision}'
+    return ""
+
+
+def _decide_float16_accumulation(
+    setting: bool | None,
+    device: torch.device,
+    encoder_dtype: torch.dtype,
+    configuration: ParakeetConfig,
+) -> tuple[bool, str]:
+    """
+    Whether to accumulate float16 products in float16, and why ("" when configured).
+
+    "auto" measures the encoder's feed-forward products both ways on this GPU
+    and turns the switch on only when it is clearly faster.
+    """
+
+    if setting is not None:
+        return setting, ""
+    if encoder_dtype != torch.float16:
+        return False, "auto: the encoder runs in float32"
+    speedup = measure_float16_accumulation_speedup(
+        device,
+        configuration.encoder["hidden_size"],
+        configuration.encoder["intermediate_size"],
+    )
+    if speedup is None:
+        return False, "auto: not measurable on this device or PyTorch build"
+    if speedup >= FLOAT16_ACCUMULATION_MIN_SPEEDUP:
+        return True, f"auto: matrix products {speedup:.2f}x faster with it on this GPU"
+    return False, f"auto: {speedup:.2f}x, no clear gain on this GPU"
+
+
+def _resolved_settings(
+    budgeted: InferenceSettings,
+    *,
+    rows: int,
+    encoder_dtype: torch.dtype,
+    float16_accumulation: bool,
+    decode_workers: int,
+) -> InferenceSettings:
+    """
+    The settings with every "auto" replaced by its decision (see ``_with_rows``
+    for the batch budget).
+    """
+
+    return dataclasses.replace(
+        _with_rows(budgeted, rows),
+        encoder_precision="float16" if encoder_dtype == torch.float16 else "float32",
+        float16_accumulation=float16_accumulation,
+        decode_workers=decode_workers,
+    )
+
+
+def _with_rows(settings: InferenceSettings, rows: int) -> InferenceSettings:
+    """
+    ``settings`` with ``rows`` per batch and a batch budget that fits them.
+
+    The budget never needs more than ``rows`` full chunks, because no batch
+    has more rows; an "auto" budget becomes exactly that.
+    """
+
+    full_rows_frames = rows * settings.max_chunk_feature_frames
+    if settings.max_batch_feature_frames is None:
+        batch_frames = full_rows_frames
+    else:
+        batch_frames = min(settings.max_batch_feature_frames, full_rows_frames)
+    return dataclasses.replace(settings, batch_size=rows, max_batch_feature_frames=batch_frames)
+
+
+def _graph_decoder_bytes(model: ParakeetTDT, settings: InferenceSettings) -> tuple[bool, int]:
+    """
+    Build and capture the graph decoder for ``settings``; return whether it is on and what it holds.
+
+    The cache is emptied before and after, so cached but free blocks (left by
+    earlier work, or by the capture's warm-up) do not count as the decoder's.
+    """
+
+    device = next(model.parameters()).device
+    torch.accelerator.empty_cache()
+    before = torch.accelerator.memory_reserved(device)
+    enabled = enable_graph_decoding(model, settings)
+    torch.accelerator.empty_cache()
+    return enabled, torch.accelerator.memory_reserved(device) - before
+
+
+def _rows_next_to_graph_decoder(model: ParakeetTDT, settings: InferenceSettings, budget: MemoryBudget) -> int | None:
+    """
+    Build the graph decoder for ``settings``; return the rows that still fit next to it.
+
+    None when graph decoding is off (in config.toml, or on this device). A
+    build that runs out of memory under the allocator cap says nothing about
+    its size, so half the rows are tried next (0 after a one-row build).
+    """
+
+    try:
+        enabled, reserved = _graph_decoder_bytes(model, settings)
+    except torch.OutOfMemoryError:
+        logger.warning("graph decoder for %d rows ran out of memory while being built", settings.batch_size)
+        return settings.batch_size // 2
+    if not enabled:
+        return None
+    rows = rows_after_reserving(budget, settings.batch_size, reserved)
+    logger.info("graph decoder reserved_mib=%.1f rows=%d of %d", reserved / 2**20, rows, settings.batch_size)
+    return rows
+
+
+def _drop_graph_decoder(model: ParakeetTDT) -> None:
+    model.graph_decoder = None
+    torch.accelerator.empty_cache()
+
+
+def _enable_graph_decoding_within_budget(
+    model: ParakeetTDT,
+    resolved: InferenceSettings,
+    budget: MemoryBudget,
+) -> tuple[bool, InferenceSettings, str]:
+    """
+    Build the CUDA Graph decoder for the chosen rows, then pay for its memory.
+
+    The decoder's static buffers and capture pool (60 MiB for 23 rows in a
+    measured run on the reference GPU) stay allocated for the whole run,
+    outside what the budget measured. The decoder is built, its memory
+    measured, and the rows that still fit computed; while that is fewer than
+    it was built for, it is rebuilt for those rows and measured again (rows
+    only go down, so this ends). After a build that runs out of memory, half
+    the rows are tried. When not even one chunk fits next to a one-row decoder,
+    graph decoding is turned off: the step-by-step loop gives the same
+    output, only slower, and the budget was measured with it.
+
+    Returns:
+        Whether graph decoding is on, the settings to run with, and a
+        warning for the user ("" when there is none).
+    """
+
+    # The budget is measured on NVIDIA GPUs only, the only ones with graph decoding.
+    measured = budget.applied and budget.chunks_that_fit is not None
+    if not measured:
+        return enable_graph_decoding(model, resolved), resolved, ""
+
+    candidate = resolved
+    while True:
+        rows = _rows_next_to_graph_decoder(model, candidate, budget)
+        if rows is None:
+            return False, candidate, ""
+        if rows == candidate.batch_size:
+            return True, candidate, ""
+        _drop_graph_decoder(model)
+        if rows >= 1:
+            candidate = _with_rows(candidate, rows)
+        elif candidate.batch_size > 1:
+            candidate = _with_rows(candidate, 1)
+        else:
+            break
+
+    warning = (
+        "Warning: CUDA Graph decoding is off: the free GPU memory holds one chunk but not "
+        "the graph decoder next to it. Transcripts are the same, decoding is slower; "
+        "close other programs that use the GPU to get it back."
+    )
+    logger.warning(warning)
+    return False, resolved, warning
+
+
+def _batch_rows_line(
+    configured: InferenceSettings,
+    resolved: InferenceSettings,
+    budget: MemoryBudget,
+    memory: MemorySettings,
+    *,
+    budget_rows: int,
+) -> str:
+    """
+    The rows decision and its reason, for the report.
+
+    Args:
+        budget_rows: Rows chosen from the budget, before the graph decoder's
+            memory was taken off; the report says when that lowered them.
+    """
+
+    rows = resolved.batch_size
+    if configured.batch_size is not None:
+        reason = f"configured {configured.batch_size}"
+        if budget.chunks_that_fit is not None and budget.chunks_that_fit < configured.batch_size:
+            reason += f", {budget.chunks_that_fit} full chunks fit"
+    elif budget.chunks_that_fit is None:
+        reason = "auto: memory not measured on this device"
+    else:
+        reason = (
+            f"auto: {memory.auto_batch_memory_share:.0%} of the {budget.chunks_that_fit} "
+            f"full chunks that fit, at most {memory.auto_batch_max_rows}"
+        )
+    if rows < budget_rows:
+        reason += f", lowered from {budget_rows} for the CUDA Graph decoder"
+    return f"Batch rows: {rows} ({reason})"

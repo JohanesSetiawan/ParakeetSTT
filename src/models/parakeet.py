@@ -17,7 +17,7 @@ import torch
 from torch import nn
 
 from ..configuration.config import ParakeetConfig, load_config
-from ..runtime.device import select_device
+from ..runtime.device import is_nvidia_gpu, select_device
 from .conformer import ConvolutionModule
 from .decoder import Decoder, DecoderCache
 from .encoder import Encoder
@@ -237,7 +237,8 @@ class ParakeetTDT(nn.Module):
         against 0.4 ms of GPU work, measured). Replaying a captured step costs
         one launch; output is bit-identical. One graph sized for the largest
         batch serves every smaller one (see GraphedGreedyDecoder). Batches
-        beyond the given bounds, and non-CUDA devices, use the eager loop.
+        beyond the given bounds, and devices other than NVIDIA GPUs, use the
+        eager loop.
 
         Args:
             max_batch_rows: Most rows a batch may have.
@@ -247,7 +248,8 @@ class ParakeetTDT(nn.Module):
         from .graphed_decoding import GraphedGreedyDecoder
 
         device = next(self.parameters()).device
-        if device.type != "cuda":
+        # Verified on NVIDIA GPUs only; ROCm devices are also type "cuda".
+        if not is_nvidia_gpu(device):
             self.graph_decoder = None
             return
         self.graph_decoder = GraphedGreedyDecoder(self, max_batch_rows, max_encoder_frames)

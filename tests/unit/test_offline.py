@@ -341,3 +341,14 @@ def test_decode_failure_in_the_worker_reaches_the_caller(tmp_path, tiny_configur
     with patch.object(OfflineTranscriber, "_decode_batch_audio", failing_on_second):
         with pytest.raises(ValueError, match="second batch"):
             transcriber.transcribe(paths)
+
+
+def test_unresolved_auto_settings_are_refused(tiny_configuration) -> None:
+    from src.inference.offline import enable_graph_decoding
+
+    settings = inference_settings(batch_size=None, decode_workers=None)
+
+    with pytest.raises(ValueError, match="still 'auto'"):
+        OfflineTranscriber(ScriptedModel(3).eval(), tiny_configuration, settings)
+    with pytest.raises(ValueError, match="batch_size"):
+        enable_graph_decoding(ScriptedModel(3), inference_settings(batch_size=None, cuda_graphs=True))

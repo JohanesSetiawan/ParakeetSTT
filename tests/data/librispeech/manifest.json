@@ -1,5 +1,6 @@
 {
-  "description": "LibriSpeech dev-clean clips used by the full test tier. reference_text is the LibriSpeech human transcript. expected_transcript is this runtime's output with default config.toml settings (last updated 2026-09-27 for word-level chunk merging). full_context_transcript is Hugging Face ParakeetForTDT on the whole clip without chunking; it equals expected_transcript for every single-chunk clip.",
+  "description": "LibriSpeech dev-clean clips used by the full test tier. reference_text is the LibriSpeech human transcript. expected_transcript is this runtime's output with default config.toml settings (last updated 2026-09-27 for word-level chunk merging). full_context_transcript is Hugging Face ParakeetForTDT on the whole clip without chunking; it equals expected_transcript for every single-chunk clip. corpus_wer_budget is the corpus word error rate the full test tier and the doctor command allow over these clips: 3.67 percent measured, room for one more wrong word.",
+  "corpus_wer_budget": 0.046,
   "clips": [
     {
       "id": "1272-128104-0000",

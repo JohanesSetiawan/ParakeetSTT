@@ -57,6 +57,9 @@ decode_workers = 3
 cap_to_free_memory = true
 auto_batch_budget = true
 reserve_mib = 256
+auto_batch_memory_share = 0.7
+auto_batch_max_rows = 64
+unmeasured_batch_rows = 16
 
 [benchmark]
 warmup_rounds = 0
@@ -81,7 +84,14 @@ def test_repository_config_is_valid() -> None:
 
     assert settings.paths.weights_dir.is_absolute()
     assert settings.paths.log_dir.is_absolute()
-    assert settings.inference.max_batch_feature_frames >= settings.inference.max_chunk_feature_frames
+    # The shipped configuration adapts to the machine.
+    assert set(settings.inference.unresolved_fields()) == {
+        "batch_size",
+        "max_batch_feature_frames",
+        "encoder_precision",
+        "float16_accumulation",
+        "decode_workers",
+    }
 
 
 def test_valid_file_is_normalized(tmp_path: Path) -> None:
@@ -125,13 +135,23 @@ def test_valid_file_is_normalized(tmp_path: Path) -> None:
         ("git_timeout_seconds = 15.0", "git_timeout_seconds = 0", "git_timeout_seconds"),
         ("max_open_files = 4", "max_open_files = 0", "max_open_files"),
         ('encoder_precision = "float16"', 'encoder_precision = "bfloat16"', "encoder_precision"),
+        ("batch_size = 4", 'batch_size = "automatic"', "batch_size"),
+        ("decode_workers = 3", 'decode_workers = "Auto"', "decode_workers"),
+        ("float16_accumulation = true", 'float16_accumulation = "yes"', "float16_accumulation"),
         ("cuda_graphs = true", 'cuda_graphs = "on"', "cuda_graphs"),
         ('float32_matmul_precision = "high"', 'float32_matmul_precision = "medium"', "float32_matmul_precision"),
         ("float16_accumulation = true", "float16_accumulation = 1", "float16_accumulation"),
+        ("max_batch_feature_frames = 2000", 'max_batch_feature_frames = "max"', "max_batch_feature_frames"),
         ("decode_workers = 3", "decode_workers = 0", "decode_workers"),
         ("terminal_details = false", "terminal_details = 0", "terminal_details"),
         ("keep_safetensors = false", 'keep_safetensors = "no"', "keep_safetensors"),
         ("reserve_mib = 256", "reserve_mib = -1", "reserve_mib"),
+        ("auto_batch_memory_share = 0.7", "auto_batch_memory_share = 0", "auto_batch_memory_share"),
+        ("auto_batch_memory_share = 0.7", "auto_batch_memory_share = 1.5", "auto_batch_memory_share"),
+        ("auto_batch_memory_share = 0.7", "auto_batch_memory_share = nan", "finite"),
+        ("gap_silence_rms = 0.001", "gap_silence_rms = inf", "finite"),
+        ("auto_batch_max_rows = 64", "auto_batch_max_rows = 0", "auto_batch_max_rows"),
+        ("unmeasured_batch_rows = 16", 'unmeasured_batch_rows = "auto"', "unmeasured_batch_rows"),
         ("auto_batch_budget = true", "auto_batch_budget = 1", "auto_batch_budget"),
         ("cap_to_free_memory = true", 'cap_to_free_memory = "yes"', "cap_to_free_memory"),
     ],
@@ -250,8 +270,8 @@ def test_quiet_line_reporter_only_logs(caplog) -> None:
 def test_runtime_summary_names_everything_on_one_line() -> None:
     from src.runtime.device import RuntimeReport
 
-    cpu = RuntimeReport("cpu", "none", 1, "x86_64", "float32", "2.x", "not available", "3.13")
-    gpu = RuntimeReport("cuda:0", "CUDA", 2, "Some GPU", "float16", "2.x", "13.x", "3.13")
+    cpu = RuntimeReport("cpu", "none", 1, "x86_64", "not applicable", "float32", "2.x", "not available", "3.13")
+    gpu = RuntimeReport("cuda:0", "CUDA", 2, "Some GPU", "8.6", "float16", "2.x", "13.x", "3.13")
 
     assert cpu.summary("float32") == (
         "Running on: x86_64 (CPU, 1 device), float32, PyTorch 2.x, CUDA not available"
@@ -321,3 +341,228 @@ def test_float16_accumulation_reports_an_unsupported_build(caplog) -> None:
 
     assert state == "off (not supported by this PyTorch build)"
     assert "does not support" in caplog.text
+
+
+# =============================================================================
+# "auto" settings and device decisions
+# =============================================================================
+
+
+def test_every_auto_setting_parses_and_must_be_resolved(tmp_path: Path) -> None:
+    text = (
+        VALID_TOML.replace("batch_size = 4", 'batch_size = "auto"')
+        .replace("max_batch_feature_frames = 2000", 'max_batch_feature_frames = "auto"')
+        .replace('encoder_precision = "float16"', 'encoder_precision = "auto"')
+        .replace("float16_accumulation = true", 'float16_accumulation = "auto"')
+        .replace("decode_workers = 3", 'decode_workers = "auto"')
+    )
+    inference = load_toml(tmp_path, text).inference
+
+    assert (inference.batch_size, inference.max_batch_feature_frames) == (None, None)
+    assert (inference.float16_accumulation, inference.decode_workers) == (None, None)
+    assert inference.encoder_precision == "auto"
+    with pytest.raises(ValueError, match="batch_size.*still 'auto'"):
+        inference.require_resolved()
+
+
+def test_explicit_settings_are_resolved_as_written(tmp_path: Path) -> None:
+    inference = load_toml(tmp_path, VALID_TOML).inference
+
+    inference.require_resolved()
+    assert inference.unresolved_fields() == ()
+
+
+@pytest.mark.parametrize(("cpus", "workers"), [(1, 1), (4, 1), (8, 2), (16, 4), (64, 8), (128, 8)])
+def test_auto_decode_workers_follow_the_cpu_count(cpus: int, workers: int) -> None:
+    from src.runtime.device import default_decode_workers
+
+    assert default_decode_workers(cpus) == workers
+
+
+@pytest.mark.parametrize(
+    ("precision", "capability", "dtype", "text"),
+    [
+        ("auto", (8, 6), torch.float16, "auto: tensor cores, compute capability 8.6"),
+        ("auto", (7, 0), torch.float16, "auto: tensor cores"),
+        ("auto", (6, 1), torch.float32, "auto: no tensor cores, compute capability 6.1"),
+        ("float16", (6, 1), torch.float16, "no tensor cores"),
+        ("float16", (8, 9), torch.float16, "float16 encoder, float32 decoder and joint"),
+        ("float32", (8, 6), torch.float32, "float32"),
+    ],
+)
+def test_encoder_precision_on_cuda_follows_tensor_cores(precision, capability, dtype, text) -> None:
+    from src.runtime import device as device_module
+
+    with patch.object(device_module, "cuda_capability", return_value=capability):
+        resolved, description = device_module.encoder_dtype_for(precision, torch.device("cuda"))
+
+    assert resolved == dtype
+    assert text in description
+
+
+@pytest.mark.parametrize("precision", ["auto", "float16"])
+def test_encoder_runs_float32_off_nvidia_gpus(precision: str) -> None:
+    from src.runtime.device import encoder_dtype_for
+
+    dtype, description = encoder_dtype_for(precision, torch.device("cpu"))
+
+    assert dtype == torch.float32
+    assert "float16 is used on NVIDIA GPUs only, this is cpu" in description
+
+
+@pytest.mark.parametrize(
+    ("capability", "architectures", "supported"),
+    [
+        ((8, 6), ["sm_75", "sm_80", "sm_86"], True),
+        ((8, 9), ["sm_80", "sm_86"], True),  # same major version, newer minor
+        ((9, 0), ["sm_86", "compute_86"], True),  # portable code compiles for newer GPUs
+        ((6, 1), ["sm_75", "sm_80"], False),  # Pascal on a build that dropped it
+        ((12, 0), ["sm_75", "sm_80", "sm_86", "sm_90"], False),
+    ],
+)
+def test_build_support_for_a_gpu_architecture(capability, architectures, supported) -> None:
+    from src.runtime import device as device_module
+
+    with (
+        patch.object(device_module, "cuda_capability", return_value=capability),
+        patch.object(device_module.torch.cuda, "get_arch_list", return_value=architectures),
+    ):
+        assert device_module.build_supports_device(torch.device("cuda")) is supported
+
+
+def test_build_support_is_not_a_question_off_cuda() -> None:
+    from src.runtime.device import build_supports_device
+
+    assert build_supports_device(torch.device("cpu")) is None
+
+
+@pytest.mark.parametrize(("accelerator", "expected"), [(None, "cpu"), (torch.device("mps"), "mps"), (torch.device("xpu"), "xpu")])
+def test_device_selection_follows_torch_accelerator(accelerator, expected: str) -> None:
+    from src.runtime import device as device_module
+
+    with patch.object(device_module.torch.accelerator, "current_accelerator", return_value=accelerator) as current:
+        assert device_module.select_device() == torch.device(expected)
+    current.assert_called_once_with(check_available=True)
+
+
+def test_float16_accumulation_is_not_measured_off_cuda() -> None:
+    from src.runtime.device import measure_float16_accumulation_speedup
+
+    assert measure_float16_accumulation_speedup(torch.device("cpu"), 64, 256) is None
+
+
+@pytest.mark.parametrize(
+    ("setting", "speedup", "dtype", "enabled", "reason"),
+    [
+        (True, None, torch.float16, True, ""),
+        (False, None, torch.float16, False, ""),
+        (None, None, torch.float32, False, "the encoder runs in float32"),
+        (None, 1.60, torch.float16, True, "1.60x faster"),
+        (None, 1.02, torch.float16, False, "no clear gain"),
+        (None, 1.10, torch.float16, False, "no clear gain"),  # below the 25 percent margin
+        (None, None, torch.float16, False, "not measurable"),
+    ],
+)
+def test_auto_float16_accumulation_needs_a_clear_measured_gain(setting, speedup, dtype, enabled, reason) -> None:
+    from types import SimpleNamespace
+
+    from src.commands import model_loading
+
+    configuration = SimpleNamespace(encoder={"hidden_size": 64, "intermediate_size": 256})
+    with patch.object(model_loading, "measure_float16_accumulation_speedup", return_value=speedup) as measure:
+        decided, why = model_loading._decide_float16_accumulation(
+            setting, torch.device("cuda"), dtype, configuration
+        )
+
+    assert decided is enabled
+    assert reason in why
+    if setting is not None or dtype != torch.float16:
+        measure.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("name", "tensor_cores"),
+    [
+        ("NVIDIA GeForce RTX 2060", True),
+        ("Tesla T4", True),
+        ("NVIDIA GeForce GTX 1650", False),
+        ("NVIDIA GeForce GTX 1660 Ti", False),
+        ("NVIDIA GeForce MX450", False),
+        ("Quadro T2000 with Max-Q Design", False),
+        ("NVIDIA T400 4GB", False),
+        ("NVIDIA T500", False),
+        ("NVIDIA T550 Laptop GPU", False),
+    ],
+)
+def test_turing_cards_without_tensor_cores_are_recognized(name: str, tensor_cores: bool) -> None:
+    """Review finding: compute capability 7.5 also covers TU116/TU117 cards without tensor cores."""
+
+    from src.runtime import device as device_module
+
+    with (
+        patch.object(device_module, "cuda_capability", return_value=(7, 5)),
+        patch.object(device_module.torch.cuda, "get_device_name", return_value=name),
+    ):
+        assert device_module.has_tensor_cores(torch.device("cuda")) is tensor_cores
+        dtype, _description = device_module.encoder_dtype_for("auto", torch.device("cuda"))
+
+    assert dtype == (torch.float16 if tensor_cores else torch.float32)
+
+
+def test_rocm_gpus_are_not_judged_by_nvidia_rules() -> None:
+    """Review finding: ROCm builds list gfx architectures, which made every AMD GPU look unsupported."""
+
+    from src.runtime import device as device_module
+
+    with patch.object(device_module.torch.version, "hip", "6.2"):
+        rocm = torch.device("cuda")
+        assert device_module.is_nvidia_gpu(rocm) is False
+        assert device_module.cuda_capability(rocm) is None
+        assert device_module.build_supports_device(rocm) is None
+        assert device_module.has_tensor_cores(rocm) is False
+        dtype, description = device_module.encoder_dtype_for("auto", rocm)
+
+    assert dtype == torch.float32
+    assert "NVIDIA GPUs only" in description
+
+    with patch.object(device_module.torch.version, "hip", "6.2"):
+        explicit, explicit_description = device_module.encoder_dtype_for("float16", torch.device("cuda"))
+        speedup = device_module.measure_float16_accumulation_speedup(torch.device("cuda"), 64, 256)
+
+    assert explicit == torch.float32 and "this is ROCm" in explicit_description
+    assert speedup is None
+
+
+@pytest.mark.parametrize(("hip", "built"), [("6.2", False), (None, True)])
+def test_graph_decoding_is_built_on_nvidia_gpus_only(tmp_path: Path, hip, built: bool) -> None:
+    """Review finding: ROCm devices are type "cuda" too; the device type alone let them build a decoder."""
+
+    from types import SimpleNamespace
+
+    from src.configuration.config import load_config
+    from src.models import graphed_decoding
+    from src.models import parakeet as parakeet_module
+    from support import write_tiny_checkpoint
+
+    model = parakeet_module.ParakeetTDT(load_config(write_tiny_checkpoint(tmp_path)))
+    gpu_parameter = SimpleNamespace(device=torch.device("cuda"))
+    with (
+        patch.object(parakeet_module.torch.version, "hip", hip),
+        patch.object(model, "parameters", lambda: iter([gpu_parameter])),
+        patch.object(graphed_decoding, "GraphedGreedyDecoder", return_value="graph decoder") as decoder_class,
+    ):
+        model.enable_graph_decoding(4, 10)
+
+    assert decoder_class.called is built
+    assert model.graph_decoder == ("graph decoder" if built else None)
+
+
+@pytest.mark.parametrize(
+    ("device_type", "hip", "family"),
+    [("cuda", None, "NVIDIA"), ("cuda", "6.2", "ROCm"), ("cpu", None, "cpu"), ("mps", None, "mps")],
+)
+def test_device_family_names_rocm_apart_from_nvidia(device_type: str, hip, family: str) -> None:
+    from src.runtime import device as device_module
+
+    with patch.object(device_module.torch.version, "hip", hip):
+        assert device_module.device_family(torch.device(device_type)) == family

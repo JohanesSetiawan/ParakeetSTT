@@ -10,6 +10,7 @@ back to a default.
 
 from __future__ import annotations
 
+import math
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,7 +20,10 @@ from .config import PROJECT_ROOT
 
 
 DEFAULT_SETTINGS_PATH = PROJECT_ROOT / "config.toml"
-ENCODER_PRECISIONS = ("float32", "float16")
+# A setting with this value is decided at startup for the device in use (see
+# commands.model_loading); every other value is used as written.
+AUTO = "auto"
+ENCODER_PRECISIONS = (AUTO, "float32", "float16")
 # torch.set_float32_matmul_precision values: "highest" is exact float32,
 # "high" allows TF32 tensor cores on GPUs that have them.
 FLOAT32_MATMUL_PRECISIONS = ("highest", "high")
@@ -66,15 +70,23 @@ class CheckpointSettings:
 
 @dataclass(frozen=True)
 class InferenceSettings:
-    """Validated user-facing settings for file and directory transcription."""
+    """
+    Validated user-facing settings for file and directory transcription.
 
-    batch_size: int
+    ``batch_size``, ``max_batch_feature_frames``, ``float16_accumulation``,
+    and ``decode_workers`` are None when config.toml says ``"auto"``, and
+    ``encoder_precision`` is then ``"auto"``. Startup replaces each with the
+    value for the device in use; a transcription only accepts resolved
+    settings (see ``require_resolved``).
+    """
+
+    batch_size: int | None
     recursive: bool
     output_filename: str
     audio_extensions: tuple[str, ...]
     max_chunk_feature_frames: int
     overlap_feature_frames: int
-    max_batch_feature_frames: int
+    max_batch_feature_frames: int | None
     max_padding_fraction: float
     merge_tolerance_feature_frames: int
     untranscribed_gap_seconds: float
@@ -85,17 +97,53 @@ class InferenceSettings:
     encoder_precision: str
     cuda_graphs: bool
     float32_matmul_precision: str
-    float16_accumulation: bool
-    decode_workers: int
+    float16_accumulation: bool | None
+    decode_workers: int | None
+
+    def unresolved_fields(self) -> tuple[str, ...]:
+        """Names of the settings that are still ``"auto"``."""
+
+        unresolved = [
+            name
+            for name in ("batch_size", "max_batch_feature_frames", "float16_accumulation", "decode_workers")
+            if getattr(self, name) is None
+        ]
+        if self.encoder_precision == AUTO:
+            unresolved.append("encoder_precision")
+        return tuple(unresolved)
+
+    def require_resolved(self) -> None:
+        """
+        Fail loudly if an ``"auto"`` setting was never decided.
+
+        Raises:
+            ValueError: Naming each unresolved setting.
+        """
+
+        unresolved = self.unresolved_fields()
+        if unresolved:
+            raise ValueError(
+                f"inference settings {list(unresolved)} are still 'auto'; resolve them for the "
+                "device first (commands.model_loading.prepare_inference_model does)"
+            )
 
 
 @dataclass(frozen=True)
 class MemorySettings:
-    """Accelerator memory policy: spill protection and the automatic batch budget."""
+    """
+    Accelerator memory policy: spill protection and the automatic batch budget.
+
+    ``auto_batch_memory_share``, ``auto_batch_max_rows``, and
+    ``unmeasured_batch_rows`` set how ``inference.batch_size = "auto"`` turns
+    the measured chunks that fit into rows per batch.
+    """
 
     cap_to_free_memory: bool
     auto_batch_budget: bool
     reserve_mib: int
+    auto_batch_memory_share: float
+    auto_batch_max_rows: int
+    unmeasured_batch_rows: int
 
 
 @dataclass(frozen=True)
@@ -154,6 +202,9 @@ def _number(
     if not isinstance(value, (int, float)) or isinstance(value, bool):
         raise ValueError(f"{section_name}.{key} must be a number, got {value!r}")
     number = float(value)
+    # TOML accepts nan and inf, which pass every comparison below.
+    if not math.isfinite(number):
+        raise ValueError(f"{section_name}.{key} must be a finite number, got {value!r}")
     if number < minimum or (maximum is not None and number > maximum):
         upper = "" if maximum is None else f" and <= {maximum}"
         raise ValueError(f"{section_name}.{key} must be >= {minimum}{upper}, got {value!r}")
@@ -172,6 +223,30 @@ def _positive_number(section: dict[str, Any], section_name: str, key: str) -> fl
     if number == 0.0:
         raise ValueError(f"{section_name}.{key} must be greater than zero")
     return number
+
+
+def _integer_or_auto(section: dict[str, Any], section_name: str, key: str, minimum: int) -> int | None:
+    """An integer, or None for ``"auto"``."""
+
+    if section.get(key) == AUTO:
+        return None
+    value = section.get(key)
+    if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
+        raise ValueError(
+            f"{section_name}.{key} must be \"{AUTO}\" or an integer >= {minimum}, got {value!r}"
+        )
+    return value
+
+
+def _boolean_or_auto(section: dict[str, Any], section_name: str, key: str) -> bool | None:
+    """A boolean, or None for ``"auto"``."""
+
+    value = section.get(key)
+    if value == AUTO:
+        return None
+    if not isinstance(value, bool):
+        raise ValueError(f"{section_name}.{key} must be \"{AUTO}\", true, or false, got {value!r}")
+    return value
 
 
 def _boolean(section: dict[str, Any], section_name: str, key: str) -> bool:
@@ -269,8 +344,8 @@ def _parse_inference(document: dict[str, Any]) -> InferenceSettings:
             "inference.overlap_feature_frames so every chunk owns some frames"
         )
 
-    max_batch_feature_frames = _integer(section, "inference", "max_batch_feature_frames", minimum=1)
-    if max_batch_feature_frames < max_chunk_feature_frames:
+    max_batch_feature_frames = _integer_or_auto(section, "inference", "max_batch_feature_frames", minimum=1)
+    if max_batch_feature_frames is not None and max_batch_feature_frames < max_chunk_feature_frames:
         raise ValueError(
             "inference.max_batch_feature_frames must be at least "
             "inference.max_chunk_feature_frames or a full chunk can never be scheduled"
@@ -297,7 +372,7 @@ def _parse_inference(document: dict[str, Any]) -> InferenceSettings:
         )
 
     return InferenceSettings(
-        batch_size=_integer(section, "inference", "batch_size", minimum=1),
+        batch_size=_integer_or_auto(section, "inference", "batch_size", minimum=1),
         recursive=_boolean(section, "inference", "recursive"),
         output_filename=output_filename,
         audio_extensions=_parse_extensions(section),
@@ -330,17 +405,23 @@ def _parse_inference(document: dict[str, Any]) -> InferenceSettings:
             "float32_matmul_precision",
             FLOAT32_MATMUL_PRECISIONS,
         ),
-        float16_accumulation=_boolean(section, "inference", "float16_accumulation"),
-        decode_workers=_integer(section, "inference", "decode_workers", minimum=1),
+        float16_accumulation=_boolean_or_auto(section, "inference", "float16_accumulation"),
+        decode_workers=_integer_or_auto(section, "inference", "decode_workers", minimum=1),
     )
 
 
 def _parse_memory(document: dict[str, Any]) -> MemorySettings:
     section = _section(document, "memory")
+    share = _number(section, "memory", "auto_batch_memory_share", minimum=0.0, maximum=1.0)
+    if share == 0.0:
+        raise ValueError("memory.auto_batch_memory_share must be greater than zero")
     return MemorySettings(
         cap_to_free_memory=_boolean(section, "memory", "cap_to_free_memory"),
         auto_batch_budget=_boolean(section, "memory", "auto_batch_budget"),
         reserve_mib=_integer(section, "memory", "reserve_mib", minimum=0),
+        auto_batch_memory_share=share,
+        auto_batch_max_rows=_integer(section, "memory", "auto_batch_max_rows", minimum=1),
+        unmeasured_batch_rows=_integer(section, "memory", "unmeasured_batch_rows", minimum=1),
     )
 
 
